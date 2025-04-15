@@ -12,6 +12,41 @@ let calcToken = 0; // Used to match results to the latest view
 let debounceTimer = null;
 let lastJobParams = null; // Store last parameters for progressive refinement
 
+// --- 3D Mode Integration ---
+import { Fractal3DViewer } from './fractal3d.js';
+import { FractalEngine } from './fractalEngineMain.js';
+
+let fractal3D = null;
+let in3DMode = false;
+
+function getFractalParams() {
+  // Returns the current fractal parameters for 3D
+  return {
+    type: viewer.fractalType,
+    view: { ...viewer.view },
+    maxIter: viewer.maxIter,
+    juliaParams: { ...viewer.juliaParams }
+  };
+}
+
+function enter3DMode() {
+  if (in3DMode) return;
+  in3DMode = true;
+  fractal3D = new Fractal3DViewer(document.body, FractalEngine, getFractalParams);
+  fractal3D.init();
+  canvas.style.display = 'none';
+  infoElem.style.display = 'none';
+}
+
+function exit3DMode() {
+  if (!in3DMode) return;
+  in3DMode = false;
+  if (fractal3D) fractal3D.exit();
+  fractal3D = null;
+  canvas.style.display = '';
+  infoElem.style.display = '';
+}
+
 function updateInfo(view) {
   infoElem.textContent = `Center: (${view.centerX.toFixed(5)}, ${view.centerY.toFixed(5)})  Zoom: ${(1/view.scale).toFixed(2)}`;
 }
@@ -92,4 +127,15 @@ startCalculation();
 window.addEventListener('resize', () => {
   viewer.resize();
   startCalculation();
+});
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') {
+    if (!in3DMode) {
+      enter3DMode();
+    } else {
+      exit3DMode();
+    }
+    e.preventDefault();
+  }
 });
