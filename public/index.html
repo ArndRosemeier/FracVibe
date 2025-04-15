@@ -7,6 +7,10 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+  <!-- Progress bar for 3D calculation -->
+  <div id="fractal3d-progress" style="position:fixed;top:0;left:0;width:100vw;height:4px;background:#222;z-index:9999;display:none;">
+    <div id="fractal3d-progress-bar" style="width:0;height:100%;background:linear-gradient(90deg,#26f,#2ff,#6f6,#ff6,#f66);transition:width 0.2s;"></div>
+  </div>
   <div id="controls">
     <label for="fractalType">Fractal:</label>
     <select id="fractalType">

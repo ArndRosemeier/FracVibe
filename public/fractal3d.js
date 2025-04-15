@@ -21,6 +21,27 @@ function getColorForHeight(h) {
   return c;
 }
 
+// Smoothing helper for heightmap
+function smoothHeightmap(heights, res) {
+  const out = new Float32Array(heights.length);
+  for (let y = 0; y < res; ++y) {
+    for (let x = 0; x < res; ++x) {
+      let sum = 0, count = 0;
+      for (let dy = -1; dy <= 1; ++dy) {
+        for (let dx = -1; dx <= 1; ++dx) {
+          const nx = x + dx, ny = y + dy;
+          if (nx >= 0 && nx < res && ny >= 0 && ny < res) {
+            sum += heights[ny * res + nx];
+            count++;
+          }
+        }
+      }
+      out[y * res + x] = sum / count;
+    }
+  }
+  return out;
+}
+
 export class Fractal3DViewer {
   constructor(container, fractalEngine, getFractalParams) {
     this.container = container;
@@ -70,7 +91,7 @@ export class Fractal3DViewer {
     this.width = 2 / view.scale * (window.innerWidth / window.innerHeight);
     this.height = 2 / view.scale;
     // Camera
-    this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+    this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 100);
     this.orbit.radius = 1.1 * Math.max(this.width, this.height);
     // Set initial camera position and target
     this.updateCamera();
@@ -87,11 +108,12 @@ export class Fractal3DViewer {
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
     // Heightmap
-    const heights = await this.fractalEngine.calculateHeightmap(
+    let heights = await this.fractalEngine.calculateHeightmap(
       this.resolution,
       this.resolution,
-      {...params, exaggeration: 0.07}
+      {...params, exaggeration: 0.03}
     );
+    heights = smoothHeightmap(heights, this.resolution);
     // Build mesh with vertex colors
     const geometry = new THREE.PlaneGeometry(
       this.width,
@@ -199,6 +221,13 @@ export class Fractal3DViewer {
     if (e.code === 'KeyS') this.move.backward = true;
     if (e.code === 'KeyA') this.move.left = true;
     if (e.code === 'KeyD') this.move.right = true;
+    // + increases, - decreases resolution
+    if (e.key === '+' || e.key === '=') {
+      this.changeResolution(1);
+    }
+    if (e.key === '-') {
+      this.changeResolution(-1);
+    }
   }
 
   onKeyUp(e) {
@@ -206,6 +235,75 @@ export class Fractal3DViewer {
     if (e.code === 'KeyS') this.move.backward = false;
     if (e.code === 'KeyA') this.move.left = false;
     if (e.code === 'KeyD') this.move.right = false;
+  }
+
+  async changeResolution(delta) {
+    const minRes = 16, maxRes = 4096; // Much higher max resolution
+    let newRes = this.resolution;
+    if (delta > 0) newRes = Math.min(maxRes, this.resolution * 2);
+    if (delta < 0) newRes = Math.max(minRes, Math.floor(this.resolution / 2));
+    if (newRes === this.resolution) return;
+    this.resolution = newRes;
+    // Show progress bar
+    const progress = document.getElementById('fractal3d-progress');
+    const bar = document.getElementById('fractal3d-progress-bar');
+    if (progress && bar) {
+      progress.style.display = 'block';
+      bar.style.width = '30%';
+      bar.style.transition = 'none';
+      setTimeout(() => { bar.style.width = '90%'; bar.style.transition = 'width 1.5s linear'; }, 50);
+    }
+    // Yield to browser to allow progress bar to show
+    await new Promise(requestAnimationFrame);
+    // Remove old mesh
+    if (this.terrain) {
+      this.scene.remove(this.terrain);
+      this.terrain.geometry.dispose();
+      this.terrain.material.dispose();
+      this.terrain = null;
+    }
+    // Get fractal params and recalculate mesh
+    const params = this.getFractalParams();
+    let heights = await this.fractalEngine.calculateHeightmap(
+      this.resolution,
+      this.resolution,
+      {...params, exaggeration: 0.03}
+    );
+    heights = smoothHeightmap(heights, this.resolution);
+    const geometry = new THREE.PlaneGeometry(
+      this.width,
+      this.height,
+      this.resolution - 1,
+      this.resolution - 1
+    );
+    let minH = Infinity, maxH = -Infinity;
+    for (let i = 0; i < heights.length; ++i) {
+      if (heights[i] < minH) minH = heights[i];
+      if (heights[i] > maxH) maxH = heights[i];
+    }
+    const colors = [];
+    for (let i = 0; i < geometry.attributes.position.count; ++i) {
+      const h = (heights[i] - minH) / (maxH - minH + 1e-6);
+      const color = getColorForHeight(h);
+      colors.push(color.r, color.g, color.b);
+      geometry.attributes.position.setZ(i, heights[i]);
+    }
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    geometry.computeVertexNormals();
+    const material = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      flatShading: true,
+      metalness: 0.2,
+      roughness: 0.7
+    });
+    this.terrain = new THREE.Mesh(geometry, material);
+    this.terrain.rotation.x = -Math.PI / 2;
+    this.scene.add(this.terrain);
+    // Hide progress bar
+    if (progress && bar) {
+      bar.style.width = '100%';
+      setTimeout(() => { progress.style.display = 'none'; bar.style.width = '0'; }, 400);
+    }
   }
 
   onResize() {
