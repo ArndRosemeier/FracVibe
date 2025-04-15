@@ -2,6 +2,7 @@
 import { FractalViewer } from './fractalViewer.js';
 import { Fractal3DViewer } from './fractal3d.js';
 import { FractalEngine } from './fractalEngineMain.js';
+import { WebGLFractalRenderer } from './webglFractal.js';
 
 const canvas = document.getElementById('fractalCanvas');
 const infoElem = document.getElementById('info');
@@ -10,6 +11,7 @@ const colorSchemeSelect = document.getElementById('colorScheme');
 const cycleColorsCheckbox = document.getElementById('cycleColors');
 const maxIterSlider = document.getElementById('maxIter');
 const maxIterValue = document.getElementById('maxIterValue');
+const webglCheckbox = document.getElementById('webglRender');
 
 let viewer = new FractalViewer(canvas, updateInfo);
 let worker = new Worker('fractalWorker.js');
@@ -30,6 +32,8 @@ let colorCycleRequestId = null;
 
 // Progressive rendering state
 let progressiveState = null;
+
+let webglRenderer = null;
 
 function getFractalParams() {
   // Returns the current fractal parameters for 3D
@@ -185,9 +189,7 @@ cycleColorsCheckbox.addEventListener('change', () => {
     if (colorCycleRequestId) cancelAnimationFrame(colorCycleRequestId);
     colorCycleOffset = 0;
     viewer.setColorOffset(0);
-    if (fractal3D && fractal3D.setColorOffset) {
-      fractal3D.setColorOffset(0);
-    }
+    if (fractal3D && fractal3D.setColorOffset) fractal3D.setColorOffset(0);
   }
 });
 
@@ -203,4 +205,45 @@ maxIterSlider.addEventListener('input', () => {
   viewer.maxIter = parseInt(maxIterSlider.value, 10);
   maxIterValue.textContent = viewer.maxIter;
   startFractalCalculation();
+});
+
+function updateWebGLState() {
+  if (webglCheckbox.checked) {
+    if (!webglRenderer) webglRenderer = new WebGLFractalRenderer(canvas);
+    // Hide CPU rendering overlays if any
+    renderWebGL();
+  } else {
+    if (webglRenderer) { webglRenderer.destroy(); webglRenderer = null; }
+    viewer.render();
+  }
+}
+
+function renderWebGL() {
+  if (!webglRenderer) return;
+  webglRenderer.render(
+    viewer.view,
+    viewer.maxIter,
+    viewer.fractalType,
+    viewer.juliaParams
+  );
+}
+
+// Hook up checkbox
+webglCheckbox.addEventListener('change', updateWebGLState);
+
+// Update rendering on any parameter change
+const originalRender = viewer.render.bind(viewer);
+viewer.render = function() {
+  if (webglCheckbox.checked && webglRenderer) {
+    renderWebGL();
+  } else {
+    originalRender();
+  }
+};
+
+// Also update on maxIter/type/params changes
+[typeSelect, colorSchemeSelect, maxIterSlider].forEach(el => {
+  el.addEventListener('change', () => {
+    if (webglCheckbox.checked) renderWebGL();
+  });
 });
