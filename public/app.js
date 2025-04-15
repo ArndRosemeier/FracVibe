@@ -1,8 +1,13 @@
-// FractalViewer must be loaded as classic script, so we assume it is globally available
+// Use ESM imports for all modules
+import { FractalViewer } from './fractalViewer.js';
+import { Fractal3DViewer } from './fractal3d.js';
+import { FractalEngine } from './fractalEngineMain.js';
 
 const canvas = document.getElementById('fractalCanvas');
 const infoElem = document.getElementById('info');
 const typeSelect = document.getElementById('fractalType');
+const colorSchemeSelect = document.getElementById('colorScheme');
+const cycleColorsCheckbox = document.getElementById('cycleColors');
 
 let viewer = new FractalViewer(canvas, updateInfo);
 let worker = new Worker('fractalWorker.js');
@@ -13,11 +18,13 @@ let debounceTimer = null;
 let lastJobParams = null; // Store last parameters for progressive refinement
 
 // --- 3D Mode Integration ---
-import { Fractal3DViewer } from './fractal3d.js';
-import { FractalEngine } from './fractalEngineMain.js';
-
 let fractal3D = null;
 let in3DMode = false;
+
+let colorCycleActive = false;
+let colorCycleOffset = 0;
+let colorCycleLastTime = 0;
+let colorCycleRequestId = null;
 
 function getFractalParams() {
   // Returns the current fractal parameters for 3D
@@ -139,3 +146,48 @@ window.addEventListener('keydown', e => {
     e.preventDefault();
   }
 });
+
+// Set color scheme from dropdown
+colorSchemeSelect.addEventListener('change', () => {
+  viewer.setColorScheme(colorSchemeSelect.value);
+  if (fractal3D && fractal3D.setColorScheme) {
+    fractal3D.setColorScheme(colorSchemeSelect.value);
+  }
+});
+
+// Set initial color scheme
+viewer.setColorScheme(colorSchemeSelect.value);
+
+function colorCycleLoop(ts) {
+  if (!colorCycleActive) return;
+  if (!colorCycleLastTime) colorCycleLastTime = ts;
+  const dt = (ts - colorCycleLastTime) / 1000;
+  colorCycleLastTime = ts;
+  // Cycle at 0.1 offset per second
+  colorCycleOffset = (colorCycleOffset + dt * 0.1) % 1;
+  viewer.setColorOffset(colorCycleOffset);
+  if (fractal3D && fractal3D.setColorOffset) {
+    fractal3D.setColorOffset(colorCycleOffset);
+  }
+  colorCycleRequestId = requestAnimationFrame(colorCycleLoop);
+}
+
+cycleColorsCheckbox.addEventListener('change', () => {
+  if (cycleColorsCheckbox.checked) {
+    colorCycleActive = true;
+    colorCycleLastTime = 0;
+    colorCycleRequestId = requestAnimationFrame(colorCycleLoop);
+  } else {
+    colorCycleActive = false;
+    if (colorCycleRequestId) cancelAnimationFrame(colorCycleRequestId);
+    colorCycleOffset = 0;
+    viewer.setColorOffset(0);
+    if (fractal3D && fractal3D.setColorOffset) {
+      fractal3D.setColorOffset(0);
+    }
+  }
+});
+
+// On startup, ensure offset is zero
+viewer.setColorOffset(0);
+if (fractal3D && fractal3D.setColorOffset) fractal3D.setColorOffset(0);

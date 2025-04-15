@@ -1,27 +1,7 @@
 // Colorful Fractal 3D Viewer using three.js (ESM import)
 import * as THREE from './three.module.js';
+import { colorSchemes } from './colorSchemes.js';
 
-function getColorForHeight(h) {
-  // h in [0, max], map to a rainbow gradient
-  // Blue (low) -> Green -> Yellow -> Red (high)
-  const c = new THREE.Color();
-  if (h < 0.2) {
-    // Deep blue to cyan
-    c.setRGB(0, h * 2, 1);
-  } else if (h < 0.5) {
-    // Cyan to green
-    c.setRGB(0, 1, 1 - (h - 0.2) * 3.33);
-  } else if (h < 0.8) {
-    // Green to yellow
-    c.setRGB((h - 0.5) * 3.33, 1, 0);
-  } else {
-    // Yellow to red/white
-    c.setRGB(1, 1 - (h - 0.8) * 5, (h > 0.95) ? (h - 0.95) * 20 : 0);
-  }
-  return c;
-}
-
-// Smoothing helper for heightmap
 function smoothHeightmap(heights, res) {
   const out = new Float32Array(heights.length);
   for (let y = 0; y < res; ++y) {
@@ -78,6 +58,9 @@ export class Fractal3DViewer {
     this.onWheel = this.onWheel.bind(this);
     this.onKeyDown = this.onKeyDown.bind(this);
     this.onKeyUp = this.onKeyUp.bind(this);
+    this.colorScheme = 'rainbow';
+    this.colorOffset = 0;
+    this.getColorForHeight = this.makeColorForHeightFn('rainbow');
   }
 
   async init() {
@@ -93,7 +76,6 @@ export class Fractal3DViewer {
     // Camera
     this.camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.01, 100);
     this.orbit.radius = 1.1 * Math.max(this.width, this.height);
-    // Set initial camera position and target
     this.updateCamera();
     // Renderer
     this.renderer = new THREE.WebGLRenderer({antialias: true});
@@ -107,31 +89,69 @@ export class Fractal3DViewer {
     this.renderer.domElement.addEventListener('wheel', this.onWheel, { passive: false });
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
-    // Heightmap
+    // Lighting
+    const ambient = new THREE.AmbientLight(0x8888aa, 0.7);
+    this.scene.add(ambient);
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+    dirLight.position.set(2, 5, 2);
+    this.scene.add(dirLight);
+    // Build mesh
+    await this.regenerateMesh();
+    // Render loop
+    this.animate();
+  }
+
+  async changeResolution(delta) {
+    const minRes = 16, maxRes = 4096; // Much higher max resolution
+    let newRes = this.resolution;
+    if (delta > 0) newRes = Math.min(maxRes, this.resolution * 2);
+    if (delta < 0) newRes = Math.max(minRes, Math.floor(this.resolution / 2));
+    if (newRes === this.resolution && delta !== 0) return;
+    this.resolution = newRes;
+    await this.regenerateMesh();
+  }
+
+  async regenerateMesh() {
+    // Show progress bar (reuse logic from changeResolution)
+    const progress = document.getElementById('fractal3d-progress');
+    const bar = document.getElementById('fractal3d-progress-bar');
+    if (progress && bar) {
+      progress.style.display = 'block';
+      bar.style.width = '30%';
+      bar.style.transition = 'none';
+      setTimeout(() => { bar.style.width = '90%'; bar.style.transition = 'width 1.5s linear'; }, 50);
+    }
+    await new Promise(requestAnimationFrame);
+    // Remove old mesh
+    if (this.terrain) {
+      this.scene.remove(this.terrain);
+      this.terrain.geometry.dispose();
+      this.terrain.material.dispose();
+      this.terrain = null;
+    }
+    // Get fractal params and recalculate mesh
+    const params = this.getFractalParams();
     let heights = await this.fractalEngine.calculateHeightmap(
       this.resolution,
       this.resolution,
       {...params, exaggeration: 0.03}
     );
     heights = smoothHeightmap(heights, this.resolution);
-    // Build mesh with vertex colors
     const geometry = new THREE.PlaneGeometry(
       this.width,
       this.height,
       this.resolution - 1,
       this.resolution - 1
     );
-    // Compute min/max for normalization
     let minH = Infinity, maxH = -Infinity;
     for (let i = 0; i < heights.length; ++i) {
       if (heights[i] < minH) minH = heights[i];
       if (heights[i] > maxH) maxH = heights[i];
     }
-    // Assign vertex colors
     const colors = [];
     for (let i = 0; i < geometry.attributes.position.count; ++i) {
       const h = (heights[i] - minH) / (maxH - minH + 1e-6);
-      const color = getColorForHeight(h);
+      const color = this.getColorForHeight(h);
       colors.push(color.r, color.g, color.b);
       geometry.attributes.position.setZ(i, heights[i]);
     }
@@ -140,21 +160,29 @@ export class Fractal3DViewer {
     const material = new THREE.MeshStandardMaterial({
       vertexColors: true,
       flatShading: true,
-      wireframe: false,
       metalness: 0.2,
       roughness: 0.7
     });
     this.terrain = new THREE.Mesh(geometry, material);
     this.terrain.rotation.x = -Math.PI / 2;
     this.scene.add(this.terrain);
-    // Lighting
-    const ambient = new THREE.AmbientLight(0x8888aa, 0.7);
-    this.scene.add(ambient);
-    const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
-    dirLight.position.set(2, 5, 2);
-    this.scene.add(dirLight);
-    // Render loop
-    this.animate();
+    // Hide progress bar
+    if (progress && bar) {
+      bar.style.width = '100%';
+      setTimeout(() => { progress.style.display = 'none'; bar.style.width = '0'; }, 400);
+    }
+  }
+
+  setColorScheme(scheme) {
+    this.colorScheme = scheme;
+    this.getColorForHeight = this.makeColorForHeightFn(scheme);
+    // Regenerate mesh with new palette
+    if (this.active) this.regenerateMesh();
+  }
+
+  setColorOffset(offset) {
+    this.colorOffset = offset;
+    if (this.active) this.regenerateMesh();
   }
 
   updateCamera() {
@@ -237,75 +265,6 @@ export class Fractal3DViewer {
     if (e.code === 'KeyD') this.move.right = false;
   }
 
-  async changeResolution(delta) {
-    const minRes = 16, maxRes = 4096; // Much higher max resolution
-    let newRes = this.resolution;
-    if (delta > 0) newRes = Math.min(maxRes, this.resolution * 2);
-    if (delta < 0) newRes = Math.max(minRes, Math.floor(this.resolution / 2));
-    if (newRes === this.resolution) return;
-    this.resolution = newRes;
-    // Show progress bar
-    const progress = document.getElementById('fractal3d-progress');
-    const bar = document.getElementById('fractal3d-progress-bar');
-    if (progress && bar) {
-      progress.style.display = 'block';
-      bar.style.width = '30%';
-      bar.style.transition = 'none';
-      setTimeout(() => { bar.style.width = '90%'; bar.style.transition = 'width 1.5s linear'; }, 50);
-    }
-    // Yield to browser to allow progress bar to show
-    await new Promise(requestAnimationFrame);
-    // Remove old mesh
-    if (this.terrain) {
-      this.scene.remove(this.terrain);
-      this.terrain.geometry.dispose();
-      this.terrain.material.dispose();
-      this.terrain = null;
-    }
-    // Get fractal params and recalculate mesh
-    const params = this.getFractalParams();
-    let heights = await this.fractalEngine.calculateHeightmap(
-      this.resolution,
-      this.resolution,
-      {...params, exaggeration: 0.03}
-    );
-    heights = smoothHeightmap(heights, this.resolution);
-    const geometry = new THREE.PlaneGeometry(
-      this.width,
-      this.height,
-      this.resolution - 1,
-      this.resolution - 1
-    );
-    let minH = Infinity, maxH = -Infinity;
-    for (let i = 0; i < heights.length; ++i) {
-      if (heights[i] < minH) minH = heights[i];
-      if (heights[i] > maxH) maxH = heights[i];
-    }
-    const colors = [];
-    for (let i = 0; i < geometry.attributes.position.count; ++i) {
-      const h = (heights[i] - minH) / (maxH - minH + 1e-6);
-      const color = getColorForHeight(h);
-      colors.push(color.r, color.g, color.b);
-      geometry.attributes.position.setZ(i, heights[i]);
-    }
-    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-    geometry.computeVertexNormals();
-    const material = new THREE.MeshStandardMaterial({
-      vertexColors: true,
-      flatShading: true,
-      metalness: 0.2,
-      roughness: 0.7
-    });
-    this.terrain = new THREE.Mesh(geometry, material);
-    this.terrain.rotation.x = -Math.PI / 2;
-    this.scene.add(this.terrain);
-    // Hide progress bar
-    if (progress && bar) {
-      bar.style.width = '100%';
-      setTimeout(() => { progress.style.display = 'none'; bar.style.width = '0'; }, 400);
-    }
-  }
-
   onResize() {
     if (!this.active) return;
     this.camera.aspect = window.innerWidth / window.innerHeight;
@@ -361,5 +320,16 @@ export class Fractal3DViewer {
     this.camera = null;
     this.renderer = null;
     this.terrain = null;
+  }
+
+  makeColorForHeightFn(scheme) {
+    const fn = colorSchemes[scheme] || colorSchemes.rainbow;
+    const self = this;
+    return function(h) {
+      // h in [0,1] for normalized height
+      let t = (h + (self.colorOffset || 0)) % 1;
+      const rgb = fn(t);
+      return { r: rgb[0]/255, g: rgb[1]/255, b: rgb[2]/255 };
+    };
   }
 }

@@ -19,11 +19,18 @@
       <option value="burningship">Burning Ship</option>
       <option value="tricorn">Tricorn</option>
     </select>
+    <label for="colorScheme">Color Scheme:</label>
+    <select id="colorScheme">
+      <option value="rainbow">Rainbow</option>
+      <option value="fire">Fire</option>
+      <option value="ocean">Ocean</option>
+      <option value="grayscale">Grayscale</option>
+      <option value="viridis">Viridis</option>
+    </select>
+    <label for="cycleColors"><input type="checkbox" id="cycleColors"> Cycle Colors</label>
     <span id="info"></span>
   </div>
   <canvas id="fractalCanvas"></canvas>
-  <script src="fractalEngine.js"></script>
-  <script src="fractalViewer.js"></script>
   <script type="module" src="app.js"></script>
 </body>
 </html>

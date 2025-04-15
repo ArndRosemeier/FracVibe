@@ -1,3 +1,6 @@
+// Import color schemes (as ESM)
+import { colorSchemes } from './colorSchemes.js';
+
 // FractalViewer: Handles canvas rendering, pan/zoom, and partial data display
 function FractalViewer(canvas, infoCallback) {
   this.canvas = canvas;
@@ -10,6 +13,8 @@ function FractalViewer(canvas, infoCallback) {
   this.maxIter = 256;
   this.fractalType = 'mandelbrot';
   this.juliaParams = { c: [-0.4, 0.6] };
+  this.colorScheme = 'rainbow';
+  this.colorOffset = 0;
   this.dragging = false;
   this.lastMouse = null;
   this.setupEvents();
@@ -35,6 +40,16 @@ FractalViewer.prototype.setView = function(view) {
 FractalViewer.prototype.setData = function(iterArray, maxIter) {
   this.imageData = iterArray;
   this.maxIter = maxIter;
+  this.render();
+};
+
+FractalViewer.prototype.setColorScheme = function(scheme) {
+  this.colorScheme = scheme;
+  this.render();
+};
+
+FractalViewer.prototype.setColorOffset = function(offset) {
+  this.colorOffset = offset;
   this.render();
 };
 
@@ -105,13 +120,10 @@ FractalViewer.prototype.render = function() {
 
 FractalViewer.prototype.iterToColor = function(iter, maxIter) {
   if (iter === maxIter) return [0,0,0];
-  // Simple coloring: smooth gradient
-  const t = iter / maxIter;
-  const r = Math.floor(255 * t);
-  const g = Math.floor(255 * (1-t));
-  const b = Math.floor(128 + 127*Math.sin(6.28*t));
-  return [r, g, b];
+  let t = iter / maxIter;
+  t = (t + this.colorOffset) % 1;
+  const fn = colorSchemes[this.colorScheme] || colorSchemes.rainbow;
+  return fn(t);
 };
 
-// Expose globally
-window.FractalViewer = FractalViewer;
+export { FractalViewer };
