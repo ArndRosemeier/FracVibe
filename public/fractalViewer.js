@@ -57,42 +57,63 @@ FractalViewer.prototype.setOnViewChange = function(cb) {
   this.onViewChange = cb;
 };
 
+// --- SHARED VIEW STATE & GENERIC PAN/ZOOM ---
+// These functions update any view object regardless of canvas
+export function panView(view, dx, dy, width, height) {
+  const scale = view.scale;
+  const aspect = width / height;
+  view.centerX -= dx * scale / width * aspect;
+  view.centerY -= dy * scale / height;
+}
+export function zoomView(view, zoomFactor) {
+  view.scale *= zoomFactor;
+}
+
 FractalViewer.prototype.setupEvents = function() {
   this.canvas.addEventListener('mousedown', e => {
-    this.dragging = true;
-    this.lastMouse = { x: e.clientX, y: e.clientY };
+    this.onMouseDown(e);
     this.canvas.style.cursor = 'grabbing';
   });
   window.addEventListener('mousemove', e => {
-    if (!this.dragging) return;
-    const dx = e.clientX - this.lastMouse.x;
-    const dy = e.clientY - this.lastMouse.y;
-    this.lastMouse = { x: e.clientX, y: e.clientY };
-    // Pan view
-    const scale = this.view.scale;
-    const aspect = this.width / this.height;
-    this.view.centerX -= dx * scale / this.width * aspect;
-    this.view.centerY -= dy * scale / this.height;
-    this.render();
-    if (this.infoCallback) this.infoCallback(this.view);
-    if (this.onViewChange) this.onViewChange(this.view);
+    this.onMouseMove(e);
   });
-  window.addEventListener('mouseup', () => {
-    if (this.dragging) {
-      this.dragging = false;
-      this.canvas.style.cursor = 'grab';
-    }
+  window.addEventListener('mouseup', e => {
+    this.onMouseUp(e);
   });
   this.canvas.addEventListener('wheel', e => {
-    e.preventDefault();
-    // Invert zoom direction: wheel up zooms in
-    const zoom = Math.exp(e.deltaY * 0.001);
-    this.view.scale *= zoom;
-    this.render();
-    if (this.infoCallback) this.infoCallback(this.view);
-    if (this.onViewChange) this.onViewChange(this.view);
+    this.onWheel(e);
   });
   this.canvas.style.cursor = 'grab';
+};
+
+FractalViewer.prototype.onMouseDown = function(e) {
+  this.dragging = true;
+  this.lastMouse = { x: e.clientX, y: e.clientY };
+};
+
+FractalViewer.prototype.onMouseMove = function(e) {
+  if (!this.dragging) return;
+  const dx = e.clientX - this.lastMouse.x;
+  const dy = e.clientY - this.lastMouse.y;
+  this.lastMouse = { x: e.clientX, y: e.clientY };
+  panView(this.view, dx, dy, this.width, this.height);
+  this.render();
+  if (this.infoCallback) this.infoCallback(this.view);
+  if (this.onViewChange) this.onViewChange(this.view);
+};
+
+FractalViewer.prototype.onMouseUp = function(e) {
+  this.dragging = false;
+  this.canvas.style.cursor = 'grab';
+};
+
+FractalViewer.prototype.onWheel = function(e) {
+  e.preventDefault();
+  const zoom = Math.exp(e.deltaY * 0.001);
+  zoomView(this.view, zoom);
+  this.render();
+  if (this.infoCallback) this.infoCallback(this.view);
+  if (this.onViewChange) this.onViewChange(this.view);
 };
 
 FractalViewer.prototype.render = function() {

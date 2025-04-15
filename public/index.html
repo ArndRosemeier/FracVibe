@@ -32,9 +32,12 @@
     <span id="maxIterValue">256</span>
     <label for="cycleColors"><input type="checkbox" id="cycleColors"> Cycle Colors</label>
     <label for="webglRender"><input type="checkbox" id="webglRender"> WebGL GPU Rendering</label>
+    <button id="webglDemoBtn" style="margin-left:1em;">Minimal WebGL Demo</button>
     <span id="info"></span>
+    <span id="renderTime" style="margin-left:1em;color:#888;"></span>
   </div>
   <canvas id="fractalCanvas"></canvas>
+  <canvas id="fractalCanvasWebGL" style="display:none;"></canvas>
   <script type="module" src="app.js"></script>
 </body>
 </html>
