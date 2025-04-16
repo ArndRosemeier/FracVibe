@@ -92,6 +92,89 @@ loadLocationBtn.addEventListener('click', () => {
     locationSortSelect.addEventListener('change', renderSavedLocations);
   }
   renderSavedLocations();
+  // Add export/import buttons at the bottom of the sidebar
+  let sidebarFooter = document.getElementById('sidebarFooter');
+  if (!sidebarFooter) {
+    sidebarFooter = document.createElement('div');
+    sidebarFooter.id = 'sidebarFooter';
+    sidebarFooter.style.display = 'flex';
+    sidebarFooter.style.justifyContent = 'flex-start';
+    sidebarFooter.style.alignItems = 'center';
+    sidebarFooter.style.gap = '1em';
+    sidebarFooter.style.padding = '1em 1.3em 1em 1.3em';
+    sidebarFooter.style.borderTop = '1px solid #333';
+    sidebarFooter.style.position = 'absolute';
+    sidebarFooter.style.bottom = '0';
+    sidebarFooter.style.width = '100%';
+    // Export button
+    const exportBtn = document.createElement('button');
+    exportBtn.textContent = 'Export';
+    exportBtn.style.background = '#444';
+    exportBtn.style.color = '#ffe066';
+    exportBtn.style.border = 'none';
+    exportBtn.style.borderRadius = '5px';
+    exportBtn.style.padding = '0.4em 1.2em';
+    exportBtn.style.cursor = 'pointer';
+    exportBtn.addEventListener('click', () => {
+      const data = JSON.stringify(memoryRepo.getAll('timestamp'), null, 2);
+      const blob = new Blob([data], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'fractal_locations.json';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }, 100);
+    });
+    // Import button
+    const importBtn = document.createElement('button');
+    importBtn.textContent = 'Import';
+    importBtn.style.background = '#ffe066';
+    importBtn.style.color = '#222';
+    importBtn.style.border = 'none';
+    importBtn.style.borderRadius = '5px';
+    importBtn.style.padding = '0.4em 1.2em';
+    importBtn.style.cursor = 'pointer';
+    importBtn.addEventListener('click', () => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.json,application/json';
+      input.style.display = 'none';
+      input.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+          try {
+            const imported = JSON.parse(evt.target.result);
+            if (Array.isArray(imported)) {
+              imported.forEach(loc => {
+                // Remove existing with same id, then add
+                memoryRepo.remove(loc.id);
+                memoryRepo.save(loc);
+              });
+              renderSavedLocations();
+              alert('Locations imported successfully.');
+            } else {
+              alert('Invalid file format.');
+            }
+          } catch (err) {
+            alert('Error importing locations: ' + err.message);
+          }
+        };
+        reader.readAsText(file);
+      });
+      document.body.appendChild(input);
+      input.click();
+      setTimeout(() => document.body.removeChild(input), 5000);
+    });
+    sidebarFooter.appendChild(exportBtn);
+    sidebarFooter.appendChild(importBtn);
+    loadLocationSidebar.appendChild(sidebarFooter);
+  }
   loadLocationSidebar.style.display = 'block';
 });
 
