@@ -1,0 +1,38 @@
+/* Fractal Splash Text Style */
+.fractal-title {
+  font-size: 6em;
+  font-weight: bold;
+  text-align: center;
+  margin-top: 15vh;
+  background: linear-gradient(90deg, #f00, #0f0, #00f); /* fallback for debug */
+  color: transparent;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  letter-spacing: 0.04em;
+  user-select: none;
+  /* pointer-events: none; */
+  filter: drop-shadow(0 2px 12px #000a);
+  transition: background 0.4s;
+  background-color: #222;
+  border: 2px solid red;
+}
+
+
+#fractal-title-canvas {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  z-index: 1;
+  pointer-events: none;
+  opacity: 0.85;
+}
+
+.fractal-title-container {
+  position: fixed;
+  top: 0; left: 0; width: 100vw; height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+  pointer-events: none;
+}
