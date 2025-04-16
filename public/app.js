@@ -21,10 +21,11 @@ let viewer = new FractalViewer(canvas, updateInfo);
 const memoryRepo = new FractalMemoryRepository();
 const saveLocationBtn = document.getElementById('saveLocationBtn');
 const loadLocationBtn = document.getElementById('loadLocationBtn');
-const loadLocationModal = document.getElementById('loadLocationModal');
-const savedLocationsList = document.getElementById('savedLocationsList');
-const closeLoadLocationModal = document.getElementById('closeLoadLocationModal');
-const locationSortSelect = document.getElementById('locationSortSelect');
+const loadLocationSidebar = document.getElementById('loadLocationSidebar');
+const closeLoadLocationSidebar = document.getElementById('closeLoadLocationSidebar');
+// We'll create the savedLocationsList and locationSortSelect elements dynamically in the sidebar
+let savedLocationsList = null;
+let locationSortSelect = null;
 
 function getCurrentLocationState() {
   return {
@@ -55,19 +56,47 @@ saveLocationBtn.addEventListener('click', () => {
     conf.style.opacity = '0';
     setTimeout(() => { conf.style.display = 'none'; }, 700);
   }, 1200);
+  // If sidebar is open, update it
+  if (loadLocationSidebar && loadLocationSidebar.style.display !== 'none') {
+    renderSavedLocations();
+  }
 });
 
 loadLocationBtn.addEventListener('click', () => {
+  // Build sidebar content if not already present
+  if (!savedLocationsList) {
+    savedLocationsList = document.createElement('div');
+    savedLocationsList.id = 'savedLocationsList';
+    savedLocationsList.style.maxHeight = '70vh';
+    savedLocationsList.style.overflowY = 'auto';
+    savedLocationsList.style.margin = '0 1.3em 1em 1.3em';
+    // Insert after sort row
+    const sidebar = loadLocationSidebar;
+    const sortRow = document.createElement('div');
+    sortRow.style.display = 'flex';
+    sortRow.style.alignItems = 'center';
+    sortRow.style.gap = '1em';
+    sortRow.style.margin = '0 1.3em 0.5em 1.3em';
+    const sortLabel = document.createElement('label');
+    sortLabel.textContent = 'Sort by:';
+    sortLabel.htmlFor = 'locationSortSelect';
+    locationSortSelect = document.createElement('select');
+    locationSortSelect.id = 'locationSortSelect';
+    locationSortSelect.style.fontSize = '1em';
+    locationSortSelect.style.padding = '0.1em 0.5em';
+    locationSortSelect.innerHTML = `<option value="timestamp">Most Recent</option><option value="name">Name</option>`;
+    sortRow.appendChild(sortLabel);
+    sortRow.appendChild(locationSortSelect);
+    sidebar.appendChild(sortRow);
+    sidebar.appendChild(savedLocationsList);
+    locationSortSelect.addEventListener('change', renderSavedLocations);
+  }
   renderSavedLocations();
-  loadLocationModal.style.display = 'flex';
+  loadLocationSidebar.style.display = 'block';
 });
 
-if (locationSortSelect) {
-  locationSortSelect.addEventListener('change', renderSavedLocations);
-}
-
-closeLoadLocationModal.addEventListener('click', () => {
-  loadLocationModal.style.display = 'none';
+closeLoadLocationSidebar.addEventListener('click', () => {
+  loadLocationSidebar.style.display = 'none';
 });
 
 function renderSavedLocations() {
@@ -118,11 +147,21 @@ function renderSavedLocations() {
       viewer.maxIter = loc.maxIter;
       if (webglCheckbox.checked) {
         updateWebGLState();
+        // After changing mode, re-apply the loaded view
+        viewer.setView({ centerX: loc.centerX, centerY: loc.centerY, scale: loc.scale });
+        renderWebGL();
+      } else {
+        updateWebGLState(); // in case switching from GPU to CPU
+        viewer.setView({ centerX: loc.centerX, centerY: loc.centerY, scale: loc.scale });
+        startFractalCalculationWithTiming();
+      }
+      // Always trigger a rerender in the current mode
+      if (webglCheckbox.checked) {
         renderWebGL();
       } else {
         startFractalCalculationWithTiming();
       }
-      loadLocationModal.style.display = 'none';
+      // loadLocationModal.style.display = 'none';
     });
     actions.appendChild(loadBtn);
     const delBtn = document.createElement('button');
@@ -611,7 +650,14 @@ function setRenderTimeDisplay(ms) {
 }
 
 // Hook up checkbox
-webglCheckbox.addEventListener('change', updateWebGLState);
+webglCheckbox.addEventListener('change', () => {
+  updateWebGLState();
+  if (webglCheckbox.checked) {
+    renderWebGL();
+  } else {
+    startFractalCalculationWithTiming();
+  }
+});
 
 // Update rendering on any parameter change
 const originalRender = viewer.render.bind(viewer);
