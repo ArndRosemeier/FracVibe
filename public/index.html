@@ -36,7 +36,24 @@
     <label for="webglRender"><input type="checkbox" id="webglRender" checked> WebGL GPU Rendering</label>
     <span id="info"></span>
     <span id="renderTime" style="margin-left:1em;color:#888;"></span>
+    <button id="saveLocationBtn" style="margin-left:1em;">Save Location</button>
+    <button id="loadLocationBtn">Load Location</button>
   </div>
+  <div id="loadLocationModal" style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;background:#0008;z-index:2000;align-items:center;justify-content:center;">
+    <div style="background:#222;padding:2em 2em 1em 2em;border-radius:10px;min-width:320px;max-width:90vw;max-height:80vh;overflow:auto;color:#fff;">
+      <h3>Saved Locations</h3>
+      <div style="display:flex;align-items:center;gap:1em;margin-bottom:0.5em;">
+        <label for="locationSortSelect">Sort by:</label>
+        <select id="locationSortSelect" style="font-size:1em;padding:0.1em 0.5em;">
+          <option value="timestamp">Most Recent</option>
+          <option value="name">Name</option>
+        </select>
+      </div>
+      <div id="savedLocationsList" style="max-height:40vh;overflow-y:auto;padding:0;margin:0 0 1em 0;"></div>
+      <button id="closeLoadLocationModal">Close</button>
+    </div>
+  </div>
+  <div id="saveLocationConfirmation" style="display:none;position:fixed;top:32px;left:50%;transform:translateX(-50%);background:#222;color:#ffe066;padding:0.7em 2em;border-radius:8px;font-size:1.2em;z-index:3000;box-shadow:0 2px 16px #0008;opacity:0;transition:opacity 0.7s;pointer-events:none;">Location saved!</div>
   <canvas id="fractalCanvas"></canvas>
   <canvas id="fractalCanvasWebGL" style="display:none;"></canvas>
   <script type="module" src="app.js"></script>

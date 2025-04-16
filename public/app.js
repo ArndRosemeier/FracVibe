@@ -3,6 +3,7 @@ import { FractalViewer } from './fractalViewer.js';
 import { Fractal3DViewer } from './fractal3d.js';
 import { FractalEngine } from './fractalEngineMain.js';
 import { WebGLFractalRenderer } from './webglFractal.js';
+import { FractalMemoryRepository } from './memoryRepository.js';
 
 const canvas = document.getElementById('fractalCanvas');
 const canvasWebGL = document.getElementById('fractalCanvasWebGL');
@@ -16,6 +17,133 @@ const webglCheckbox = document.getElementById('webglRender');
 const renderTimeElem = document.getElementById('renderTime');
 
 let viewer = new FractalViewer(canvas, updateInfo);
+// --- Fractal Location Memory Repository and UI ---
+const memoryRepo = new FractalMemoryRepository();
+const saveLocationBtn = document.getElementById('saveLocationBtn');
+const loadLocationBtn = document.getElementById('loadLocationBtn');
+const loadLocationModal = document.getElementById('loadLocationModal');
+const savedLocationsList = document.getElementById('savedLocationsList');
+const closeLoadLocationModal = document.getElementById('closeLoadLocationModal');
+const locationSortSelect = document.getElementById('locationSortSelect');
+
+function getCurrentLocationState() {
+  return {
+    id: Date.now() + Math.random(),
+    name: '',
+    centerX: viewer.view.centerX,
+    centerY: viewer.view.centerY,
+    scale: viewer.view.scale,
+    fractalType: typeSelect.value,
+    maxIter: parseInt(maxIterSlider.value, 10),
+    renderer: webglCheckbox.checked ? 'GPU' : 'CPU',
+    timestamp: Date.now()
+  };
+}
+
+saveLocationBtn.addEventListener('click', () => {
+  const state = getCurrentLocationState();
+  const defaultName = `Location (${state.centerX.toFixed(3)}, ${state.centerY.toFixed(3)}, zoom ${(1/state.scale).toFixed(2)})`;
+  const userName = window.prompt('Name this location (optional):', defaultName);
+  if (userName === null) return; // Cancelled
+  state.name = userName && userName.trim() ? userName.trim() : defaultName;
+  memoryRepo.save(state);
+  // Non-modal fade-out confirmation
+  const conf = document.getElementById('saveLocationConfirmation');
+  conf.style.display = 'block';
+  conf.style.opacity = '1';
+  setTimeout(() => {
+    conf.style.opacity = '0';
+    setTimeout(() => { conf.style.display = 'none'; }, 700);
+  }, 1200);
+});
+
+loadLocationBtn.addEventListener('click', () => {
+  renderSavedLocations();
+  loadLocationModal.style.display = 'flex';
+});
+
+if (locationSortSelect) {
+  locationSortSelect.addEventListener('change', renderSavedLocations);
+}
+
+closeLoadLocationModal.addEventListener('click', () => {
+  loadLocationModal.style.display = 'none';
+});
+
+function renderSavedLocations() {
+  savedLocationsList.innerHTML = '';
+  const sortBy = locationSortSelect ? locationSortSelect.value : 'timestamp';
+  const locations = memoryRepo.getAll(sortBy);
+  if (!locations.length) {
+    const div = document.createElement('div');
+    div.textContent = 'No locations saved yet.';
+    div.style.padding = '1em';
+    savedLocationsList.appendChild(div);
+    return;
+  }
+  locations.forEach(loc => {
+    const row = document.createElement('div');
+    row.style.display = 'flex';
+    row.style.alignItems = 'center';
+    row.style.justifyContent = 'space-between';
+    row.style.padding = '0.4em 0.5em';
+    row.style.borderBottom = '1px solid #333';
+    row.style.gap = '1em';
+    // Info
+    const info = document.createElement('div');
+    info.style.flex = '1 1 0';
+    info.style.overflow = 'hidden';
+    info.innerHTML = `<span style="font-weight:bold;">${loc.name}</span><br><span style="font-size:0.9em;color:#ffc966;">${new Date(loc.timestamp).toLocaleString()}</span><br><span style="font-size:0.9em;color:#aaa;">Type: ${loc.fractalType}, Iter: ${loc.maxIter}, ${loc.renderer}</span>`;
+    row.appendChild(info);
+    // Actions
+    const actions = document.createElement('div');
+    actions.style.display = 'flex';
+    actions.style.gap = '0.5em';
+    const loadBtn = document.createElement('button');
+    loadBtn.textContent = 'Load';
+    loadBtn.style.background = '#ffe066';
+    loadBtn.style.color = '#222';
+    loadBtn.style.fontWeight = 'bold';
+    loadBtn.style.border = 'none';
+    loadBtn.style.borderRadius = '5px';
+    loadBtn.style.padding = '0.2em 1.1em';
+    loadBtn.style.cursor = 'pointer';
+    loadBtn.addEventListener('click', () => {
+      typeSelect.value = loc.fractalType;
+      maxIterSlider.value = loc.maxIter;
+      maxIterValue.textContent = loc.maxIter;
+      webglCheckbox.checked = (loc.renderer === 'GPU');
+      viewer.setFractal(loc.fractalType);
+      viewer.setView({ centerX: loc.centerX, centerY: loc.centerY, scale: loc.scale });
+      viewer.maxIter = loc.maxIter;
+      if (webglCheckbox.checked) {
+        updateWebGLState();
+        renderWebGL();
+      } else {
+        startFractalCalculationWithTiming();
+      }
+      loadLocationModal.style.display = 'none';
+    });
+    actions.appendChild(loadBtn);
+    const delBtn = document.createElement('button');
+    delBtn.textContent = 'Delete';
+    delBtn.style.background = '#444';
+    delBtn.style.color = '#ffe066';
+    delBtn.style.border = 'none';
+    delBtn.style.borderRadius = '5px';
+    delBtn.style.padding = '0.2em 0.8em';
+    delBtn.style.cursor = 'pointer';
+    delBtn.addEventListener('click', () => {
+      memoryRepo.remove(loc.id);
+      renderSavedLocations();
+    });
+    actions.appendChild(delBtn);
+    row.appendChild(actions);
+    savedLocationsList.appendChild(row);
+  });
+}
+
+
 // Start with a very zoomed-out view (tiny Mandelbrot)
 viewer.view.scale = 300;
 
