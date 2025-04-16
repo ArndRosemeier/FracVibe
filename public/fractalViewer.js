@@ -10,7 +10,7 @@ function FractalViewer(canvas, infoCallback) {
   this.height = canvas.height = window.innerHeight;
   this.view = { centerX: -0.5, centerY: 0, scale: 3 };
   this.imageData = null; // Int32Array of iterations
-  this.maxIter = 256;
+  this.maxIter = 512;
   this.fractalType = 'mandelbrot';
   this.juliaParams = { c: [-0.4, 0.6] };
   this.colorScheme = 'rainbow';
@@ -32,6 +32,7 @@ FractalViewer.prototype.setFractal = function(type, params) {
   if (params) this.juliaParams = params;
 };
 
+// (Patched in app.js for zoom capping in WebGL mode)
 FractalViewer.prototype.setView = function(view) {
   this.view = { ...view };
   this.render();
@@ -107,10 +108,17 @@ FractalViewer.prototype.onMouseUp = function(e) {
   this.canvas.style.cursor = 'grab';
 };
 
+// (Patched in app.js for zoom capping in WebGL mode)
 FractalViewer.prototype.onWheel = function(e) {
   e.preventDefault();
   const zoom = Math.exp(e.deltaY * 0.001);
   zoomView(this.view, zoom);
+  // --- Clamp zoom for WebGL mode ---
+  if (typeof WEBGL_MIN_SCALE !== 'undefined' && typeof webglCheckbox !== 'undefined' && webglCheckbox.checked) {
+    if (this.view.scale < WEBGL_MIN_SCALE) {
+      this.view.scale = WEBGL_MIN_SCALE;
+    }
+  }
   this.render();
   if (this.infoCallback) this.infoCallback(this.view);
   if (this.onViewChange) this.onViewChange(this.view);

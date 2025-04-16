@@ -16,6 +16,39 @@ const webglCheckbox = document.getElementById('webglRender');
 const renderTimeElem = document.getElementById('renderTime');
 
 let viewer = new FractalViewer(canvas, updateInfo);
+// Start with a very zoomed-out view (tiny Mandelbrot)
+viewer.view.scale = 300;
+
+// --- WebGL zoom cap logic ---
+const WEBGL_ZOOM_CAP = 10000;
+const WEBGL_MIN_SCALE = 1 / WEBGL_ZOOM_CAP;
+let askedCpuSwitchAtZoomCap = false;
+let deniedCpuSwitchAtZoomCap = false;
+
+const originalSetView = viewer.setView.bind(viewer);
+viewer.setView = function(view) {
+  // Cap zoom in WebGL mode
+  if (webglCheckbox.checked) {
+    if (view.scale < WEBGL_MIN_SCALE) {
+      view = { ...view, scale: WEBGL_MIN_SCALE };
+      if (!askedCpuSwitchAtZoomCap && !deniedCpuSwitchAtZoomCap) {
+        askedCpuSwitchAtZoomCap = true;
+        setTimeout(() => {
+          if (window.confirm('Zoom level limit reached for GPU mode. Switch to CPU mode for deeper zoom?')) {
+            webglCheckbox.checked = false;
+            updateWebGLState();
+          } else {
+            deniedCpuSwitchAtZoomCap = true;
+          }
+        }, 10);
+      }
+    }
+  }
+  originalSetView(view);
+};
+
+viewer.setView(viewer.view);
+updateInfo(viewer.view);
 let worker = new Worker('fractalWorker.js');
 let currentResult = null;
 let aborting = false;
@@ -36,6 +69,11 @@ let colorCycleRequestId = null;
 let progressiveState = null;
 
 let webglRenderer = null;
+
+// Track if user has been asked to switch to CPU mode at zoom cap
+// (DECLARED ONCE at the top for global use)
+
+
 
 let lastRenderStart = 0;
 let lastRenderDuration = 0;
@@ -81,6 +119,14 @@ function updateInfo(view) {
 
 typeSelect.addEventListener('change', () => {
   viewer.setFractal(typeSelect.value);
+  // Reset view to default for each fractal type
+  let defaultView;
+  if (typeSelect.value === 'julia') {
+    defaultView = { centerX: 0, centerY: 0, scale: 3 };
+  } else {
+    defaultView = { centerX: -0.5, centerY: 0, scale: 3 };
+  }
+  viewer.setView(defaultView);
   startFractalCalculationWithTiming();
 });
 
@@ -190,14 +236,48 @@ viewer.setOnViewChange(onViewChangeHandler);
 
 // Set WebGL and color cycling as default
 webglCheckbox.checked = true;
-cycleColorsCheckbox.checked = true;
+cycleColorsCheckbox.checked = false;
 updateWebGLState();
 
-// Start color cycling immediately if enabled
+// Animate zoom from 300 to 3 (default) at startup, then show splash
+(function animateZoom() {
+  let target = 3;
+  let minStep = 0.01;
+  let delay = 16; // ms per frame (about 60fps)
+  function loop() {
+    if (viewer.view.scale > target) {
+      let diff = viewer.view.scale - target;
+      let thisStep = Math.max(diff * 0.08, minStep); // Easing: smaller steps as we approach
+      viewer.view.scale = Math.max(viewer.view.scale - thisStep, target);
+      viewer.setView(viewer.view);
+      updateInfo(viewer.view);
+      setTimeout(loop, delay);
+    } else {
+      // Animation done, show splash
+      updateInfo(viewer.view);
+      showFractVibeSplash();
+    }
+  }
+  loop();
+})();
+
+function showFractVibeSplash() {
+  const splash = document.getElementById('fractVibeSplash');
+  if (!splash) return;
+  splash.style.opacity = '1';
+  // Fade out after 2 seconds
+  setTimeout(() => {
+    splash.style.opacity = '0';
+  }, 2000);
+}
+
+// Start color cycling only if enabled (now default OFF)
 if (cycleColorsCheckbox.checked) {
   colorCycleActive = true;
   colorCycleLastTime = performance.now();
   colorCycleRequestId = requestAnimationFrame(colorCycleLoop);
+} else {
+  colorCycleActive = false;
 }
 
 // Initial calculation
@@ -283,28 +363,6 @@ maxIterSlider.addEventListener('input', () => {
   startFractalCalculationWithTiming();
 });
 
-// Minimal WebGL Demo Button
-const webglDemoBtn = document.getElementById('webglDemoBtn');
-webglDemoBtn.addEventListener('click', () => {
-  let demoCanvas = document.createElement('canvas');
-  demoCanvas.width = 100;
-  demoCanvas.height = 100;
-  demoCanvas.style.position = 'fixed';
-  demoCanvas.style.top = '10px';
-  demoCanvas.style.right = '10px';
-  demoCanvas.style.border = '2px solid #0f0';
-  document.body.appendChild(demoCanvas);
-  let gl = demoCanvas.getContext('webgl') || demoCanvas.getContext('experimental-webgl');
-  if (gl) {
-    gl.clearColor(0.2, 0.8, 0.2, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    alert('WebGL context created and cleared! You should see a green square in the corner.');
-  } else {
-    alert('Failed to create WebGL context!');
-  }
-  setTimeout(() => demoCanvas.remove(), 3000);
-});
-
 // --- Helper: Map color scheme string to shader index ---
 const colorSchemeMap = {
   'rainbow': 0,
@@ -339,6 +397,29 @@ function updateWebGLState() {
     // Now set canvas size (must be visible)
     canvasWebGL.width = window.innerWidth;
     canvasWebGL.height = window.innerHeight;
+    viewer.setView = function(view) {
+  // Cap zoom in WebGL mode
+  if (webglCheckbox.checked) {
+    const maxZoom = 10000;
+    if (1 / view.scale > maxZoom) {
+      view = { ...view, scale: 1 / maxZoom };
+      // Ask user to switch to CPU mode only once
+      if (!askedCpuSwitchAtZoomCap && !deniedCpuSwitchAtZoomCap) {
+        askedCpuSwitchAtZoomCap = true;
+        setTimeout(() => {
+          if (window.confirm('Zoom level limit reached for GPU mode. Switch to CPU mode for deeper zoom?')) {
+            webglCheckbox.checked = false;
+            updateWebGLState();
+          } else {
+            deniedCpuSwitchAtZoomCap = true;
+          }
+        }, 10);
+      }
+    }
+  }
+  this.view = { ...view };
+  this.render();
+};
     setTimeout(() => {
       // Log style right before context creation
       console.log('[WebGL] Before context: style.display =', canvasWebGL.style.display);
@@ -366,11 +447,32 @@ function updateWebGLState() {
 function renderWebGL() {
   lastRenderStart = performance.now();
   if (!webglRenderer) return;
+  // --- Enforce zoom cap at render time ---
+  if (webglCheckbox.checked && viewer.view.scale < WEBGL_MIN_SCALE) {
+    viewer.view.scale = WEBGL_MIN_SCALE;
+    if (!askedCpuSwitchAtZoomCap && !deniedCpuSwitchAtZoomCap) {
+      askedCpuSwitchAtZoomCap = true;
+      setTimeout(() => {
+        if (window.confirm('Zoom level limit reached for GPU mode. Switch to CPU mode for deeper zoom?')) {
+          webglCheckbox.checked = false;
+          updateWebGLState();
+        } else {
+          deniedCpuSwitchAtZoomCap = true;
+        }
+      }, 10);
+    }
+  }
   console.log('[WebGL] renderWebGL: view', JSON.stringify(viewer.view), 'maxIter', viewer.maxIter, 'colorScheme', viewer.colorScheme);
+  // Map fractal type string to int
+  const typeMap = { mandelbrot: 0, julia: 1, burningship: 2, tricorn: 3 };
+  const fractalTypeInt = typeMap[viewer.fractalType] || 0;
+  const juliaParams = (fractalTypeInt === 1) ? viewer.juliaParams : undefined;
   webglRenderer.render(
     viewer.view,
     viewer.maxIter,
-    getColorSchemeIdx()
+    getColorSchemeIdx(),
+    fractalTypeInt,
+    juliaParams
   );
   lastRenderDuration = performance.now() - lastRenderStart;
   setRenderTimeDisplay(lastRenderDuration);

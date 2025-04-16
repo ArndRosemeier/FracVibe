@@ -38,19 +38,58 @@ export class WebGLFractalRenderer {
       uniform int u_maxIter;
       uniform int u_colorScheme;
       uniform float u_colorOffset;
+      uniform int u_fractalType;
+      uniform float u_julia_cx;
+      uniform float u_julia_cy;
       void main() {
         float x0 = u_centerX + (v_uv.x - 0.5) * u_scale * u_aspect;
         float y0 = u_centerY + ((1.0 - v_uv.y) - 0.5) * u_scale;
-        float x = 0.0;
-        float y = 0.0;
+        float x, y;
         int iter = 0;
-        for (int i = 0; i < 1024; i++) {
-          if (iter >= u_maxIter) break;
-          float xtemp = x * x - y * y + x0;
-          y = 2.0 * x * y + y0;
-          x = xtemp;
-          if (x * x + y * y > 4.0) break;
-          iter++;
+        if (u_fractalType == 1) { // Julia
+          x = x0;
+          y = y0;
+          for (int i = 0; i < 1024; i++) {
+            if (iter >= u_maxIter) break;
+            float xtemp = x * x - y * y + u_julia_cx;
+            y = 2.0 * x * y + u_julia_cy;
+            x = xtemp;
+            if (x * x + y * y > 4.0) break;
+            iter++;
+          }
+        } else if (u_fractalType == 2) { // Burning Ship
+          x = 0.0;
+          y = 0.0;
+          for (int i = 0; i < 1024; i++) {
+            if (iter >= u_maxIter) break;
+            float xtemp = x * x - y * y + x0;
+            y = abs(2.0 * x * y) + y0;
+            x = abs(xtemp);
+            if (x * x + y * y > 4.0) break;
+            iter++;
+          }
+        } else if (u_fractalType == 3) { // Tricorn
+          x = 0.0;
+          y = 0.0;
+          for (int i = 0; i < 1024; i++) {
+            if (iter >= u_maxIter) break;
+            float xtemp = x * x - y * y + x0;
+            y = -2.0 * x * y + y0;
+            x = xtemp;
+            if (x * x + y * y > 4.0) break;
+            iter++;
+          }
+        } else { // Mandelbrot
+          x = 0.0;
+          y = 0.0;
+          for (int i = 0; i < 1024; i++) {
+            if (iter >= u_maxIter) break;
+            float xtemp = x * x - y * y + x0;
+            y = 2.0 * x * y + y0;
+            x = xtemp;
+            if (x * x + y * y > 4.0) break;
+            iter++;
+          }
         }
         float t = float(iter) / float(u_maxIter);
         t = mod(t + u_colorOffset, 1.0);
@@ -160,6 +199,9 @@ export class WebGLFractalRenderer {
     this.u_maxIter = gl.getUniformLocation(this.program, 'u_maxIter');
     this.u_colorScheme = gl.getUniformLocation(this.program, 'u_colorScheme');
     this.u_colorOffset = gl.getUniformLocation(this.program, 'u_colorOffset');
+    this.u_fractalType = gl.getUniformLocation(this.program, 'u_fractalType');
+    this.u_julia_cx = gl.getUniformLocation(this.program, 'u_julia_cx');
+    this.u_julia_cy = gl.getUniformLocation(this.program, 'u_julia_cy');
     this.colorOffset = 0;
   }
 
@@ -167,7 +209,7 @@ export class WebGLFractalRenderer {
     this.colorOffset = offset;
   }
 
-  render(view, maxIter, colorSchemeIdx = 0) {
+  render(view, maxIter, colorSchemeIdx = 0, fractalType = 0, juliaParams = undefined) {
     const gl = this.gl;
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.useProgram(this.program);
@@ -178,6 +220,17 @@ export class WebGLFractalRenderer {
     gl.uniform1i(this.u_maxIter, maxIter);
     gl.uniform1i(this.u_colorScheme, colorSchemeIdx);
     gl.uniform1f(this.u_colorOffset, this.colorOffset || 0);
+    // Fractal type: 0=mandelbrot, 1=julia, 2=burningship, 3=tricorn
+    gl.uniform1i(this.u_fractalType, fractalType);
+    if (fractalType === 1 && juliaParams && Array.isArray(juliaParams.c)) {
+      gl.uniform1f(this.u_julia_cx, juliaParams.c[0]);
+      gl.uniform1f(this.u_julia_cy, juliaParams.c[1]);
+    } else {
+      gl.uniform1f(this.u_julia_cx, 0.0);
+      gl.uniform1f(this.u_julia_cy, 0.0);
+    }
+    // Debug log
+    console.log('[WebGL] render: fractalType', fractalType, 'juliaParams', juliaParams);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   };
 
