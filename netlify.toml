@@ -1,0 +1,17 @@
+# Netlify configuration for FracVibe static site
+[build]
+  publish = "public"
+  command = ""
+
+[build.environment]
+  NODE_VERSION = "18"
+
+[dev]
+  publish = "public"
+  command = ""
+
+# Redirect all requests to index.html (for SPAs)
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
