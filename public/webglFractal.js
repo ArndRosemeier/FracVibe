@@ -37,6 +37,7 @@ export class WebGLFractalRenderer {
       uniform float u_centerX, u_centerY, u_scale, u_aspect;
       uniform int u_maxIter;
       uniform int u_colorScheme;
+      uniform float u_colorOffset;
       void main() {
         float x0 = u_centerX + (v_uv.x - 0.5) * u_scale * u_aspect;
         float y0 = u_centerY + ((1.0 - v_uv.y) - 0.5) * u_scale;
@@ -52,6 +53,7 @@ export class WebGLFractalRenderer {
           iter++;
         }
         float t = float(iter) / float(u_maxIter);
+        t = mod(t + u_colorOffset, 1.0);
         vec3 color;
         if (iter == u_maxIter) {
           color = vec3(0.0,0.0,0.0);
@@ -157,6 +159,12 @@ export class WebGLFractalRenderer {
     this.u_aspect = gl.getUniformLocation(this.program, 'u_aspect');
     this.u_maxIter = gl.getUniformLocation(this.program, 'u_maxIter');
     this.u_colorScheme = gl.getUniformLocation(this.program, 'u_colorScheme');
+    this.u_colorOffset = gl.getUniformLocation(this.program, 'u_colorOffset');
+    this.colorOffset = 0;
+  }
+
+  setColorOffset(offset) {
+    this.colorOffset = offset;
   }
 
   render(view, maxIter, colorSchemeIdx = 0) {
@@ -169,8 +177,9 @@ export class WebGLFractalRenderer {
     gl.uniform1f(this.u_aspect, this.canvas.width / this.canvas.height);
     gl.uniform1i(this.u_maxIter, maxIter);
     gl.uniform1i(this.u_colorScheme, colorSchemeIdx);
+    gl.uniform1f(this.u_colorOffset, this.colorOffset || 0);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
-  }
+  };
 
   destroy() {
     // No longer forcibly lose the context! Just null out the reference.

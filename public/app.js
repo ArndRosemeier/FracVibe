@@ -27,7 +27,7 @@ let lastJobParams = null; // Store last parameters for progressive refinement
 let fractal3D = null;
 let in3DMode = false;
 
-let colorCycleActive = false;
+let colorCycleActive = true;
 let colorCycleOffset = 0;
 let colorCycleLastTime = 0;
 let colorCycleRequestId = null;
@@ -188,6 +188,18 @@ function onViewChangeHandler() {
 }
 viewer.setOnViewChange(onViewChangeHandler);
 
+// Set WebGL and color cycling as default
+webglCheckbox.checked = true;
+cycleColorsCheckbox.checked = true;
+updateWebGLState();
+
+// Start color cycling immediately if enabled
+if (cycleColorsCheckbox.checked) {
+  colorCycleActive = true;
+  colorCycleLastTime = performance.now();
+  colorCycleRequestId = requestAnimationFrame(colorCycleLoop);
+}
+
 // Initial calculation
 startFractalCalculationWithTiming();
 
@@ -232,6 +244,10 @@ function colorCycleLoop(ts) {
   if (fractal3D && fractal3D.setColorOffset) {
     fractal3D.setColorOffset(colorCycleOffset);
   }
+  if (webglCheckbox.checked && webglRenderer && webglRenderer.setColorOffset) {
+    webglRenderer.setColorOffset(colorCycleOffset);
+    renderWebGL();
+  }
   colorCycleRequestId = requestAnimationFrame(colorCycleLoop);
 }
 
@@ -246,6 +262,10 @@ cycleColorsCheckbox.addEventListener('change', () => {
     colorCycleOffset = 0;
     viewer.setColorOffset(0);
     if (fractal3D && fractal3D.setColorOffset) fractal3D.setColorOffset(0);
+    if (webglCheckbox.checked && webglRenderer && webglRenderer.setColorOffset) {
+      webglRenderer.setColorOffset(0);
+      renderWebGL();
+    }
   }
 });
 
