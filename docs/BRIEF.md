@@ -47,8 +47,11 @@ The behaviours that must go RED when broken, each phrased as a statement. Reuse
    **BLOCKED** with the reasoning.
 
 ## Docs to amend in the SAME commit
-`docs/STATE.md` (your row), `docs/DECISIONS.md` (a new row if you decided
-something), and any claim in `MODERNIZATION.md` your change makes false.
+`docs/PLAN.md` (your slice's status) and `docs/DECISIONS.md` (a new row if you
+decided something), and any claim in `MODERNIZATION.md` your change makes false.
+**`docs/STATE.md` is the DISPATCHER's file — do not edit it.** Report the facts and
+the dispatcher records them; one hot board file with one writer avoids a docs
+conflict on every landing.
 
 ## Your report (short)
 **LANDED** or **BLOCKED**, then: sha; gate exit code + counts + the raw log path;

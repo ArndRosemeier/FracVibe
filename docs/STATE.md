@@ -11,19 +11,19 @@ reconciled: origin/main=dea8a55 · local main=c6c87e2 (0 behind, 4 ahead) · 202
 OWNER | 2026-09-21 | decision=**push approved** — owner chose "Push all 5 commits to origin/main" | effect=Phase 0 + machinery land on `origin/main`; the deployed blank-canvas site is fixed
 OWNER | 2026-09-21 | verbatim: *"I want this to be resilient and correct, you can take your time to achieve that state. You be the judge how to achieve this best."* | effect=standing mandate; the METHOD is the dispatcher's judgement and is written down in `docs/PLAN.md` | ledger row 6
 
-## ⚠ THE ONE THING THAT MATTERS NOW
-The push is owner-approved and is executed at the gated tip. Until it lands,
-`origin/main` is the **blank-canvas build** in `MODERNIZATION.md` §1 row 1. After it
-lands, the live priority is the campaign in `docs/PLAN.md`, whose first writer is
-slice **S1 (canvas-truth: B4 + B9)**.
+## ⚠ BLOCKED — the owner-approved push cannot be performed from this host
+BLOCKER | push-to-origin | the tip is gated and the owner approved it, but `git push origin main` → `fatal: could not read Username for 'https://github.com': No such device or address` (exit 128). Nothing is wrong with the repo. This host has **no** way to authenticate: no credential helper (local/global/system), no `GITHUB_TOKEN`/`GH_TOKEN` in the environment, no `~/.git-credentials`, no `~/.netrc`, `gh` is not installed, `~/.ssh` holds only `authorized_keys` (inbound) and no private key, and `ssh-add -l` reports "The agent has no identities" while `ssh -T git@github.com` → `Permission denied (publickey)`. **I did not look inside `~/.openclaw` for credentials** — it belongs to another platform and the standing rule is to stop and ask. Resolution needs the owner: credentials, a deploy key, or a push the owner performs. Until then `origin/main` stays at `dea8a55` and the deployed site stays broken.
+DECISION | the campaign does NOT wait on the push. Writers base on **LOCAL `main`** — the true tip, which already carries the machinery — not on the stale `origin/main`. Recorded because the base sha in every brief will look wrong to a successor who only reads `origin/main`.
+NEXT | when the push does become possible, push `main` (it is ahead of `origin/main` by a fast-forward) and re-verify with `git ls-remote origin refs/heads/main`.
 
 ## SESSION
 SESSION | id=session-f6d26a74-68de-4926-b4d3-16efb7ff2421 | role=chief of staff (owner-designated) | state=active · idled after the first reconcile pass · goal frozen and paused by design
 SESSION | id=session-d1525624-6f23-4803-837e-34a1adc80fea | role=predecessor: audit + Phase 0 | state=ended 2026-09-21T10:14Z · left no worktree, no branch, no lock behind (verified)
 
 ## IN-FLIGHT
-PROBE | id=dc6f39f3-2a45-4f41-9234-9ce42b13394c | question=where do the view / render / cancel / import / WebGL-lifecycle seams live, and where are they duplicated or monkey-patched? | state=dispatched, READ-ONLY (no writes, no suite) · reads the main tree · consume its report, then delete it
-NOTE | no WRITER is in flight. The campaign's first writer is dispatched only after the push lands, so that it bases on `origin/main` rather than on a local branch.
+IN-FLIGHT | row=S1 | writer=<dispatched below> | worktree=/home/administrator/projects/FracVibe/worktrees/s1-canvas | branch=feat/s1-canvas | base=LOCAL main, see DISPATCH below | state=dispatched · scope=canvas-truth (B4 resize/DPR + B9 WebGL-failure fallback and honest teardown) · files=webglFractal.js, fractalViewer.js, index.html, styles.css, app.js, tests/ · dispatched_by=session-f6d26a74
+PROBE | id=dc6f39f3-2a45-4f41-9234-9ce42b13394c | state=**CONSUMED** 2026-09-21 · report kept at `docs/PROBE-2026-09-21-seams.md` (validated at 9e8661e; code unchanged since c6c87e2) · agent deleted | findings=six defects the audit did not contain (⚠ in the report): `progress` frames are never applied, there is no `worker.onerror`, a bad `done` payload throws uncaught, 3D init failure leaves a black screen with both canvases hidden, there is no global error handler, and four state variables are dead | action=all six folded into the `docs/PLAN.md` slice table
+NOTE | only ONE writer is in flight, and that is the campaign's serialization rule working: every slice touches `public/app.js` (docs/PLAN.md §2), so slices run one at a time unless a probe has PROVEN two footprints disjoint.
 
 ## LANDED
 LANDED | row=machinery | sha=c6c87e2 | branch=main | verify=MY OWN at this sha: `bash scripts/gate.sh` exit 0 GREEN, 4 passed / 0 failed / 6.4s, MemAvailable 18616MB, raw log /tmp/fracvibe-gate/gate-full-c6c87e2-20260921T082802Z.log · plus the lock/tier/per-tree controls in GUARD below | scope=scripts/gate.sh (one gate command, atomic mkdir lock in the git COMMON dir shared across worktrees, two tiers), AGENTS.md, docs/BRIEF.md, docs/DECISIONS.md, .gitignore worktrees/, and playwright.config.js `reuseExistingServer: true → false` | retired=nothing (no writer was dispatched) | docs=this file, docs/DECISIONS.md rows 4–5
@@ -32,7 +32,7 @@ NOTE | the predecessor's own evidence survives as /tmp/fv-a.log and /tmp/fv-b.lo
 
 ## QUEUE
 QUEUE | row=* | The sequenced campaign is `docs/PLAN.md` (slices S1–S6, with footprints, pins, order and the serialization rule). The rows below are the raw defect inventory it draws from — do not dispatch a row directly; dispatch its slice.
-QUEUE | row=1 | push Phase 0 + machinery to origin/main | status=APPROVED BY OWNER 2026-09-21, executing at the gated tip
+QUEUE | row=1 | push Phase 0 + machinery to origin/main | status=OWNER-APPROVED 2026-09-21, **BLOCKED on credentials** (see BLOCKER above) — not on the repo, and not on any missing work
 QUEUE | row=B4 | WebGL canvas is never resized; both canvases size their buffer from CSS px, so everything is blurry on HiDPI | src=MODERNIZATION.md §2 B4
 QUEUE | row=B5 | iteration cap mismatch: slider allows 2000, the fragment shader loops to 1024 → silently mis-coloured pixels above 1024 | src=MODERNIZATION.md §2 B5
 QUEUE | row=B6 | worker abort is a no-op (the flag can only be set between jobs) | src=MODERNIZATION.md §2 B6
