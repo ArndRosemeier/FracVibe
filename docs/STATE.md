@@ -7,18 +7,23 @@
 
 reconciled: origin/main=dea8a55 · local main=c6c87e2 (0 behind, 4 ahead) · 2026-09-21T08:27Z · by=session-f6d26a74-68de-4926-b4d3-16efb7ff2421 · host=load 0.34, MemAvailable 18.2GB, no orphan suite processes, :3000 free · registry=2 sessions under ~/.dsh/sessions/--home-administrator-projects-FracVibe--
 
+## OWNER
+OWNER | 2026-09-21 | decision=**push approved** — owner chose "Push all 5 commits to origin/main" | effect=Phase 0 + machinery land on `origin/main`; the deployed blank-canvas site is fixed
+OWNER | 2026-09-21 | verbatim: *"I want this to be resilient and correct, you can take your time to achieve that state. You be the judge how to achieve this best."* | effect=standing mandate; the METHOD is the dispatcher's judgement and is written down in `docs/PLAN.md` | ledger row 6
+
 ## ⚠ THE ONE THING THAT MATTERS NOW
-Phase 0 (the app-breaking B1–B3 fixes) is **committed locally but NOT on
-`origin/main`**. Netlify publishes `origin/main`, so the deployed site is still the
-**blank-canvas build** in `MODERNIZATION.md` §1 row 1. Landing it is a push, and the
-push is the owner's call (QUEUE row 1).
+The push is owner-approved and is executed at the gated tip. Until it lands,
+`origin/main` is the **blank-canvas build** in `MODERNIZATION.md` §1 row 1. After it
+lands, the live priority is the campaign in `docs/PLAN.md`, whose first writer is
+slice **S1 (canvas-truth: B4 + B9)**.
 
 ## SESSION
 SESSION | id=session-f6d26a74-68de-4926-b4d3-16efb7ff2421 | role=chief of staff (owner-designated) | state=active · idled after the first reconcile pass · goal frozen and paused by design
 SESSION | id=session-d1525624-6f23-4803-837e-34a1adc80fea | role=predecessor: audit + Phase 0 | state=ended 2026-09-21T10:14Z · left no worktree, no branch, no lock behind (verified)
 
 ## IN-FLIGHT
-none
+PROBE | id=dc6f39f3-2a45-4f41-9234-9ce42b13394c | question=where do the view / render / cancel / import / WebGL-lifecycle seams live, and where are they duplicated or monkey-patched? | state=dispatched, READ-ONLY (no writes, no suite) · reads the main tree · consume its report, then delete it
+NOTE | no WRITER is in flight. The campaign's first writer is dispatched only after the push lands, so that it bases on `origin/main` rather than on a local branch.
 
 ## LANDED
 LANDED | row=machinery | sha=c6c87e2 | branch=main | verify=MY OWN at this sha: `bash scripts/gate.sh` exit 0 GREEN, 4 passed / 0 failed / 6.4s, MemAvailable 18616MB, raw log /tmp/fracvibe-gate/gate-full-c6c87e2-20260921T082802Z.log · plus the lock/tier/per-tree controls in GUARD below | scope=scripts/gate.sh (one gate command, atomic mkdir lock in the git COMMON dir shared across worktrees, two tiers), AGENTS.md, docs/BRIEF.md, docs/DECISIONS.md, .gitignore worktrees/, and playwright.config.js `reuseExistingServer: true → false` | retired=nothing (no writer was dispatched) | docs=this file, docs/DECISIONS.md rows 4–5
@@ -26,7 +31,8 @@ LANDED | row=Phase0 | sha=001cec9 | branch=main | commits=b83ecca,f9a016e,001cec
 NOTE | the predecessor's own evidence survives as /tmp/fv-a.log and /tmp/fv-b.log (both "4 passed", 2026-09-21T10:14Z). Corroborating, not durable, and superseded by the logs above.
 
 ## QUEUE
-QUEUE | row=1 | push Phase 0 + machinery to origin/main | why=the deployed site is broken until Phase 0 lands; the machinery is what makes later landings verifiable | blocks=every user-visible outcome | owner_decision=pending · recommendation: push
+QUEUE | row=* | The sequenced campaign is `docs/PLAN.md` (slices S1–S6, with footprints, pins, order and the serialization rule). The rows below are the raw defect inventory it draws from — do not dispatch a row directly; dispatch its slice.
+QUEUE | row=1 | push Phase 0 + machinery to origin/main | status=APPROVED BY OWNER 2026-09-21, executing at the gated tip
 QUEUE | row=B4 | WebGL canvas is never resized; both canvases size their buffer from CSS px, so everything is blurry on HiDPI | src=MODERNIZATION.md §2 B4
 QUEUE | row=B5 | iteration cap mismatch: slider allows 2000, the fragment shader loops to 1024 → silently mis-coloured pixels above 1024 | src=MODERNIZATION.md §2 B5
 QUEUE | row=B6 | worker abort is a no-op (the flag can only be set between jobs) | src=MODERNIZATION.md §2 B6
