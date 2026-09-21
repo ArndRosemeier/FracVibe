@@ -172,7 +172,18 @@ The deliberately deferred items from the previous campaign (`MODERNIZATION.md` �
 unless a slice here proves one is required — in which case it goes to the owner as a fork, not in
 silently.
 
-## 8 · THE FORK RE-OPENED (perturbation probe, 2026-09-21)
+## 8 · THE FORK — RESOLVED (owner, 2026-09-21): ARBITRARY DEPTH
+**The owner's answer, verbatim:** *"1e15 is not really enough, i would like to have it as arbitrary
+deep as the user wants (getting slower of course). Please consult the web for that."*
+
+Research is done and committed: `docs/RESEARCH-2026-09-21-arbitrary-depth.md` (cited throughout).
+It resolves the fork decisively: **arbitrary depth is achievable, and the naive probe's 1e15 collapse
+was a MISSING-MECHANISM result, not a precision ceiling.** The two mechanisms it lacked are exactly
+the ones the sources name — **REBASING** (keeps the deltas small) and **RESCALING** (defeats double
+*underflow*, which is the real wall near 1e308, not mantissa precision). The measured 74.6 % glitch
+rate at 1e15 in that probe is precisely the signature of un-rebased deltas. See §9 for the route and
+the revised slices. The options below are kept as the history of how the fork was put.
+
 The measurement above changes the value proposition the owner accepted. The honest options:
 
 - **Route 1 — compensated float32** (measured: holds to **≥1e10**) at ~10–12× fragment cost. No
@@ -191,3 +202,46 @@ The measurement above changes the value proposition the owner accepted. The hone
 orbit transport is proven exact, the limiter is identified, and this same code is the foundation for
 whatever depth comes later. Rejected: "keep chasing 1e15 first", which requires a delta formulation
 nobody has yet demonstrated here *plus* glitch rebasing, before shipping any user-visible improvement.
+
+## 9 · THE ARBITRARY-DEPTH ROUTE (from cited research) — revised slices
+**Architecture, as practised by shipping renderers and the closest browser analogue:**
+- **Reference orbit: arbitrary precision, computed ONCE per view, on the CPU** (in a Web Worker, so
+  the main thread stays free). Native renderers use GMP/MPFR; the **browser** analogue (bertbaron)
+  uses **BigInt fixed point** with the limb count growing with zoom — available here with no
+  dependency at all. Precision follows **bits ≈ log2(1/scale) + margin**, i.e. **3.3219 bits per
+  decimal digit** of zoom (the shape is settled); the **margin is NOT standardized** — 0 in the bare
+  bound, **+64** in rust-fractal-core — so it must be chosen and measured, not assumed.
+- **Per-pixel deltas: float64 on the GPU**, kept representable by **rebasing** (`|Z+z| < |z|` ⇒
+  `z ← Z+z`, reset the reference iteration) and **rescaling** (`z = S·w` with `|w| ≈ 1`, re-scaled
+  every few hundred iterations). With those in place, double precision is not the limit — underflow,
+  memory and time are.
+- **Glitches: Pauldelbrot detection** `|Z+z|² < G·|Z|²`, G between 1e-2 and 1e-8, essentially free
+  because `|Z+z|²` is already computed. **No principled G is published** — KF exposes it as a user
+  slider whose extremes are "good but very slow" and "fast but bad images".
+- **Speed: series approximation** (probe-point-based skip; the analytic test is NOT used in
+  practice), or Fraktaler 3's BLA. It cuts per-pixel work, never the reference's precision need.
+- **GPU:** the consensus for our depth range is **reference on the CPU, deltas on the GPU**; KF notes
+  OpenCL is only good to ~1e300 for double, which is exactly why it keeps the reference on the CPU.
+
+**Revised slices (superseding the P-list in §3):**
+
+| id | intent | the pin that matters |
+|---|---|---|
+| **P1** | **Perturbation core WITH rescaling and rebasing.** The naive probe lacked both — that is why it collapsed at 1e15. Expect a large depth jump over that result. | at a depth beyond the naive failure (≥1e15) the image matches a float64 reference within a stated threshold; the orbit is computed **once per view** (counted); **a zoom sweep across every rebase shows no spike** |
+| **P2** | **Arbitrary-precision reference orbit** — BigInt fixed point in a Worker, precision growing with zoom (`bits ≈ log2(1/scale) + margin`). | depth keeps increasing as the limb count grows, measured, with the margin stated; the **precision-STEP boundaries** change nothing visible (the only documented literature defect here is KF 2018 "corrupt image at transition between number types") |
+| **P3** | **Glitch solving beyond same-reference rebasing** (new references / near-pixel), chosen by measurement. | each strategy's documented artifact is absent or bounded and pinned: no "noisy appearance", no "weird flat blobs", no endless-reference loop, no corruption of pixels that merely share an iteration count |
+| **P4** | **Series approximation** for speed (probe-point skip). | an SA-skipped render equals the non-skipped render within a stated threshold, and SA is disabled where sources say it is invalid (some power-3 locations, Burning Ship) |
+| **P5** | **Lift the zoom cap** so any of this becomes user-visible; retire the CPU handoff over the covered range. | beyond the old cap the GPU stays selected and correct; the offer no longer appears in the covered range |
+| **P6** | GPU-side reference (NTT / limb arithmetic) **only if** the CPU orbit becomes the bottleneck. | deferred — FractalShark is the only implementation found that does it |
+
+**The owner's smoothness requirement, restated against the research.** The two hop sources are
+(a) **precision / number-type transitions**, for which the ONLY documented defect in the literature is
+the 2018 KF corruption bug — i.e. a real and *under-documented* risk class, and (b) **rebasing**,
+whose artifacts are documented per strategy. Both get the sweep-no-spike criterion, and P2's step
+boundaries and P3's strategy choice each need their own measurement.
+
+**Honest unknowns, to be resolved by measurement rather than assumption:** no rigorous error bound or
+correctness proof exists for the glitch threshold G or for series-approximation skipping (stated by
+the field's own author); no source states how a current renderer's precision transition looks during
+interactive zoom; and the depth ceiling of a **BigInt** reference in a browser is not published —
+bertbaron's ~1e1500 figure is for a WebGPU float32+exponent path, not a BigInt orbit.
