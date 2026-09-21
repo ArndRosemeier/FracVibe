@@ -777,15 +777,26 @@ function applyWorkerFrame(calcTokenValue, rawResult, final) {
   if (!progress) return false;
   if (calcTokenValue !== progress.calcToken) return false;
   if (!worker || worker._fvGeneration !== progress.workerGeneration) return false;
+  // D1: the payload carries a Float32Array of SMOOTH escape values, with NaN
+  // marking the cells not yet calculated (it used to be an Int32Array of integer
+  // counts with -1). The validation is unchanged in INTENT — a malformed payload
+  // must never become a frame — and is what the S2 pin holds it to: an absent
+  // payload, a non-byte-length payload, a payload that is not a whole number of
+  // 4-byte entries, or one of the wrong length is refused with a visible reason.
   if (!rawResult || typeof rawResult.byteLength !== 'number' || rawResult.byteLength % 4 !== 0) {
-    throw new Error('worker result is not an Int32Array payload');
+    throw new Error('worker result is not a Float32Array payload');
   }
-  const intResult = new Int32Array(rawResult);
+  const smoothResult = new Float32Array(rawResult);
   const expected = progress.width * progress.height;
-  if (intResult.length !== expected) {
-    throw new Error(`worker result has ${intResult.length} entries, expected ${expected}`);
+  if (smoothResult.length !== expected) {
+    throw new Error(`worker result has ${smoothResult.length} entries, expected ${expected}`);
   }
-  viewer.setData(intResult, viewer.maxIter);
+  // The buffer is indexed against the iteration cap the JOB ran at, not against
+  // whatever the viewer holds now: `viewer.maxIter` is only updated when the
+  // slider change reaches setMaxIter, and a job started from the restored view can
+  // carry a different cap. Passing the job's own cap keeps the "exactly maxIter is
+  // inside ⇒ black" test aligned with the values in the buffer.
+  viewer.setData(smoothResult, progress.jobParams.maxIter);
   const n = (appliedFramesByJob.get(progress.jobId) || 0) + 1;
   appliedFramesByJob.set(progress.jobId, n);
   appliedFrameCount++;
@@ -1308,9 +1319,18 @@ attachContextLossGuard(canvasWebGL);
 // --- S1: debug/observation hook for the suite ---------------------------------
 // A small, frozen surface so tests can observe view truth without inferring it
 // from pixels. It exposes no way to change renderer behaviour.
+// The precision-hop pin's baseline buffer (D1). Test-only state: `captureShiftBaseline`
+// stores a copy of the frame the worker produced, so the pin can re-render that SAME
+// frame with a shifted escape value instead of accumulating shifts.
+let shiftBaseline = null;
+let shiftBaselineMaxIter = 0;
 window.__fv = Object.freeze({
   getView: () => ({ ...viewer.view }),
   setScale: (scale) => viewer.setView({ ...viewer.view, scale }),
+  // Move the view to an explicit centre and scale through the REAL setView (the
+  // same entry point the startup animation uses; the clamp still applies). The
+  // zoom-sweep pin needs a centre whose window actually crosses the set boundary.
+  setView: (view) => viewer.setView({ ...viewer.view, ...view }),
   runAnimationFrame: () => { viewer.setView({ ...viewer.view, scale: viewer.view.scale }); },
   renderWebGL: () => renderWebGL(),
   forceFallback: () => handleWebGLFailure('WebGL failure forced for observation.'),
@@ -1392,6 +1412,57 @@ window.__fv = Object.freeze({
     if (!fractal3D) throw new Error('3D mode is not active');
     fractal3D.setColorScheme(scheme);
   },
+  // --- D1 smooth-colour observables (the continuous escape value) ---
+  // The EXACT continuous colour of an arbitrary smooth value through the kernel's
+  // ONE definition (no table quantisation), so a pin can hold the quantised table
+  // the render writes to the definition it samples.
+  colorAtSmoothIteration: (value, maxIter) => viewer.colorAtSmoothIteration(value, maxIter),
+  // The same for a value the viewer is actually holding, through the QUANTISED
+  // table the render writes (so the pin can compare the table against the exact
+  // definition instead of restating either).
+  colorForValue: (value, maxIter) => viewer.colorForValue(value, maxIter),
+  // The kernel's exact continuous definition, independent of the UI state, so a
+  // pin can check the formula itself (inside ⇒ exactly maxIter, finiteness, ...).
+  smoothValue: (escapeRadiusSq, n, maxIter) => FractalKernel.smoothIterationValue(escapeRadiusSq, n, maxIter),
+  // The kernel constant the GLSL is templated with, so a pin can hold the shader
+  // and the kernel to the same number instead of trusting the source.
+  smoothLogBailout: FractalKernel.SMOOTH_LOG_BAILOUT,
+  bailoutSq: FractalKernel.BAILOUT_SQ,
+  smoothPixel: (type, px, py, maxIter, jx, jy) =>
+    FractalKernel.iteratePixelSmooth(type, px, py, maxIter, jx, jy),
+  // The ONE uncalculated-placeholder colour, from the kernel.
+  uncalculatedColor: () => FractalKernel.UNCALCULATED_COLOR.slice(),
+  // The whole escape-value buffer as a plain array (the pin computes its
+  // statistics inside the page, so this never crosses the wire).
+  iterBufferAll: () => (viewer.imageData ? Array.from(viewer.imageData) : null),
+  // Render the CURRENT buffer with every finite escape value shifted by `epsilon`,
+  // through the REAL `setData`/`render` path. This models a precision hop exactly:
+  // the same view, the same buffer, escape values differing by a sub-iteration
+  // amount (what a rebased reference orbit or a float32 rounding difference
+  // produces). It is an observation-only entry point like `deliverWorkerMessage`:
+  // the only production code it runs is the colour mapping under test.
+  //
+  // The baseline is captured EXPLICITLY so repeated shifts do not accumulate, and
+  // dropped explicitly so a later real frame is used again.
+  captureShiftBaseline: () => {
+    if (!viewer.imageData) return false;
+    shiftBaseline = viewer.imageData.slice();
+    shiftBaselineMaxIter = viewer.maxIter;
+    return true;
+  },
+  clearShiftBaseline: () => { shiftBaseline = null; },
+  renderShiftedBuffer: (epsilon) => {
+    if (!shiftBaseline) return false;
+    const shifted = new Float32Array(shiftBaseline.length);
+    for (let i = 0; i < shiftBaseline.length; ++i) {
+      const v = shiftBaseline[i];
+      shifted[i] = v === v ? v + epsilon : v;
+    }
+    viewer.setData(shifted, shiftBaselineMaxIter);
+    return true;
+  },
+  // The ONE uncalculated-placeholder colour, from the kernel.
+  uncalculatedColor: () => FractalKernel.UNCALCULATED_COLOR.slice(),
   // --- S3 kernel observables (the ONE cap, observed not inferred) ---
   // `maxIterCap` is the kernel constant the slider max, the clamps and the shader
   // loop bound all derive from. `shaderMaxIter` is the value actually templated
@@ -1403,6 +1474,12 @@ window.__fv = Object.freeze({
   shaderLoopBounds: () => (webglRenderer && webglRenderer.shaderLoopBounds
     ? webglRenderer.shaderLoopBounds.slice()
     : null),
+  // D1: the GPU's smooth-colour constants as ACTUALLY templated, so a pin can hold
+  // the shader and the kernel to the same numbers instead of trusting the source.
+  shaderSmoothLogBailout: () => (webglRenderer ? webglRenderer.shaderSmoothLogBailout : null),
+  // The fragment source as generated. Read-only; the shader-formula pin reads the
+  // smooth expression out of it rather than inferring it from pixels.
+  shaderSource: () => (webglRenderer && webglRenderer.shaderSource ? webglRenderer.shaderSource : null),
   // The kernel's own tables, so a test can drive every supported type/palette
   // without restating the list in a second fixture.
   fractalTypes: () => FractalKernel.FRACTAL_TYPES.map((t) => t.value),

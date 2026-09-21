@@ -39,10 +39,13 @@ onmessage = function(e) {
   const levels = [8, 4, 2, 1].filter((step) => step <= Math.max(1, job.gridStep));
   if (levels.length === 0) levels.push(1);
 
-  // ONE buffer for the whole sequence. Pixels not yet computed stay -1, which the
-  // viewer paints as the "uncalculated" colour, so a partial frame is honest about
-  // what is still missing instead of smearing the previous level.
-  const result = job.prior ? job.prior.slice() : new Int32Array(width * height).fill(-1);
+  // ONE buffer for the whole sequence. It holds SMOOTH (continuous) escape values
+  // (D1), so it is a Float32Array: an Int32Array cannot represent the value at all.
+  // Pixels not yet computed stay NaN, which the viewer paints as the "uncalculated"
+  // colour, so a partial frame is honest about what is still missing instead of
+  // smearing the previous level. NaN is the sentinel the whole pipeline uses now;
+  // it used to be -1 in an Int32Array.
+  const result = job.prior ? job.prior.slice() : new Float32Array(width * height).fill(NaN);
   const chunkSize = 4096;
 
   for (let l = 0; l < levels.length; l++) {

@@ -184,22 +184,31 @@ The GLSL remains the one documented exception. Pinned by `tests/kernel-parity.sp
 Still open in this section: per-frame allocation in the 2D renderer, the per-pass buffer copies
 / single worker, and the prefix/`colorSchemes.js` re-export.
 
-**Per-frame allocation in the 2D renderer.** `FractalViewer.render()` rebuilds a
-`Uint32Array(maxIter+2)` LUT and calls `ctx.createImageData(w,h)` on every call — including
-every `mousemove` during a drag (`fractalViewer.js:135-158`). Cache the LUT (key on
-scheme/offset/maxIter) and reuse one `ImageData`.
-*Still open after S6 — and NOT dead code:* this is the `progressiveState.jobParams`/render
-path (`app.js` job setup) plus `fractalViewer.js:135-158`, both live. The four declarations
-S6 deleted (`currentResult`, `aborting`, `debounceTimer`, `lastJobParams` at `app.js:427-430`
-pre-S6) were a different, genuinely unread set, which is why they could go without touching
-this.
+**Per-frame allocation in the 2D renderer.** `FractalViewer.render()` rebuilds its colour
+table and calls `ctx.createImageData(w,h)` on every call — including every `mousemove`
+during a drag. Cache the table (key on scheme/offset/maxIter) and reuse one `ImageData`.
+*Still open after S6 and after D1 — and NOT dead code:* this is the
+`progressiveState.jobParams`/render path (`app.js` job setup) plus `fractalViewer.js`,
+both live. The four declarations S6 deleted (`currentResult`, `aborting`, `debounceTimer`,
+`lastJobParams` at `app.js:427-430` pre-S6) were a different, genuinely unread set, which
+is why they could go without touching this.
+*Amended by D1 (2026-09-21):* the table is no longer a `Uint32Array(maxIter+2)` with one
+entry per INTEGER iteration. It is built over the **quantised continuous escape value** at
+`COLORS_LUT_STRIDE = 256` entries per iteration — a fixed resolution independent of
+`maxIter`, plus an inside entry and a `NaN` placeholder — because the buffer is now a
+`Float32Array` of smooth values and an integer LUT cannot index it (`docs/DECISIONS.md`
+row 27). The allocation is still per render, so this finding stands; the table is larger
+(at `maxIter` 2000: 512 002 entries ≈ 2 MB) and is therefore a *better* caching candidate
+than before, not a worse one.
 
 **Progressive refinement copies the whole buffer per pass** (`fractalWorker.js:12`
 `job.prior.slice()`, plus `{...job, chunk}` per chunk) and runs on a single worker. A
 worker pool sized to `navigator.hardwareConcurrency`, tiles instead of grid halving, and
 transferable buffers would be the modern shape.
 *Still open after S6:* explicitly out of S6's scope (P1 remainder; the brief excludes the
-worker pool and the per-frame LUT allocation).
+worker pool and the per-frame colour-table allocation). D1 kept the per-pass copy shape
+(`job.prior.slice()` now copies a `Float32Array` of smooth values, and `NaN` — not `-1` —
+is the "not yet calculated" sentinel: `docs/DECISIONS.md` row 27).
 
 **Zoom-cap logic is triplicated** (`app.js:279-298`, `app.js:650-672`, `app.js:701-714`
 pre-fix), `FractalViewer.setView`/`onWheel` are monkey-patched from `app.js`, and the clamp
@@ -283,7 +292,9 @@ upgrade, and the repo abstraction is already the right seam for it.
    instrumentation, consolidate the zoom/view-state patching.
    **DONE through S1–S6** (B4–B8 in S1–S5; the dead files, dead state, debug logs and the
    two surviving modals in S6). The one Phase-1 item still open is the P1 remainder in §3:
-   per-frame LUT/`ImageData` allocation and the single-worker progressive copies.
+   per-frame colour-table/`ImageData` allocation and the single-worker progressive copies.
+   (The table is a continuous-value table since D1 — see the amended finding below — but it
+   is still rebuilt per render.)
 3. **Phase 2 — foundation (2–4 days).** Vite build, `three` from npm, Node 24, ESM dev
    server, lint/format/CI, single fractal kernel (+ its palette table) shared by
    worker/main/shader, worker pool.

@@ -33,6 +33,13 @@
   const MAX_ITER = 2000;
   const MIN_ITER = 1;
   const BAILOUT = 4;
+  // The escape radius squared at which the iteration test fires. ONE constant,
+  // used by the kernel, templated into the GLSL (D1).
+  const BAILOUT_SQ = BAILOUT;
+  // 1 / ln(BAILOUT_SQ): the constant factor of the smooth (continuous) escape
+  // count. Templated into the GLSL as a float32 literal so BOTH renderers
+  // evaluate the identical expression (see smoothIterationValue below).
+  const SMOOTH_LOG_BAILOUT = 1 / Math.log(BAILOUT_SQ);
 
   // --- the ONE fractal-type table --------------------------------------------
   // `index` is the shader's `u_fractalType`. `glsl` is the identifier that
@@ -135,12 +142,127 @@
   // The palette function for a scheme name (2D and 3D CPU rendering).
   function paletteFunction(value) { return colorSchemes[value] || colorSchemes.rainbow; }
 
+  // --- D1: THE smooth (continuous) escape-time value ---------------------------
+  // Colour used to be a STEP function of an INTEGER iteration count, in both
+  // renderers: the CPU had one LUT entry per integer (`Uint32Array(maxIter + 2)`)
+  // and the shader did `float(iter) / float(u_maxIter)`. A staircase like that
+  // AMPLIFIES a precision hop: a difference far smaller than one iteration can
+  // push a pixel across a step and flip it a whole colour band, and those pixels
+  // cluster at the fractal boundary — which is exactly what is on screen when you
+  // are zoomed in. This function makes colour continuous in the escape value, so
+  // a small change in the value is a small change in the colour.
+  //
+  // The value returned is
+  //
+  //     v = n + 1 - log2( log(|z|²) / log(BAILOUT_SQ) )
+  //
+  // where |z|² is the squared magnitude at which the escape test fired and n is
+  // the 1-based index of the update that produced it. It is the standard
+  // continuous iteration count: `log2( log|z| / log R )` is the renormalised
+  // fraction of the last step. Everything here is in log space, so the escape
+  // RADIUS is not needed — only its square, which is the value the loop already
+  // has, and ONE constant `SMOOTH_LOG_BAILOUT = 1 / ln(BAILOUT_SQ)`.
+  //
+  // The GLSL in `webglFractal.js` evaluates the SAME expression with the same
+  // constants (`u_maxIter` and `SMOOTH_LOG_BAILOUT` are templated in from here);
+  // `tests/kernel-parity.spec.js` and `tests/smooth-color.spec.js` hold the two
+  // to that. This is what keeps a GPU↔CPU switch from being a visible colour
+  // change at the cap, which is the defect this slice exists to remove.
+  //
+  // The `n > maxIter` guard is the "inside the set" case: a point that never
+  // escaped has n = maxIter + 1, and must come out EXACTLY maxIter so both
+  // renderers paint it black (the GPU's `iter == u_maxIter` test).
+  function smoothIterationValue(escapeRadiusSq, n, maxIter) {
+    const cap = clampMaxIter(maxIter);
+    if (n > cap || !(escapeRadiusSq > 0) || !isFinite(escapeRadiusSq)) return cap;
+    const v = 1 + n - Math.log(Math.log(escapeRadiusSq) * SMOOTH_LOG_BAILOUT) / Math.LN2;
+    if (!isFinite(v)) return cap;
+    return Math.min(v, cap);
+  }
+
+  // The colour parameter for a smooth value: t = (v / maxIter + colorOffset) mod 1,
+  // clamped to [0, 1) for the mod's floating-point edge. Colour cycling applies to
+  // the CONTINUOUS value (D1), not to a quantised iteration index.
+  function colorParameter(smoothValue, maxIter, colorOffset) {
+    const cap = clampMaxIter(maxIter);
+    const offset = isFinite(colorOffset) ? colorOffset : 0;
+    let t = (smoothValue / cap + offset) % 1;
+    if (!isFinite(t)) t = 0;
+    if (t < 0) t += 1;
+    if (t >= 1) t = 0;
+    return t;
+  }
+
+  // The ONE colour of one smooth value. `undefined` is returned only when a
+  // palette function misbehaves, which the 2D renderer paints as the placeholder.
+  function colorAtSmoothIteration(smoothValue, maxIter, paletteName, colorOffset) {
+    const cap = clampMaxIter(maxIter);
+    if (smoothValue >= cap) return [0, 0, 0]; // inside the set is black
+    return paletteFunction(paletteName)(colorParameter(smoothValue, cap, colorOffset));
+  }
+
+  // --- D1: the quantised colour table (the ONE mapping the 2D renderer uses) ----
+  // The integer LUT is gone (it cannot index a Float32 value). Colour is now a
+  // table over the QUANTISED CONTINUOUS value: COLORS_LUT_STRIDE steps per unit
+  // of smooth value, fixed, independent of maxIter. The residual is a
+  // half-stride palette step — at 256 steps/iteration for a palette whose fastest
+  // segment changes ~1/255 per 1/255 of t, under 1 RGB unit out of 255, i.e. below
+  // the quantisation the canvas can display at all — and it does NOT grow with
+  // maxIter (a maxIter-proportional table WOULD: at maxIter 2000 it could not
+  // resolve neighbouring escape values at all). See docs/DECISIONS.md row 27.
+  const COLORS_LUT_STRIDE = 256;
+  // +1 for the inside-the-set entry at exactly maxIter.
+  const COLORS_LUT_SIZE = MAX_ITER * COLORS_LUT_STRIDE + 1;
+  // The colour an uncalculated cell is painted with. Deliberately NOT a palette
+  // colour, so a cell the worker has not reached can never be mistaken for a
+  // rendered value (pinned by tests/smooth-color.spec.js).
+  const UNCALCULATED_COLOR = [40, 40, 40];
+
+  // The LUT entry a smooth value maps to:
+  //   0 .. cap*STRIDE - 1   an escaped value (palette colour)
+  //   cap*STRIDE            exactly maxIter: inside the set (black)
+  //   -1                    not a smooth value at all: the uncalculated NaN
+  //                         sentinel, an infinity, or a negative value
+  function colorLutIndex(smoothValue, maxIter) {
+    const cap = clampMaxIter(maxIter);
+    if (!isFinite(smoothValue)) return -1;
+    if (smoothValue >= cap) return cap * COLORS_LUT_STRIDE;
+    let t = smoothValue / cap;
+    if (t < 0) t = 0; // only reachable for a negative smooth value
+    return Math.floor(t * (cap * COLORS_LUT_STRIDE));
+  }
+
+  // The colour of a LUT entry (the exact colour the pixel path writes), so the
+  // suite can compare the quantised path against the continuous definition rather
+  // than restating either. The inside-the-set entry is black; `-1` (uncalculated)
+  // is the fixed placeholder, which is deliberately NOT a palette colour.
+  function colorAtLutIndex(index, maxIter, paletteName, colorOffset) {
+    const cap = clampMaxIter(maxIter);
+    if (index < 0) return UNCALCULATED_COLOR;
+    if (index >= cap * COLORS_LUT_STRIDE) return [0, 0, 0];
+    const t = colorParameter(index / COLORS_LUT_STRIDE, cap, colorOffset);
+    return paletteFunction(paletteName)(t);
+  }
+
+  // The ONE place a colour becomes a canvas pixel value. The 2D renderer's table
+  // holds these, so the palette functions are evaluated ONCE per table entry and
+  // the pixel loop is a lookup.
+  function toRGBA(color) {
+    if (!color) return (255 << 24) | (40 << 16) | (40 << 8) | 40;
+    return (255 << 24) | (color[2] << 16) | (color[1] << 8) | color[0];
+  }
+
   // --- the iteration core -----------------------------------------------------
   // `px, py` are the point in the complex plane (already projected from the
   // pixel). For Julia the point is z0 and (jx, jy) is the constant c; for every
-  // other type z0 = 0 and c = the point. Returns the iteration count; the return
-  // value EQUALS maxIter exactly when the point never escaped (i.e. it is inside).
-  function iteratePixel(type, px, py, maxIter, jx, jy) {
+  // other type z0 = 0 and c = the point.
+  //
+  // Returns the FULL escape state, not just a count, because the smooth value
+  // needs both: `iter` is the number of update steps applied before the escape
+  // test fired, and `escapeRadiusSq` is the squared magnitude that test saw.
+  // `iter` EQUALS maxIter exactly when the point never escaped (it is inside),
+  // which is the classification every consumer uses and which D1 does NOT change.
+  function iteratePixelState(type, px, py, maxIter, jx, jy) {
     let zx, zy, cx = px, cy = py;
     if (type === 'julia') {
       zx = px;
@@ -152,9 +274,11 @@
       zy = 0;
     }
     let iter = 0;
+    let zx2 = 0, zy2 = 0, escapeRadiusSq = 0;
     while (iter < maxIter) {
-      const zx2 = zx * zx, zy2 = zy * zy;
-      if (zx2 + zy2 > BAILOUT) return iter;
+      zx2 = zx * zx; zy2 = zy * zy;
+      escapeRadiusSq = zx2 + zy2;
+      if (escapeRadiusSq > BAILOUT_SQ) return { iter: iter, escapeRadiusSq: escapeRadiusSq };
       if (type === 'burningship') {
         zy = Math.abs(2 * zx * zy) + cy;
         zx = Math.abs(zx2 - zy2 + cx);
@@ -168,7 +292,37 @@
       }
       ++iter;
     }
-    return iter;
+    return { iter: iter, escapeRadiusSq: escapeRadiusSq };
+  }
+
+  // The integer count every pre-D1 consumer used. Kept as the one definition of
+  // "how many iterations", so the 3D heightmap and any caller cannot drift from
+  // the kernel's own loop.
+  function iteratePixel(type, px, py, maxIter, jx, jy) {
+    return iteratePixelState(type, px, py, maxIter, jx, jy).iter;
+  }
+
+  // The SMOOTH value of a point: the D1 replacement for the integer count in every
+  // colour path.
+  //
+  // The `n` it passes is the 1-BASED INDEX OF THE UPDATE WHOSE RESULT EXCEEDED THE
+  // BAILOUT, and the magnitude is that same result — exactly what the shader's loop
+  // holds when it breaks. `iteratePixelState` returns the number of updates
+  // COMPLETED before the escape test fired, and because this kernel tests at the TOP
+  // of the iteration that count already INCLUDES the escaping update, while the
+  // shader breaks BEFORE its `iter++` and therefore EXCLUDES it. Passing `iter` here
+  // (not `iter + 1`) is what makes the two renderers compute the identical value; a
+  // systematic ONE-ITERATION colour difference otherwise — a whole 5-unit band at
+  // maxIter 50, and an invisible-but-real 0.5 units at 2000 — is measured by the
+  // low-cap GPU/CPU parity check in tests/smooth-color.spec.js pin 5.
+  //
+  // A point that never escaped is INSIDE and must come out EXACTLY maxIter, the
+  // same value the shader's `iter == u_maxIter` case produces.
+  function iteratePixelSmooth(type, px, py, maxIter, jx, jy) {
+    const cap = clampMaxIter(maxIter);
+    const state = iteratePixelState(type, px, py, cap, jx, jy);
+    if (state.iter >= cap) return cap;
+    return smoothIterationValue(state.escapeRadiusSq, state.iter, cap);
   }
 
   // Project a pixel to the complex plane. `view` is {centerX, centerY, scale}.
@@ -181,9 +335,10 @@
   }
 
   // --- the worker's entry point: fill the not-yet-computed entries of `chunk` --
-  // `result` is an Int32Array of width*height whose computed entries hold an
-  // iteration count and whose uncomputed entries hold -1 (progressive
-  // refinement skips those already done).
+  // `result` is a Float32Array of width*height whose computed entries hold a
+  // SMOOTH (continuous) iteration value and whose uncomputed entries hold NaN (D1:
+  // an Int32Array cannot hold the value, so the "-1 not yet calculated" sentinel is
+  // represented as the non-finite value instead — `!isFinite` is the skip test).
   function calcFractalChunk(job, result) {
     const width = job.width, height = job.height;
     const type = job.type;
@@ -200,12 +355,15 @@
     }
     for (let i = 0; i < chunk.length; ++i) {
       const idx = chunk[i];
-      if (result[idx] !== -1) continue;
+      // NaN is the "not yet calculated" sentinel: a cell that is NOT NaN has
+      // already been computed by a coarser level and must be skipped (the
+      // progressive-refinement contract that used to be `!== -1`).
+      if (result[idx] === result[idx]) continue;
       const x = idx % width;
       const y = (idx / width) | 0;
       const cx = view.centerX + (x - width / 2) * scale / width * aspect;
       const cy = view.centerY + (y - height / 2) * scale / height;
-      result[idx] = iteratePixel(type, cx, cy, maxIter, jx, jy);
+      result[idx] = iteratePixelSmooth(type, cx, cy, maxIter, jx, jy);
     }
     return null;
   }
@@ -234,7 +392,10 @@
       for (let x = 0; x < width; ++x) {
         const cx = centerX + (x - width / 2) * scale / width * aspect;
         const cy = centerY + (y - height / 2) * scale / height;
-        const iter = iteratePixel(type, cx, cy, maxIter, jx, jy);
+        const state = iteratePixelState(type, cx, cy, maxIter, jx, jy);
+        // The height is the DISCRETE iteration count, exactly as before: the 3D
+        // heightmap is a geometry, not a colour, and D1 changes colour only.
+        const iter = state.iter;
         const h = iter < maxIter ? Math.log(iter + 1) / logDen : 0;
         heights[y * width + x] = h * exaggeration;
       }
@@ -249,6 +410,13 @@
     MAX_ITER: MAX_ITER,
     MIN_ITER: MIN_ITER,
     BAILOUT: BAILOUT,
+    BAILOUT_SQ: BAILOUT_SQ,
+    // D1: the ONE smooth-colour definition and the constants the GLSL is
+    // templated with, so both renderers evaluate the identical expression.
+    SMOOTH_LOG_BAILOUT: SMOOTH_LOG_BAILOUT,
+    COLORS_LUT_STRIDE: COLORS_LUT_STRIDE,
+    COLORS_LUT_SIZE: COLORS_LUT_SIZE,
+    UNCALCULATED_COLOR: Object.freeze(UNCALCULATED_COLOR.slice()),
     FRACTAL_TYPES: Object.freeze(FRACTAL_TYPES),
     COLOR_SCHEMES: Object.freeze(COLOR_SCHEMES),
     colorSchemes: Object.freeze(colorSchemes),
@@ -256,7 +424,15 @@
     indexForType: indexForType,
     indexForColorScheme: indexForColorScheme,
     paletteFunction: paletteFunction,
+    smoothIterationValue: smoothIterationValue,
+    colorParameter: colorParameter,
+    colorAtSmoothIteration: colorAtSmoothIteration,
+    colorLutIndex: colorLutIndex,
+    colorAtLutIndex: colorAtLutIndex,
+    toRGBA: toRGBA,
     iteratePixel: iteratePixel,
+    iteratePixelState: iteratePixelState,
+    iteratePixelSmooth: iteratePixelSmooth,
     pixelToCoord: pixelToCoord,
     calcFractalChunk: calcFractalChunk,
     calculateHeightmap: calculateHeightmap

@@ -1,5 +1,6 @@
-// Import color schemes (as ESM)
-import { colorSchemes } from './colorSchemes.js';
+// D1 removed this file's only use of the `colorSchemes` re-export: the palette now
+// comes from the kernel's shared colour mapping, so the side-effect import below
+// is the ONLY kernel dependency left here.
 // The ONE kernel: iteration cap, type table, palette table (see that file). It is
 // imported for its side effect because it deliberately has no `export`.
 import './fractalKernel.js';
@@ -22,7 +23,9 @@ function FractalViewer(canvas, infoCallback) {
   this.zoomLimit = null;
   this.onZoomLimit = null;
   this.view = { centerX: -0.5, centerY: 0, scale: 3 };
-  this.imageData = null; // Int32Array of iterations
+  // D1: a Float32Array of SMOOTH (continuous) escape values, with NaN in the
+  // cells the worker has not calculated yet (an Int32Array cannot hold the value).
+  this.imageData = null;
   this.maxIter = FractalKernel.clampMaxIter(512);
   this.fractalType = 'mandelbrot';
   this.juliaParams = { c: [-0.4, 0.6] };
@@ -90,6 +93,9 @@ FractalViewer.prototype.setView = function(view) {
   if (clamped && this.onZoomLimit) this.onZoomLimit(this.view);
 };
 
+// `iterArray` is a Float32Array of SMOOTH escape values with NaN marking the cells
+// the worker has not reached yet (D1 — it used to be an Int32Array of integer
+// counts with -1 as the sentinel).
 FractalViewer.prototype.setData = function(iterArray, maxIter) {
   this.imageData = iterArray;
   this.maxIter = maxIter;
@@ -184,6 +190,28 @@ FractalViewer.prototype.onWheel = function(e) {
   if (this.onViewChange) this.onViewChange(this.view);
 };
 
+// Build the render's colour table. The table is over the SMOOTH value, at the
+// kernel's ONE stride (COLORS_LUT_STRIDE steps per iteration of escape value), so
+// it is a sampled version of the continuous mapping and NOT a staircase: the
+// worst-case difference from the exact palette is half a stride step, under one
+// 1/255 unit. It is also the ONLY place the palette is evaluated, so the pixel
+// loop below is a lookup — the same shape the old integer LUT had, at a resolution
+// that cannot alias. The uncalculated placeholder is the table's last index.
+FractalViewer.prototype.buildColorTable = function() {
+  const size = this.maxIter * FractalKernel.COLORS_LUT_STRIDE + 1;
+  // size real entries + 1 inside-the-set entry + 1 uncalculated-placeholder entry.
+  const table = new Uint32Array(size + 2);
+  for (let i = 0; i < size; ++i) {
+    table[i] = FractalKernel.toRGBA(FractalKernel.colorAtLutIndex(i, this.maxIter, this.colorScheme, this.colorOffset));
+  }
+  // Entry `size` is exactly maxIter: the point never escaped, so it is black
+  // (matching the GPU's `iter == u_maxIter` test), and index `size + 1` is the
+  // "not yet calculated" placeholder — NaN is not a smooth value at all.
+  table[size] = FractalKernel.toRGBA([0, 0, 0]);
+  table[size + 1] = FractalKernel.toRGBA(FractalKernel.UNCALCULATED_COLOR);
+  return table;
+};
+
 FractalViewer.prototype.render = function() {
   // imageData belongs to the size that produced it; after a resize it is stale
   // until the next worker result, so fall back to the background instead of
@@ -193,31 +221,26 @@ FractalViewer.prototype.render = function() {
     this.ctx.fillRect(0, 0, this.width, this.height);
     return;
   }
-  // --- FAST COLOR LOOKUP TABLE OPTIMIZATION ---
-  // Precompute color LUT for all possible iteration values
-  const lut = new Uint32Array(this.maxIter + 2); // +1 for maxIter (black), +1 for -1 (uncalculated)
-  const toRGBA = (r, g, b, a=255) => (a << 24) | (b << 16) | (g << 8) | r;
-  for (let i = 0; i <= this.maxIter; ++i) {
-    if (i === this.maxIter) {
-      lut[i] = toRGBA(0, 0, 0, 255); // Inside set = black
-    } else {
-      const color = this.iterToColor(i, this.maxIter);
-      lut[i] = toRGBA(color[0], color[1], color[2], 255);
-    }
-  }
-  lut[this.maxIter + 1] = toRGBA(40, 40, 40, 255); // -1 (uncalculated)
-
-  // Use Uint32Array view for fast pixel writes
+  // --- D1: CONTINUOUS COLOUR, FROM THE ONE KERNEL MAPPING ---------------------
+  // The pre-D1 table had ONE entry per INTEGER iteration and could not index a
+  // Float32 value at all. The table built here is sampled over the continuous
+  // value instead, so adjacent pixels whose smooth values differ by far less than
+  // one iteration get adjacent — not equal-or-opposite — colours. That is what
+  // removes the amplifier: a precision hop no longer moves a pixel across a whole
+  // colour band (docs/DECISIONS.md row 27).
+  const table = this.buildColorTable();
+  const placeholderIndex = table.length - 1;
+  const cap = this.maxIter;
   try {
     const img = this.ctx.createImageData(this.width, this.height);
     const buf32 = new Uint32Array(img.data.buffer);
-    for (let i = 0; i < this.width * this.height; ++i) {
-      const iter = this.imageData[i];
-      if (iter === -1) {
-        buf32[i] = lut[this.maxIter + 1];
-      } else {
-        buf32[i] = lut[iter] !== undefined ? lut[iter] : lut[this.maxIter + 1];
-      }
+    for (let i = 0; i < buf32.length; ++i) {
+      const value = this.imageData[i];
+      // NaN is the "not yet calculated" sentinel (it used to be -1). It is NOT a
+      // palette colour: it is the fixed placeholder. Every other value — including
+      // exactly maxIter (inside the set, black) — takes its table entry.
+      const index = value !== value ? -1 : FractalKernel.colorLutIndex(value, cap);
+      buf32[i] = index < 0 ? table[placeholderIndex] : table[index];
     }
     this.ctx.putImageData(img, 0, 0);
   } catch (err) {
@@ -231,12 +254,23 @@ FractalViewer.prototype.render = function() {
   }
 };
 
-FractalViewer.prototype.iterToColor = function(iter, maxIter) {
-  if (iter === maxIter) return [0,0,0];
-  let t = iter / maxIter;
-  t = (t + this.colorOffset) % 1;
-  const fn = colorSchemes[this.colorScheme] || colorSchemes.rainbow;
-  return fn(t);
+// The colour of a value the viewer is holding, through the SAME table path the
+// render writes (so a pin can compare the quantised table against the exact
+// definition rather than restating either). NaN is the placeholder, exactly
+// maxIter is inside-the-set black.
+FractalViewer.prototype.colorForValue = function(value, maxIter) {
+  const cap = FractalKernel.clampMaxIter(maxIter == null ? this.maxIter : maxIter);
+  const index = value !== value ? -1 : FractalKernel.colorLutIndex(value, cap);
+  return FractalKernel.colorAtLutIndex(index, cap, this.colorScheme, this.colorOffset);
+};
+
+// The colour of an ARBITRARY smooth value (not necessarily one the worker
+// produced), through the kernel's exact continuous definition — the observable the
+// colour-continuity pin needs. `value === maxIter` is the inside-the-set black.
+FractalViewer.prototype.colorAtSmoothIteration = function(value, maxIter) {
+  const cap = FractalKernel.clampMaxIter(maxIter == null ? this.maxIter : maxIter);
+  if (value !== value) return FractalKernel.UNCALCULATED_COLOR.slice();
+  return FractalKernel.colorAtSmoothIteration(value, cap, this.colorScheme, this.colorOffset);
 };
 
 export { FractalViewer };

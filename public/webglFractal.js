@@ -14,6 +14,16 @@ function trackLiveRenderer(delta) {
   if (typeof window !== 'undefined') window.__fvLiveWebglRenderers = liveRendererCount;
 }
 
+// A JS number as a GLSL float literal. GLSL `float` is IEEE float32, so
+// `Math.fround` produces exactly the value the shader will parse. GLSL has no
+// implicit int→float widening, so an integral value MUST carry the `.0` (a bare
+// `4` makes `escapeRadiusSq > BAILOUT_SQ` a type error that fails the fragment
+// compile and silently falls back to the CPU — D1 pin 5 caught exactly that).
+function glslFloat(value) {
+  const s = String(Math.fround(value));
+  return /[.eE]/.test(s) ? s : s + '.0';
+}
+
 // Minimal WebGL Fractal Renderer (Mandelbrot/Julia)
 export class WebGLFractalRenderer {
   constructor(canvas) {
@@ -65,6 +75,12 @@ export class WebGLFractalRenderer {
     // so a GLSL branch can never drift from the maps app.js uses.
     const defines = [
       '#define MAX_ITER ' + FractalKernel.MAX_ITER,
+      // D1: the SAME constants the kernel's `smoothIterationValue` uses. They are
+      // float literals because GLSL has no implicit int→float widening: a bare
+      // `4` here makes `escapeRadiusSq > BAILOUT_SQ` a type error that fails the
+      // fragment compile and silently falls back to the CPU.
+      '#define SMOOTH_LOG_BAILOUT ' + glslFloat(FractalKernel.SMOOTH_LOG_BAILOUT),
+      '#define BAILOUT_SQ ' + glslFloat(FractalKernel.BAILOUT_SQ),
       ...FractalKernel.FRACTAL_TYPES.map((t) => '#define FT_' + t.glsl + ' ' + t.index),
       ...FractalKernel.COLOR_SCHEMES.map((s) => '#define CS_' + s.glsl + ' ' + s.index)
     ].join('\n') + '\n';
@@ -83,6 +99,11 @@ export class WebGLFractalRenderer {
         float y0 = u_centerY + ((1.0 - v_uv.y) - 0.5) * u_scale;
         float x, y;
         int iter = 0;
+        // D1: the squared magnitude the escape test fires on. It is the SAME
+        // quantity the kernel's iteratePixelState returns as escapeRadiusSq
+        // (both are x*x + y*y of the state the test sees), and the smooth value
+        // below is computed from it with the identical expression.
+        float escapeRadiusSq = 0.0;
         if (u_fractalType == FT_JULIA) { // Julia
           x = x0;
           y = y0;
@@ -91,7 +112,8 @@ export class WebGLFractalRenderer {
             float xtemp = x * x - y * y + u_julia_cx;
             y = 2.0 * x * y + u_julia_cy;
             x = xtemp;
-            if (x * x + y * y > 4.0) break;
+            escapeRadiusSq = x * x + y * y;
+            if (escapeRadiusSq > BAILOUT_SQ) break;
             iter++;
           }
         } else if (u_fractalType == FT_BURNINGSHIP) { // Burning Ship
@@ -102,7 +124,8 @@ export class WebGLFractalRenderer {
             float xtemp = x * x - y * y + x0;
             y = abs(2.0 * x * y) + y0;
             x = abs(xtemp);
-            if (x * x + y * y > 4.0) break;
+            escapeRadiusSq = x * x + y * y;
+            if (escapeRadiusSq > BAILOUT_SQ) break;
             iter++;
           }
         } else if (u_fractalType == FT_TRICORN) { // Tricorn
@@ -113,7 +136,8 @@ export class WebGLFractalRenderer {
             float xtemp = x * x - y * y + x0;
             y = -2.0 * x * y + y0;
             x = xtemp;
-            if (x * x + y * y > 4.0) break;
+            escapeRadiusSq = x * x + y * y;
+            if (escapeRadiusSq > BAILOUT_SQ) break;
             iter++;
           }
         } else { // FT_MANDELBROT
@@ -124,11 +148,27 @@ export class WebGLFractalRenderer {
             float xtemp = x * x - y * y + x0;
             y = 2.0 * x * y + y0;
             x = xtemp;
-            if (x * x + y * y > 4.0) break;
+            escapeRadiusSq = x * x + y * y;
+            if (escapeRadiusSq > BAILOUT_SQ) break;
             iter++;
           }
         }
-        float t = float(iter) / float(u_maxIter);
+        // D1: the smooth (continuous) escape value. This is the SAME expression
+        // as the kernel's smoothIterationValue, on the same n and the same escape
+        // magnitude. n is the 1-BASED INDEX of the update that produced
+        // escapeRadiusSq, i.e. iter + 1 here because this loop breaks BEFORE its
+        // own iter++; the kernel's loop returns that count already incremented, so
+        // it passes its iter unchanged. Getting this off by one is a systematic
+        // one-iteration colour difference between the renderers, which pin 5's
+        // low-cap GPU/CPU parity check measures (a whole 5-unit band at maxIter 50).
+        //   n + 1 - log2( log(|z|^2) / log(BAILOUT_SQ) )
+        // and the iter == u_maxIter case (inside the set) is forced to exactly
+        // u_maxIter so it stays black and matches the kernel exactly. A staircase
+        // here is what made a precision hop visible when zooming.
+        float n = float(iter) + 1.0;
+        float smooth = n + 1.0 - log(log(escapeRadiusSq) * SMOOTH_LOG_BAILOUT) / log(2.0);
+        if (iter == u_maxIter || !(smooth < float(u_maxIter))) smooth = float(u_maxIter);
+        float t = smooth / float(u_maxIter);
         t = mod(t + u_colorOffset, 1.0);
         vec3 color;
         if (iter == u_maxIter) {
@@ -207,6 +247,14 @@ export class WebGLFractalRenderer {
       fragSrc.matchAll(/for \(int i = 0; i < ([A-Za-z_][A-Za-z0-9_]*); i\+\+\)/g),
       (m) => m[1]
     );
+    // D1: the smooth-colour constants ACTUALLY templated in, so the suite can hold
+    // the GPU and the kernel to the same numbers instead of trusting the source.
+    const smoothDefine = fragSrc.match(/#define SMOOTH_LOG_BAILOUT ([-\d.eE+]+)/);
+    this.shaderSmoothLogBailout = smoothDefine ? Number(smoothDefine[1]) : null;
+    // The fragment source as an own NON-ENUMERABLE property, so a pin can read the
+    // smooth expression itself (`n + 1.0 - log(...)`) rather than infer it from
+    // pixels, without leaking into console dumps of the renderer.
+    Object.defineProperty(this, 'shaderSource', { value: fragSrc, enumerable: false });
     // Compile shaders with debug
     const vsh = gl.createShader(gl.VERTEX_SHADER);
     gl.shaderSource(vsh, vertSrc);
