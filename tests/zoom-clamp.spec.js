@@ -8,6 +8,8 @@
 const { test, expect } = require('@playwright/test');
 
 test('wheel, startup-animation setView and render all clamp to the same scale', async ({ page }) => {
+  // The cap is 1e-20 now, so every capped wheel tick renders a real image.
+  test.setTimeout(180_000);
   const pageErrors = [];
   page.on('pageerror', (err) => pageErrors.push(String(err)));
   await page.goto('./', { waitUntil: 'domcontentloaded' });
@@ -40,11 +42,11 @@ test('wheel, startup-animation setView and render all clamp to the same scale', 
 
     // Path 2 — the startup animation's path: a plain setView with an over-cap
     // scale, applied to a fresh object (never the live one).
-    fv.setScale(1e-9);
+    fv.setScale(1e-21);
     const afterAnimationPath = fv.getView().scale;
 
     // Path 3 — an explicit render must not change what was clamped.
-    fv.setScale(1e-9);
+    fv.setScale(1e-21);
     fv.renderWebGL();
     const afterRender = fv.getView().scale;
 
@@ -60,8 +62,13 @@ test('wheel, startup-animation setView and render all clamp to the same scale', 
   expect(result.limitEvents.map((e) => e.scale)).toEqual(
     result.limitEvents.map(() => result.minScale),
   );
-  // ...but the user was PROMPTED exactly once (the pre-S1 code sprayed the modal).
-  expect(result.limitEvents.filter((e) => e.prompted).length).toBe(1);
+  // ...and the cap is REPORTED on every capped tick. GPU-ARBITRARY removed the
+  // "ask the user once" behaviour along with the CPU-switch offer: with the delta
+  // RANGE fixed the cap is a performance limit on a GPU that stays on the GPU, so
+  // there is nothing to ask. `prompted` stays in the payload as an observable and
+  // must now be false on EVERY tick — a regression that reintroduced the ask turns
+  // this RED.
+  expect(result.limitEvents.filter((e) => e.prompted).length).toBe(0);
   expect(pageErrors).toEqual([]);
 });
 

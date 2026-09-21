@@ -117,6 +117,7 @@ test('S6 pin: a scripted interaction produces ZERO app console output', async ({
 // record empty. Restoring `window.prompt` in the save path (the control) makes
 // this test RED.
 test('S6 pin: no alert/confirm/prompt is called; both non-modal flows stay usable', async ({ page }) => {
+  test.setTimeout(180_000);
   await page.addInitScript(() => {
     window.__fvDialogs = [];
     const record = (kind) => (message) => {
@@ -162,40 +163,56 @@ test('S6 pin: no alert/confirm/prompt is called; both non-modal flows stay usabl
   expect(afterCancel.length).toBe(1);
   expect(afterCancel.map((l) => l.name)).toEqual(['S6 named location']);
 
-  // (b) the GPU zoom-cap offer path. `setScale` is the same clamp entry point
-  // the wheel uses; the cap must be applied even though nothing is answered.
+  // (b) the GPU zoom-cap path. `setScale` is the same clamp entry point the wheel
+  // uses. GPU-ARBITRARY changed what happens here: the owner's invariant is that a
+  // present GPU renders every depth, so there is NO CPU-switch offer any more. The
+  // cap still applies, the app still REPORTS it (non-modally), and the renderer
+  // checkbox is untouched by it.
   const capped = await page.evaluate(() => {
-    window.__fv.setScale(1e-9);
-    return window.__fv.getView().scale;
+    window.__fv.setScale(1e-21);
+    return {
+      scale: window.__fv.getView().scale,
+      minScale: window.__fv.minScale,
+      webgl: document.getElementById('webglRender').checked,
+      message: document.getElementById('appMessage').textContent,
+    };
   });
-  expect(capped).toBe(await page.evaluate(() => window.__fv.minScale));
-  await expect(page.locator('#zoomCapOffer')).toBeVisible();
-  // The user WAS asked (once), and the ask is not a dialog.
-  expect(await page.evaluate(() => window.__fv.zoomCapPrompted())).toBe(true);
-  // A further capped tick must not ask again.
+  expect(capped.scale).toBe(capped.minScale);
+  // The offer element is GONE from the page, so no mode switch is reachable.
+  await expect(page.locator('#zoomCapOffer')).toHaveCount(0);
+  await expect(page.locator('#zoomCapSwitchToCpu')).toHaveCount(0);
+  expect(
+    await page.evaluate(() => window.__fv.zoomCapOffered()),
+    'nothing offers a CPU switch at the cap',
+  ).toBe(false);
+  expect(
+    await page.evaluate(() => window.__fv.zoomCapPrompted()),
+    'nothing ASKS the user at the cap either',
+  ).toBe(false);
+  // It still reports — information, not a mode switch.
+  expect(capped.message).toContain('Zoom limit reached for GPU mode');
+  expect(capped.message).toContain('stays on the GPU');
+  // The manual renderer checkbox is untouched by the cap: this is the invariant.
+  expect(capped.webgl, 'a capped GPU view must still be rendering on the GPU').toBe(true);
+  // A further capped tick must not stack notices, and must never prompt.
   const again = await page.evaluate(() => {
     const seen = [];
     window.addEventListener('fv-zoom-limit', (e) => seen.push(e.detail));
-    window.__fv.setScale(1e-9);
+    window.__fv.setScale(1e-21);
     return seen;
   });
   expect(again.map((d) => d.prompted)).toEqual([false]);
-
-  // The offer's REAL "switch" answer: CPU mode, cap still applied.
-  await page.click('#zoomCapSwitchToCpu');
-  await expect(page.locator('#zoomCapOffer')).toBeHidden();
-  expect(await page.isChecked('#webglRender')).toBe(false);
-  expect(await page.evaluate(() => window.__fv.getView().scale)).toBe(
-    await page.evaluate(() => window.__fv.minScale),
-  );
 
   const dialogs = await page.evaluate(() => window.__fvDialogs);
   expect(dialogs, 'alert/confirm/prompt calls after BOTH paths').toEqual([]);
 });
 
-// The offer's OTHER answer (dismiss) is a separate concern: it must hide the
-// offer, keep the cap, and never ask again — still with no dialog anywhere.
-test('S6 pin: dismissing the zoom-cap offer keeps the cap and never asks again', async ({ page }) => {
+// GPU-ARBITRARY: the zoom-cap notice is INFORMATION, repeated at most once every
+// 2 s during a wheel storm, and it never touches the renderer. This replaces S6's
+// "dismiss the offer" pin, whose whole subject — the offer — no longer exists.
+test('GPU-ARBITRARY pin: the zoom-cap notice is non-modal and never switches renderer', async ({ page }) => {
+  // The cap is now genuinely deep, so each capped wheel tick renders a real image.
+  test.setTimeout(180_000);
   await page.addInitScript(() => {
     window.__fvDialogs = [];
     const record = (kind) => (message) => {
@@ -211,27 +228,42 @@ test('S6 pin: dismissing the zoom-cap offer keeps the cap and never asks again',
   await page.goto('./', { waitUntil: 'domcontentloaded' });
   await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
 
-  await page.evaluate(() => window.__fv.setScale(1e-9));
-  await expect(page.locator('#zoomCapOffer')).toBeVisible();
-  await page.click('#zoomCapDismiss');
-  await expect(page.locator('#zoomCapOffer')).toBeHidden();
-
-  const after = await page.evaluate(() => {
-    const events = [];
-    window.addEventListener('fv-zoom-limit', (e) => events.push(e.detail));
-    window.__fv.setScale(1e-9);
+  const first = await page.evaluate(() => {
+    window.__fv.setScale(1e-21);
     return {
       scale: window.__fv.getView().scale,
       minScale: window.__fv.minScale,
-      promptedNow: window.__fv.zoomCapPrompted(),
-      offeredNow: window.__fv.zoomCapOffered(),
-      events,
-      dialogs: window.__fvDialogs,
+      message: document.getElementById('appMessage').textContent,
+      shown: document.getElementById('appMessage').style.display,
     };
   });
-  expect(after.scale).toBe(after.minScale);           // the cap still applies
-  expect(after.offeredNow).toBe(false);               // the offer did not come back
-  expect(after.events.map((d) => d.prompted)).toEqual([false]); // and never asks again
+  expect(first.scale).toBe(first.minScale);        // the cap still applies
+  expect(first.message).toContain('Zoom limit reached for GPU mode');
+  expect(first.shown, 'the notice is a visible, non-modal status surface').not.toBe('none');
+
+  const after = await page.evaluate(() => {
+    // A wheel storm at the limit: the notice is throttled, not stacked, and the
+    // GPU lane stays the active renderer throughout.
+    let events = 0;
+    window.addEventListener('fv-zoom-limit', () => { events++; });
+    for (let i = 0; i < 12; i++) window.__fv.setScale(1e-21);
+    return {
+      events,
+      events2: 0,
+      webgl: document.getElementById('webglRender').checked,
+      offered: window.__fv.zoomCapOffered(),
+      prompted: window.__fv.zoomCapPrompted(),
+      offerNodes: document.querySelectorAll('#zoomCapOffer').length,
+      dialogs: window.__fvDialogs,
+      scale: window.__fv.getView().scale,
+    };
+  });
+  expect(after.events, 'every capped tick still REPORTS').toBe(12);
+  expect(after.scale).toBe(after.minScale);
+  expect(after.webgl, 'the renderer never switches itself').toBe(true);
+  expect(after.offered).toBe(false);
+  expect(after.prompted).toBe(false);
+  expect(after.offerNodes, 'the offer markup is not in the published page').toBe(0);
   expect(after.dialogs).toEqual([]);
 });
 

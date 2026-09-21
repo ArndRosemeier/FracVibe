@@ -224,6 +224,9 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
       rows,
       minScale: fv.minScale,
       iterBudgetMinScale: fv.iterBudgetMinScale,
+      // The scale the perturbation (deep) lane opens at: the ONE constant the D2
+      // floor and the lane boundary share.
+      deepLaneMinScale: fv.iterBudgetMinScale,
       perDecade: fv.iterBudgetPerDecade,
       sliderMaxAttr: slider.getAttribute('max'),
       sliderMaxProp: slider.max,
@@ -250,9 +253,32 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
   // Past the float64 orbit's reach the ONE cap, not the rule, decides.
   expect(measured.anchors.atDeep, 'the rule can never exceed the ONE cap').toBe(measured.cap);
 
-  // The rule shares ONE number with app.js — the scale of the GPU zoom cap — and a
-  // pin holds them equal, so the slice that lifts the cap cannot leave the rule stale.
-  expect(measured.iterBudgetMinScale, 'the floor starts exactly at the GPU zoom cap').toBe(measured.minScale);
+  // GPU-ARBITRARY moved the app's zoom cap to 1e-20 (the measured cost wall), so
+  // the rule's knee is no longer the app's cap and the old equality is deliberately
+  // GONE: `ITER_BUDGET_MIN_SCALE` stays 1e-4 because that is the scale the DEEP
+  // LANE opens at, and the two must still agree. What the pin now holds is that the
+  // cap is strictly DEEPER than the knee (so the rule really can raise the budget
+  // inside the reachable range) and that the sampled anchors below are unaffected.
+  expect(measured.iterBudgetMinScale, 'the floor knee is the deep lane threshold, stated as a number')
+    .toBe(measured.deepLaneMinScale);
+  // The knee is a BEHAVIOUR, not a restated constant: at the knee the deep lane is
+  // off and just below it the deep lane is on, measured through the renderer's own
+  // `usePerturbation` after a real draw.
+  const lane = await page.evaluate(() => {
+    const fv = window.__fv;
+    const centre = { centerX: -0.743643887037151, centerY: 0.13182590420533 };
+    fv.setDeepView({ ...centre, scale: fv.iterBudgetMinScale });
+    fv.renderWebGL();
+    const atKnee = fv.usePerturbation();
+    fv.setDeepView({ ...centre, scale: fv.iterBudgetMinScale * 0.5 });
+    fv.renderWebGL();
+    const belowKnee = fv.usePerturbation();
+    return { atKnee, belowKnee };
+  });
+  expect(lane.atKnee, 'at the knee the perturbation lane is NOT used').toBe(false);
+  expect(lane.belowKnee, 'below the knee the perturbation lane IS used').toBe(true);
+  expect(measured.minScale, 'the cap must be DEEPER than the floor knee, or the rule is dead')
+    .toBeLessThan(measured.iterBudgetMinScale);
 
   // S3 pin 2 stays green: the slider's bound IS the kernel cap IS the templated
   // shader loop bound (four sites).

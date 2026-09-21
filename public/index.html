@@ -65,14 +65,13 @@
     <button id="saveLocationConfirm" style="background:#ffe066;color:#222;border:none;border-radius:5px;padding:0.35em 1em;cursor:pointer;font-weight:bold;">Save</button>
     <button id="saveLocationCancel" style="background:#444;color:#ffe066;border:none;border-radius:5px;padding:0.35em 1em;cursor:pointer;">Cancel</button>
   </div>
-  <!-- S6: non-modal GPU zoom-cap offer. Replaces window.confirm. Shown at most
-       once; the cap is applied by the clamp regardless of which button is used
-       (or of no button being used at all). -->
-  <div id="zoomCapOffer" role="status" aria-live="polite" style="display:none;position:fixed;top:64px;left:50%;transform:translateX(-50%);z-index:3500;align-items:center;gap:0.8em;background:rgba(30,30,30,0.96);border:1px solid #ffe066;border-radius:8px;padding:0.6em 1em;color:#ffe066;box-shadow:0 2px 16px #0008;">
-    <span>Zoom limit reached for GPU mode. Switch to CPU mode for deeper zoom?</span>
-    <button id="zoomCapSwitchToCpu" style="background:#ffe066;color:#222;border:none;border-radius:5px;padding:0.35em 1em;cursor:pointer;font-weight:bold;">Switch to CPU</button>
-    <button id="zoomCapDismiss" style="background:#444;color:#ffe066;border:none;border-radius:5px;padding:0.35em 1em;cursor:pointer;">Stay on GPU</button>
-  </div>
+  <!-- GPU-ARBITRARY: the S6 non-modal GPU zoom-cap CPU-switch OFFER is REMOVED.
+       The owner's invariant — "If a GPU is present, complete depth needs to be
+       calculated there, period" — makes a mode switch at the cap wrong, not merely
+       optional. At whatever limit remains the app reports through #appMessage
+       (non-modal, informational) and keeps rendering on the GPU. The CPU lane
+       stays reachable ONLY when WebGL is absent/failed, or through the manual
+       renderer checkbox, which is kept unchanged. -->
   <!-- Non-modal failure/status surface: renderer fallbacks and the global error
        net report here instead of an alert (S1/B9). -->
   <div id="appMessage" role="status" aria-live="polite" style="display:none;"></div>

@@ -81,6 +81,24 @@ export class WebGLFractalRenderer {
     this.bigOrbitErrors = 0;
     this.bigOrbitWorkerSpawns = 0;
     this.lastBigOrbitMs = 0;
+    // ARBITRARY DEPTH: the exponent split for the deep lane's delta seed. The
+    // override is TEST-ONLY (0 = the measured rule) and exists so the shift itself
+    // can be swept, exactly as bigOrbitBitsOverride sweeps the precision.
+    this.deepSeedShift = 0;
+    // DIAGNOSTIC ONLY (default false): draw the pre-fix seed, so the collapse this
+    // slice fixes is measured through the REAL program rather than hand-rolled.
+    this.legacyDeltaSeed = false;
+    // The wall-clock ms of the last full-image draw, measured around the
+    // synchronous GL pass. This is the value the readout reports.
+    this.lastDrawMs = 0;
+    // A 1x1 RGBA scratch buffer for the completion sync that makes the render-time
+    // readout real (see draw). Reused, because it is touched once per image.
+    this._syncPixel = new Uint8Array(4);
+    // How many full-image passes this renderer has issued. The render-time readout
+    // is asserted against this so "the time is a FULL image" is counted: `draw`
+    // always submits exactly one full-frame drawArrays, and this counter advances
+    // by one per pass (never per partial pass, because there are none).
+    this.fullImagePasses = 0;
     this.onBigOrbitReady = null;
     this.orbitSource = 'none';
     if (!canvas) {
@@ -182,9 +200,56 @@ export class WebGLFractalRenderer {
           //    (docs/DECISIONS.md row 33).
           //  * RESCALING — renormalise S every PERTURB_RESCALE_INTERVAL iterations
           //    (see the kernel constants for where it does, and does not, matter).
+          //
+          // ARBITRARY DEPTH (the range fix). The two lines that used to read
+          //     float dcx = (v_uv.x - 0.5) * u_scale * u_aspect;
+          //     float dcy = ((1.0 - v_uv.y) - 0.5) * u_scale;
+          // were the wall: u_scale is a float32 UNIFORM, so past ~2e-38 the product
+          // underflows and every pixel lands on the reference point before any
+          // rebasing or rescaling can act — measured through the real shader: a
+          // structured frame at 1e-37, ONE value at 2e-38 (docs/DECISIONS.md rows
+          // 39/42+). The delta only ever needs to be SMALL, never WIDE, so the fix
+          // seeds it in float32's NORMAL range and carries the scale's exponent in
+          // the rescaled representation's own S:
+          //
+          //     u_scale <- scale * 2^shift               (a normal float32, so the
+          //                                               offset product is normal)
+          //     S       <- 2^-shift                      (a normal float32; the shift
+          //                                               saturates at 120, which is
+          //                                               the measured reach below)
+          //
+          // The physical per-pixel offset is unchanged — S * dc is exactly what the
+          // old code computed — while neither the seeded delta nor S is ever
+          // subnormal. That is what stops the collapse: it is the delta's RANGE that
+          // was float32-bounded, not its mantissa, and no mantissa change (wider
+          // hi/lo orbit words) can fix a range underflow. S is carried as TWO
+          // factors because 2^-shift alone underflows for the deepest views; both
+          // factors are powers of two, so every scaling step stays exact.
+          //
+          // The loop's EXISTING rescaling then walks S from 2^-shift toward |z| as
+          // the delta grows, exactly as before. Nothing else changes: rebasing, the
+          // glitch detector and the S-normalisation are untouched. With a shift of 0
+          // the expressions are byte-for-byte the pre-change ones (S = 1, u_scale is
+          // the true scale), which is why the shallow lane is unchanged.
+          //
+          // The shift is orthogonal to how the pass is SCHEDULED: a coarse-to-fine
+          // pass re-runs this same per-pixel expression with the same uniforms, so
+          // progressive refinement can reuse the mechanism unchanged (the exponent
+          // depends on the VIEW, not on the frame's resolution or its place in a
+          // refinement sequence).
+          float S = exp2(-u_scaleShift);        // exact (power of two)
           float dcx = (v_uv.x - 0.5) * u_scale * u_aspect;
           float dcy = ((1.0 - v_uv.y) - 0.5) * u_scale;
-          float S = 1.0;                 // z = S*w, dc = S*d
+          // DIAGNOSTIC ONLY (default 0, never set in production): u_diagLegacy == 1
+          // reproduces the PRE-FIX seed exactly — the raw times-u_scale product with
+          // S = 1 — so the pin can measure the collapse it fixes through the REAL
+          // render path instead of hand-rolling a baseline. It is the same pattern
+          // as P1's u_diag and P2's orbitMode: observation only.
+          if (u_diagLegacy == 1) {
+            dcx = (v_uv.x - 0.5) * u_scaleLegacy * u_aspect;
+            dcy = ((1.0 - v_uv.y) - 0.5) * u_scaleLegacy;
+            S = 1.0;
+          }
           float dzx = 0.0, dzy = 0.0;    // w
           float ddx = dcx, ddy = dcy;    // d
           float Zx = 0.0, Zy = 0.0, Z2 = 0.0, z2g = 0.0;
@@ -260,6 +325,15 @@ export class WebGLFractalRenderer {
       precision highp float;
       varying vec2 v_uv;
       uniform float u_centerX, u_centerY, u_scale, u_aspect;
+      // ARBITRARY DEPTH: the exponent folded out of u_scale into S. 0 in every
+      // shallow draw (u_scale is then the true scale and S = 1, byte-for-byte the
+      // pre-change shader); non-zero only in the deep lane, where it keeps the
+      // seeded delta and S out of float32's subnormal range.
+      uniform float u_scaleShift;
+      // DIAGNOSTIC ONLY (default 0): reproduce the pre-fix delta seed. See the
+      // perturbation branch. Production never sets either uniform non-zero.
+      uniform float u_scaleLegacy;
+      uniform int u_diagLegacy;
       uniform int u_maxIter;
       uniform int u_colorScheme;
       uniform float u_colorOffset;
@@ -529,6 +603,11 @@ ${mandelbrotBody}
       centerX: gl.getUniformLocation(program, 'u_centerX'),
       centerY: gl.getUniformLocation(program, 'u_centerY'),
       scale: gl.getUniformLocation(program, 'u_scale'),
+      // ARBITRARY DEPTH: the exponent folded out of `scale` into `S`.
+      scaleShift: gl.getUniformLocation(program, 'u_scaleShift'),
+      // DIAGNOSTIC ONLY: the pre-fix seed (see the perturbation branch).
+      scaleLegacy: gl.getUniformLocation(program, 'u_scaleLegacy'),
+      diagLegacy: gl.getUniformLocation(program, 'u_diagLegacy'),
       aspect: gl.getUniformLocation(program, 'u_aspect'),
       maxIter: gl.getUniformLocation(program, 'u_maxIter'),
       colorScheme: gl.getUniformLocation(program, 'u_colorScheme'),
@@ -551,6 +630,58 @@ ${mandelbrotBody}
 
   setColorOffset(offset) {
     this.colorOffset = offset;
+  }
+
+  // --- ARBITRARY DEPTH: the delta-coordinate RANGE split ----------------------
+  // The defect this replaces: `dc = (v_uv - 0.5) * u_scale` with `u_scale` a
+  // float32 UNIFORM. Past ~2e-38 the product is subnormal and every pixel lands on
+  // the reference point before rebasing/rescaling can act (measured through the
+  // REAL shader: structured at 1e-37, ONE value at 2e-38).
+  //
+  // The fix is a uniform split, not a new algorithm:
+  //   u_scale        <- scale * 2^shift            (kept a NORMAL float32)
+  //   u_scaleShift <- shift, folded into S = exp2(-shift)
+  // so the shader forms the SAME physical delta (`S * dc` is untouched because
+  // `2^shift * 2^-shift === 1` exactly) while neither the seeded delta nor S is
+  // ever subnormal. The exponent then rides the loop's EXISTING rescaling, which
+  // already walks S toward |z|.
+  //
+  // The shift is chosen by MEASUREMENT (docs/DECISIONS.md, GPU-ARBITRARY rows). It
+  // is CAPPED at 120 because S = 2^-shift must itself stay a normal float32: past
+  // that the representation's own scale underflows, which is where this slice's
+  // measured reach ends. A two-factor S (S = S1*S2) was implemented and measured to
+  // be WORSE at every depth it was tried on (double rounding in the quadratic term
+  // turned the exact 1e-40 result into 32% misclassification), so it is not shipped.
+  // `TARGET_DEEP_DELTA_EXP` is the magnitude the seeded delta is aimed at
+  // (2^-40 ~ 9.1e-13): normal, comfortably above the subnormal boundary, and below
+  // 1 so the first iterations stay in the linear regime the perturbation
+  // formulation wants.
+  deepScaleUniforms(scale, seedShiftOverride = 0) {
+    const TARGET_DEEP_DELTA_EXP = -40;
+    // A normal float32 spans 2^-126 .. 2^127; S = 2^-shift must land inside it.
+    const MAX_SHIFT = 120;
+    if (!(scale > 0) || !isFinite(scale)) {
+      return { scale: scale, shift: 0 };
+    }
+    // The first iteration's delta is |offset * scale| with |offset| <= ~0.8, so its
+    // exponent is ~log2(scale). Fold out the power of two that lands it near
+    // TARGET_DEEP_DELTA_EXP; the offset ORDER never matters because the shift is an
+    // integer power of two, so 2^shift * 2^-shift is exactly 1.
+    const e = Math.log2(scale);                       // scale = 2^e, e < 0 for a zoom
+    let shift = Math.round(TARGET_DEEP_DELTA_EXP - e);
+    if (!isFinite(shift)) return { scale: scale, shift: 0 };
+    if (shift < 0) shift = 0;
+    shift += seedShiftOverride | 0;
+    if (shift < 0) shift = 0;
+    // S = 2^-shift is a normal float32 only while shift <= 120; past the measured
+    // reach the shift saturates, which is what WEBGL_ZOOM_CAP encodes.
+    if (shift > MAX_SHIFT) shift = MAX_SHIFT;
+    // Scale by a power of two exactly (`Math.pow(2, n)` is exact for integer n).
+    const scaled = scale * Math.pow(2, shift);
+    if (!(scaled > 0) || !isFinite(scaled)) {
+      return { scale: scale, shift: 0 };
+    }
+    return { scale: scaled, shift: shift };
   }
 
   // Keep the drawing buffer at CSS size x devicePixelRatio and the viewport in
@@ -790,6 +921,13 @@ ${mandelbrotBody}
     const gl = this.gl;
     // Safe to call after destroy()/context loss: draw nothing rather than throw.
     if (!gl || this.destroyed || gl.isContextLost() || !this.program) return;
+    // ARBITRARY DEPTH: the full-image time of THIS pass. `draw` issues exactly one
+    // full-frame drawArrays for the whole image (no tiling, no partial pass), and
+    // in WebGL1 the command is ordered with the readbacks the suite performs, so
+    // the elapsed wall clock is attributable to this image. The readout reports it
+    // and the suite asserts it covers a FULL image (the frame counter below).
+    const drawStart = (typeof performance !== 'undefined' && performance.now)
+      ? performance.now() : Date.now();
     if (gl.canvas && (gl.drawingBufferWidth !== this.canvas.width || gl.drawingBufferHeight !== this.canvas.height)) {
       gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     }
@@ -840,7 +978,28 @@ ${mandelbrotBody}
     const U = this.usePerturbation ? this.uPerturb : this.uPlain;
     gl.uniform1f(U.centerX, view.centerX);
     gl.uniform1f(U.centerY, view.centerY);
-    gl.uniform1f(U.scale, view.scale);
+    // ARBITRARY DEPTH: the deep lane seeds its delta in float32's NORMAL range and
+    // folds the scale exponent into the shader's `S`. The seam is the RANGE of the
+    // delta coordinate, so this is a uniform SPLIT, not a change of algorithm:
+    // `u_scale` carries scale*2^shift and `u_scaleShift` carries the exponent. The
+    // physical per-pixel offset is identical (S * dc is unchanged), and with a
+    // shift of 0 the two values are exactly the pre-change ones — which is why the
+    // shallow lane is byte-for-byte identical (measured, pin 2).
+    // shift 0 => scale is the true scale and both factors are exactly 1: the
+    // pre-change expressions, unchanged.
+    let seeded = { scale: view.scale, shift: 0 };
+    if (this.usePerturbation) {
+      seeded = this.deepScaleUniforms(view.scale, this.deepSeedShift);
+    }
+    // ARBITRARY DEPTH: the delta-coordinate RANGE split. `u_scale` carries the
+    // normal-range seed and `u_scaleShift` the exponent the shader folds into S.
+    // With shift 0 both are the plain pre-change values.
+    gl.uniform1f(U.scale, seeded.scale);
+    gl.uniform1f(U.scaleShift, seeded.shift || 0);
+    // DIAGNOSTIC ONLY: default OFF, so production draws the fixed seed. The pin
+    // turns it on to measure the pre-fix collapse through the same program.
+    gl.uniform1i(U.diagLegacy, this.legacyDeltaSeed ? 1 : 0);
+    gl.uniform1f(U.scaleLegacy, view.scale);
     gl.uniform1f(U.aspect, this.canvas.width / this.canvas.height);
     // The shader's loop bound is the constant MAX_ITER; clamping the uniform to the
     // same ONE constant is what makes `iter == u_maxIter` (the "inside" test) mean
@@ -878,6 +1037,23 @@ ${mandelbrotBody}
     gl.uniform1i(U.diag, diag);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     gl.uniform1i(U.diag, 0);
+    // One full-image pass done: count it and close the clock. The sync is what makes
+    // the number MEAN something, and it is MEASURED which sync works here: WebGL
+    // queues the draw and returns immediately, so a wall clock around drawArrays
+    // alone reads 0.0 ms at every depth, and `gl.finish()` does NOT wait on this
+    // host's ANGLE/SwiftShader (measured: 0.2 ms against a true 288 ms image). A
+    // ONE-PIXEL readback DOES wait, and its cost is the image itself: measured
+    // median frame 243.5 ms with it against 226.7 ms without on a 1280x800 animated
+    // zoom, i.e. ~7 % over an image that already takes ~227 ms. That is affordable
+    // for a per-FULL-IMAGE readout (not per animation frame), so the reported number
+    // is the real cost of the image the user is looking at.
+    if (!gl.isContextLost()) {
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, this._syncPixel);
+    }
+    const drawEnd = (typeof performance !== 'undefined' && performance.now)
+      ? performance.now() : Date.now();
+    this.lastDrawMs = drawEnd - drawStart;
+    this.fullImagePasses++;
   };
 
   destroy() {

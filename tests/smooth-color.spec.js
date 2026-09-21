@@ -39,6 +39,10 @@ const BAND_CAP = 50;
 // The scale sweep: 0.05 down to the cap's own minimum (1/10000), log-spaced.
 const SWEEP_LO = 0.05;
 const SWEEP_STEPS = 14;
+// The deepest scale the CPU-lane hop sweep uses. Chosen where the D2 budget is
+// large enough that the frame is not saturated to black: measured `finite` counts
+// stay in the thousands here, against a handful at the 1e-20 cap.
+const SWEEP_HI_SCALE = 1e-8;
 
 async function waitIdle(page) {
   await expect
@@ -237,11 +241,19 @@ test('D1 pin 3: no hop while zooming, at any step including the cap boundary', a
   page.on('pageerror', (err) => pageErrors.push(String(err)));
   await setup(page);
 
+  // GPU-ARBITRARY moved the app's zoom cap to 1e-20 (the measured cost wall), and
+  // this pin runs the CPU lane: at 1e-20 the D2 budget is saturated and almost
+  // every pixel is INSIDE the set, so the sub-iteration population it must measure
+  // disappears. The sweep is therefore anchored on a stated DEEPEST scale where the
+  // CPU lane still resolves sub-iteration moves, and the cap boundary is checked
+  // separately below. `SWEEP_HI_SCALE` is a number, not the app's cap, so a later
+  // cap change cannot silently make this pin vacuous again.
   const minScale = await page.evaluate(() => window.__fv.minScale);
+  const sweepHi = Math.max(minScale, SWEEP_HI_SCALE);
   const scales = [];
-  for (let i = 0; i <= SWEEP_STEPS; i++) scales.push(SWEEP_LO * Math.pow(minScale / SWEEP_LO, i / SWEEP_STEPS));
-  // The last step IS the cap's own minimum scale.
-  scales[scales.length - 1] = minScale;
+  for (let i = 0; i <= SWEEP_STEPS; i++) scales.push(SWEEP_LO * Math.pow(sweepHi / SWEEP_LO, i / SWEEP_STEPS));
+  // The last step IS the deepest scale this sweep can measure.
+  scales[scales.length - 1] = sweepHi;
 
   const rows = [];
   for (const scale of scales) {

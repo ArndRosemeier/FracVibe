@@ -41,11 +41,6 @@ const importLocationsBtn = document.getElementById('importLocationsBtn');
 // These live in index.html; the modal is shown/hidden rather than built on demand.
 const savedLocationsList = document.getElementById('savedLocationsList');
 const locationSortSelect = document.getElementById('locationSortSelect');
-// S6: the two non-modal surfaces that replace `window.prompt` (save/naming) and
-// `window.confirm` (GPU zoom-cap offer). Queried here with every other element.
-const zoomCapOffer = document.getElementById('zoomCapOffer');
-const zoomCapSwitchBtn = document.getElementById('zoomCapSwitchToCpu');
-const zoomCapDismissBtn = document.getElementById('zoomCapDismiss');
 
 // --- S3: the ONE type/palette table and the ONE iteration cap ---------------
 // The <select> option lists and the slider's `max` are DERIVED from the kernel
@@ -426,70 +421,46 @@ viewer.view.scale = 300;
 // (setZoomLimit/clampScale) so wheel, setView and the startup animation all
 // produce the SAME value. This module only DECIDES the cap and what to say when
 // it is reached. There is no monkey-patching of viewer methods any more.
-const WEBGL_ZOOM_CAP = 10000;
+// GPU-ARBITRARY: the cap is no longer the PRECISION wall — it is the measured
+// cost wall. `WEBGL_ZOOM_CAP = 1e20` (scale 1e-20) is where a full image measured
+// ~285 ms at 640x480 on this host (SwiftShader software rasteriser), against
+// ~14 ms at the old 1e4 cap and ~640 ms at 1e-40; a real GPU is faster, and the
+// number is stated so the choice can be re-made. The DELTA-RANGE mechanism is
+// correct far past it (verified to 1e-40, docs/DECISIONS.md), so this is the
+// performance bound the deliverable calls for — not a representability bound.
+//
+// The owner's invariant is explicit and is NOT a heuristic: "If a GPU is present,
+// complete depth needs to be calculated there, period." There is no depth- or
+// time-based fallback and no crossover. Slowness at extreme depth is accepted and
+// made VISIBLE (the per-image render-time readout) rather than traded for a mode
+// switch. The CPU lane stays reachable ONLY as the genuine no-GPU path (WebGL
+// absent/failed) and through the manual renderer checkbox the owner kept.
+const WEBGL_ZOOM_CAP = 1e20;
 const WEBGL_MIN_SCALE = 1 / WEBGL_ZOOM_CAP;
-let askedCpuSwitchAtZoomCap = false;
+let zoomCapNoticeAt = 0;
+let askedCpuSwitchAtZoomCap = false;   // kept for the observables the suite reads
 let deniedCpuSwitchAtZoomCap = false;
-// S6: the offer is non-modal and shown AT MOST ONCE. This remembers whether the
-// offer is currently on screen, so the pin can observe "the user was actually
-// asked" as a DOM fact rather than inferring it from a deferred callback.
 let cpuSwitchOfferVisible = false;
 
-function showZoomCapOffer() {
-  if (!zoomCapOffer) return;
-  cpuSwitchOfferVisible = true;
-  zoomCapOffer.style.display = 'flex';
-}
-
-function hideZoomCapOffer() {
-  cpuSwitchOfferVisible = false;
-  if (zoomCapOffer) zoomCapOffer.style.display = 'none';
-}
-
-// The user asked for the CPU renderer from the cap offer. This is the SAME
-// action as unticking the checkbox: it unchecks, which fires the checkbox's ONE
-// change handler (updateWebGLState + a real CPU calculation). The cap itself was
-// already applied by FractalViewer.clampScale before this ran.
-function acceptCpuSwitchAtZoomCap() {
-  hideZoomCapOffer();
-  webglCheckbox.checked = false;
-  webglCheckbox.dispatchEvent(new Event('change'));
-}
-
-// The user declined (or dismissed) the offer. The cap stays applied; the offer
-// is never shown again, and `fv-zoom-limit` keeps reporting `prompted: false`
-// for every further capped tick, so "once" stays observable.
-function declineCpuSwitchAtZoomCap() {
-  hideZoomCapOffer();
-  deniedCpuSwitchAtZoomCap = true;
-}
-
 function handleZoomLimitReached() {
-  showMessage('Zoom limit reached for GPU mode (~' + WEBGL_ZOOM_CAP.toLocaleString() + 'x). Offer to switch to CPU for deeper zoom.');
-  // The cap is hit on every further wheel tick, but the user is ASKED only once.
-  // Report both facts to the observer so "once" is observable, not asserted from
-  // behaviour. `prompted` means exactly "the user was actually asked", i.e. this
-  // is the one tick that puts the offer on screen.
-  const prompted = !askedCpuSwitchAtZoomCap && !deniedCpuSwitchAtZoomCap;
+  const now = (typeof performance !== 'undefined' && performance.now)
+    ? performance.now() : Date.now();
+  // At most one notice every 2 s: a wheel storm at the limit must not stack
+  // messages, and the notice is INFORMATION, never a mode switch.
+  if (now - zoomCapNoticeAt > 2000) {
+    zoomCapNoticeAt = now;
+    showMessage('Zoom limit reached for GPU mode (~' + WEBGL_ZOOM_CAP.toLocaleString()
+      + 'x). Rendering stays on the GPU; the limit is performance, not precision.');
+  }
+  // Report the event to the observer. `prompted` stays in the payload for the
+  // existing `fv-zoom-limit` contract, but the app never ASKS any more: no offer
+  // is shown and no CPU switch is reachable from here.
   try {
     window.dispatchEvent(new CustomEvent('fv-zoom-limit', {
-      detail: { scale: viewer.view.scale, prompted },
+      detail: { scale: viewer.view.scale, prompted: false },
     }));
   } catch (_) { /* observation only */ }
-  if (!prompted) return;
-  askedCpuSwitchAtZoomCap = true;
-  // NON-MODAL (S6): the offer is a positioned element with two buttons, shown
-  // synchronously. It blocks nothing — the clamp was already applied by the
-  // caller and the render it triggers proceeds — and BOTH answers leave the cap
-  // in force, because neither one touches `viewer.zoomLimit`. This replaces the
-  // S1 `window.confirm` (old `app.js:394`), retired as the smell row 9 recorded.
-  showZoomCapOffer();
 }
-
-// The offer's two real answers. They are wired once, here, so the offer cannot
-// be shown without a way to answer it.
-if (zoomCapSwitchBtn) zoomCapSwitchBtn.addEventListener('click', acceptCpuSwitchAtZoomCap);
-if (zoomCapDismissBtn) zoomCapDismissBtn.addEventListener('click', declineCpuSwitchAtZoomCap);
 
 
 viewer.setZoomLimit(WEBGL_MIN_SCALE, handleZoomLimitReached);
@@ -1465,10 +1436,11 @@ window.__fv = Object.freeze({
   simulateContextLoss: () => handleWebGLLoss('Context loss simulated.'),
   zoomCap: WEBGL_ZOOM_CAP,
   minScale: WEBGL_MIN_SCALE,
-  // S6: the non-modal zoom-cap offer, observed as a DOM fact. `offered` is
-  // "the offer is on screen right now"; `prompted` is "the one-time ask has
-  // happened" (which is exactly what `fv-zoom-limit`'s `prompted` reports), so a
-  // one-line regression in either mechanism is visible without pixel inference.
+  // GPU-ARBITRARY: the S6 zoom-cap CPU-switch OFFER no longer exists. These two
+  // observables are kept in the frozen surface (a pin and the app's own status
+  // reporting read them) but are now OBSERVABLY INERT: nothing in the app can show
+  // an offer or ask a question, because the owner's invariant forbids the switch.
+  // A regression that reintroduced either would move them, so they stay live.
   zoomCapOffered: () => cpuSwitchOfferVisible,
   zoomCapPrompted: () => askedCpuSwitchAtZoomCap,
   liveRenderers: () => (typeof window.__fvLiveWebglRenderers === 'number' ? window.__fvLiveWebglRenderers : 0),
@@ -1762,8 +1734,41 @@ window.__fv = Object.freeze({
   // without restating the list in a second fixture.
   fractalTypes: () => FractalKernel.FRACTAL_TYPES.map((t) => t.value),
   colorSchemes: () => FractalKernel.COLOR_SCHEMES.map((s) => s.value),
-  // --- S2 worker observables (counted, never inferred) ---
-  // How many Workers this page has constructed, and how many live jobs a terminate
+  // GPU-ARBITRARY: the per-FULL-IMAGE render time, in ms — the observable behind
+  // the visible `#renderTime` readout. `lastRenderDuration` is written by
+  // `renderWebGL` (and by the CPU branch of `renderFractal`) around ONE complete
+  // pass, and the renderer's own `fullImagePasses` counter lets a pin prove the
+  // measured pass really was a whole image rather than a partial refinement frame.
+  renderTimeMs: () => lastRenderDuration,
+  fullImagePasses: () => (webglRenderer ? webglRenderer.fullImagePasses : 0),
+  renderTimeText: () => (renderTimeElem ? renderTimeElem.textContent : ''),
+  // GPU-ARBITRARY observation surface (the same shape as P1's `perturbConstants`
+  // and P2's `bigOrbitBits`): the delta-coordinate RANGE split the deep lane
+  // actually used, and the diagnostic that reproduces the pre-fix seed.
+  deepSeed: () => {
+    if (!webglRenderer || typeof webglRenderer.deepScaleUniforms !== 'function') return null;
+    const s = webglRenderer.deepScaleUniforms(viewer.view.scale, webglRenderer.deepSeedShift);
+    return { shift: s.shift, scaleUniform: s.scale, scale: viewer.view.scale, target: -40 };
+  },
+  // TEST-ONLY: shift the deep seed's exponent by ±n powers of two, so the shift
+  // can be swept and its optimum measured rather than asserted. 0 = the rule.
+  setDeepSeedShift: (n) => {
+    if (!webglRenderer) return false;
+    webglRenderer.deepSeedShift = n | 0;
+    return true;
+  },
+  // TEST-ONLY: draw the PRE-FIX delta seed (the raw float32 `* u_scale` product,
+  // S = 1) through the real program, so the collapse this slice fixes is measured
+  // in-pin instead of hand-rolled outside the code under test.
+  setLegacyDeltaSeed: (on) => {
+    if (!webglRenderer) return false;
+    webglRenderer.legacyDeltaSeed = !!on;
+    return true;
+  },
+  legacyDeltaSeed: () => !!(webglRenderer && webglRenderer.legacyDeltaSeed),
+  // The ONE kernel iteration budget the last draw used, so a perf pin can state
+  // the cost per image at a stated budget.
+  // --- S2 worker observables (counted, never inferred) ---  // How many Workers this page has constructed, and how many live jobs a terminate
   // killed. A cancellation is proven by the second number going up, not by watching
   // pixels stop changing.
   workerGeneration: () => workerGeneration,
