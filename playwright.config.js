@@ -19,7 +19,11 @@ module.exports = defineConfig({
   webServer: {
     command: 'node server/server.js',
     url: 'http://127.0.0.1:3000',
-    reuseExistingServer: true,
+    // NEVER reuse a server this run did not start: one left behind by a dev
+    // session or another worktree serves DIFFERENT files, so reuse would make a
+    // green suite report on code the run never loaded. scripts/gate.sh refuses
+    // on a busy :3000; this is the second line of the same defence.
+    reuseExistingServer: false,
     timeout: 30_000,
   },
 });
