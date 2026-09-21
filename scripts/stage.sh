@@ -176,7 +176,12 @@ def collect(rel, seen):
         collect(dep, seen)
 
 seen = set()
-for entry in ('app.js', 'fractalWorker.js'):
+# `gpuDiagnostic.js` is an entry even though nothing `import`s it: `index.html`
+# declares it in a <script> tag, so the page DOES fetch it, and being an entry is
+# what makes it content-addressed. Without this it would be served from a fixed
+# URL and could go stale for the 4 h Cloudflare TTL (the PUBLISH-CACHE trap) -
+# unacceptable for the diagnostic whose entire job is to report the CURRENT build.
+for entry in ('app.js', 'fractalWorker.js', 'gpuDiagnostic.js'):
     collect(entry, seen)
 if 'app.js' not in SOURCES:
     raise SystemExit('stage: RED — app.js was not found under ' + root)
@@ -200,7 +205,12 @@ def order(rel, stack=()):
         DONE.add(rel)
         ORDER.append(rel)
 
-for entry in ('app.js', 'fractalWorker.js'):
+# `gpuDiagnostic.js` is an entry even though nothing `import`s it: `index.html`
+# declares it in a <script> tag, so the page DOES fetch it, and being an entry is
+# what makes it content-addressed. Without this it would be served from a fixed
+# URL and could go stale for the 4 h Cloudflare TTL (the PUBLISH-CACHE trap) -
+# unacceptable for the diagnostic whose entire job is to report the CURRENT build.
+for entry in ('app.js', 'fractalWorker.js', 'gpuDiagnostic.js'):
     order(entry)
 
 for rel in ORDER:
