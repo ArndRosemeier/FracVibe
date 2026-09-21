@@ -56,6 +56,21 @@ test('a viewport resize moves the WebGL backing store with it', async ({ page })
     }), { timeout: 20_000 })
     .toEqual({ w: 1600, h: 1200 });
 
+  // The resized buffer must still be CSS size x dpr (800 x 2), not merely "1600
+  // because the constant said so".
+  const measured = await page.evaluate(() => {
+    const c = /** @type {HTMLCanvasElement} */ (document.getElementById('fractalCanvasWebGL'));
+    return {
+      dpr: window.devicePixelRatio,
+      cssWidth: window.innerWidth,
+      cssHeight: window.innerHeight,
+      bufferWidth: c.width,
+      bufferHeight: c.height,
+    };
+  });
+  expect(measured.bufferWidth).toBe(Math.round(measured.cssWidth * measured.dpr));
+  expect(measured.bufferHeight).toBe(Math.round(measured.cssHeight * measured.dpr));
+
   // The resize path must also repaint and recompute, at the new resolution.
   await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
   expect(pageErrors).toEqual([]);

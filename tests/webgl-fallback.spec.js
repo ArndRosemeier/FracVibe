@@ -65,6 +65,37 @@ test('forced WebGL context-creation failure still renders on the CPU canvas and 
   expect(pageErrors).toEqual([]);
 });
 
+test('a WebGL failure AFTER startup starts a NEW CPU calculation', async ({ page }) => {
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(String(err)));
+  // Count the jobs the app hands to the worker. This is the observable that the
+  // old failure path lacked entirely: it called viewer.render() (which paints the
+  // background when no image data exists) and never started a calculation.
+  await page.addInitScript(() => {
+    window.__fvWorkerMessages = 0;
+    const post = Worker.prototype.postMessage;
+    Worker.prototype.postMessage = function (...args) {
+      window.__fvWorkerMessages++;
+      return post.apply(this, args);
+    };
+  });
+  await page.goto('./', { waitUntil: 'domcontentloaded' });
+  await expect
+    .poll(async () => page.evaluate(() => window.__fv.animationSettled()), { timeout: 30_000 })
+    .toBe(true);
+  await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
+
+  const before = await page.evaluate(() => window.__fvWorkerMessages);
+  await page.evaluate(() => window.__fv.forceFallback());
+  await expect(page.locator('#appMessage')).toContainText(/CPU/i);
+  await expect(page.locator('#fractalCanvas')).toBeVisible();
+  await expect
+    .poll(async () => page.evaluate(() => window.__fvWorkerMessages), { timeout: 10_000 })
+    .toBeGreaterThan(before);
+
+  expect(pageErrors).toEqual([]);
+});
+
 test('a lost WebGL context degrades to the CPU canvas with a message', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (err) => pageErrors.push(String(err)));
