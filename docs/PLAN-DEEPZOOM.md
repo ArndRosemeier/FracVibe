@@ -65,10 +65,30 @@ small. **This is needed under every route, which is why it is D1.**
 | **D6** | **Align the CPU and GPU sample points.** `FractalKernel.pixelToCoord` samples pixel CORNERS while the shader samples CENTRES, so the two renderers disagree by 1.26% (1e3) / 9.0% (1e5) — **more than the GPU's float32 error at shallow zoom**, and it inflates the parity pins' tolerances. | CPU and GPU agree at the same sample points to the float32 floor; the parity pins' thresholds can tighten and are tightened | queued |
 
 ### Acceptance criterion for EVERY slice (the owner's requirement, made measurable)
-A **continuous zoom sweep** through the scale range a slice touches — including every
-boundary where precision, the reference orbit, or the algorithm changes — must show **no
-step-to-step image-difference spike**. A hop that changes the image more than its
-neighbours is a failure, however correct the steady-state image is.
+**Corrected after D1, which measured the original version of this criterion to be
+NON-DISCRIMINATING.** The original wording — *"a continuous zoom sweep must show no
+step-to-step image-difference spike"* — was wrong: at deep zoom the frame-to-frame
+difference is dominated by genuine image change (measured mean 9–45 L1 per step), so a
+boundary is **not** an outlier in either a correct or a broken build. It passed both ways.
+The criterion is therefore a **hop-classification** rule, not a raw-difference rule:
+
+1. **Hop classification — the deciding assertion.** Whenever the value a pixel is coloured
+   from moves by less than half an iteration (precision changed, so the image should not
+   have), the colour may not move more than its own proportional change plus **2 RGB
+   units**. Every violating pixel is a *hopping* pixel, and the count must be **0** at every
+   step of the sweep — including every boundary where precision, the reference orbit, or
+   the algorithm changes. D1 measured 0 hopping pixels at every step of a 14-step sweep
+   down to the cap's `1e-4`, with a half-iteration hop flipping 0 of 21 856 pixels.
+2. **Non-vacuity floor.** The sweep must also prove it exercised sub-iteration values (D1
+   measured 41–80% sub-iteration population per step) and that the image was genuinely
+   changing. A sweep in which nothing changes proves nothing.
+3. A hop that violates rule 1 is a **failure**, however correct the steady-state image is.
+
+The raw frame-difference bound is still recorded alongside as honest information, but it
+does **not** decide the test. Any future slice adding a precision path must also pin the
+path's own boundary the way D1 pinned pin 6: assert the mismatch was REAL (a job was
+genuinely in flight, at a different cap) before asserting the outcome, so the pin cannot
+pass vacuously.
 
 ## 4 · What the probe measured (full evidence: `docs/PROBE-2026-09-21-gpu-precision.md`)
 
