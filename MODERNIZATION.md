@@ -89,6 +89,18 @@ is only ever set *between* jobs. Cancel instead by `worker.terminate()` + respaw
 **B7. HTML injection via imported locations.** `renderSavedLocations()` interpolates
 `loc.name` into `innerHTML` (`app.js:208` pre-fix), and `loc` objects come from a
 user-supplied JSON file. Use `textContent` / element construction.
+*Fixed (S4):* no string is ever parsed as markup. The row is built with `createElement` +
+`textContent` (`appendLocationInfo`, `app.js:275`) and the list is cleared with
+`savedLocationsList.textContent = ''`. Note this paragraph names only `loc.name`: the deleted sink
+(`app.js:180`) interpolated **five** attacker-controlled fields (`name`, `timestamp`,
+`fractalType`, `maxIter`, `renderer`) into one template, and all five are text now. Beyond the
+sink, imported records are validated per record against a schema before storage
+(`memoryRepository.js:85`), the import is bounded (200 records / 1 MiB / 200-char names / 128-char
+ids), malformed JSON reports through `#appMessage`, and the `getAll()` sort no longer throws on a
+non-string name. Pinned by `tests/import-validation.spec.js`; the dispatcher independently
+confirmed that flipping the shared helper back to `innerHTML` turns all three hostile-render pins
+RED. Unpinned (declared): a `FileReader` read error has an `onerror` handler (`app.js:212`) but no
+dedicated pin.
 
 **B8. Color cycling in 3D recomputes the whole heightmap every frame.**
 `colorCycleLoop` → `fractal3D.setColorOffset()` → `regenerateMesh()`, i.e. a full
