@@ -540,3 +540,106 @@ test('D1 pin 5: the GPU evaluates the identical smooth expression with the same 
 
   expect(pageErrors).toEqual([]);
 });
+
+// --- pin 6 ---------------------------------------------------------------------
+
+test('D1 pin 6: a finished frame is indexed at the cap ITS OWN job ran at', async ({ page }) => {
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(String(err)));
+  await page.goto('./', { waitUntil: 'domcontentloaded' });
+  await expect
+    .poll(() => page.evaluate(() => window.__fv && window.__fv.animationSettled()), { timeout: 30_000 })
+    .toBe(true);
+  await waitIdle(page);
+
+  // THE REACHABLE MISMATCH. `applyLoadedRecord` sets the slider and
+  // `viewer.setMaxIter` and then, when the record's renderer is GPU, calls only
+  // `renderWebGL()` — it does NOT cancel a calculation that is already in flight.
+  // So a user on the default GPU renderer who clicks Load (or imports and loads) a
+  // location whose maxIter differs from the slider changes the viewer's cap while a
+  // CPU job is still running, and that job's frame arrives afterwards.
+  //
+  // Everything below happens in ONE synchronous page task, so the worker cannot
+  // deliver a frame in between: the job is deterministic, not a timing race.
+  const built = await page.evaluate(() => {
+    // A real CPU job at cap 50, started by the real slider handler.
+    const slider = /** @type {HTMLInputElement} */ (document.getElementById('maxIter'));
+    slider.value = '50';
+    slider.dispatchEvent(new Event('input', { bubbles: true }));
+    const jobCap = window.__fv.maxIter();
+    const jobToken = window.__fv.jobToken();
+    // A SCHEMA-VALID record that differs from the slider only in maxIter, imported
+    // through the real import path (so the record the user could really have is
+    // what reaches the store) and loaded through the real Load path, with the GPU
+    // renderer the page is already using.
+    const view = window.__fv.getView();
+    window.__fv.importDocument([{
+      id: 'd1-cap-mismatch',
+      name: 'D1 cap-mismatch probe',
+      scale: view.scale,
+      centerX: view.centerX,
+      centerY: view.centerY,
+      fractalType: 'mandelbrot',
+      maxIter: 2000,
+      renderer: 'GPU',
+      timestamp: Date.now(),
+    }]);
+    window.__fv.loadLocation('d1-cap-mismatch');
+    return {
+      jobCap,
+      jobToken,
+      viewerCapAfterLoad: window.__fv.maxIter(),
+      gpuChecked: /** @type {HTMLInputElement} */ (document.getElementById('webglRender')).checked,
+    };
+  });
+
+  // The mismatch must be REAL for the rest of the pin to mean anything: a job was
+  // in flight, it ran at cap 50, and the load moved the viewer's cap to 2000.
+  expect(built.jobToken, 'a CPU job must be in flight when the load happens').not.toBe(null);
+  expect(built.jobCap).toBe(50);
+  expect(built.viewerCapAfterLoad, 'the load must have changed the viewer cap while the job ran').toBe(2000);
+  expect(built.gpuChecked, 'the GPU branch is the load path that does not cancel the job').toBe(true);
+
+  await waitIdle(page);
+
+  const out = await page.evaluate((jobCap) => {
+    const vals = window.__fv.iterBufferAll();
+    const capUsed = window.__fv.maxIter(); // the cap the finished frame was indexed at
+    let nan = 0, inside = 0;
+    for (const v of vals) {
+      if (v === null || v !== v) { nan++; continue; }
+      if (v === jobCap) inside++;
+    }
+    // Paint the stored frame through the app's ORIGINAL 2D renderer — what CPU mode
+    // would show for this buffer at the cap the frame was indexed with.
+    window.__fv.paintCpuFrame();
+    const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('fractalCanvas'));
+    const px = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height).data;
+    let black = 0, notBlack = 0, firstBad = null, blank = true;
+    for (let i = 0; i < vals.length; i++) {
+      const k = i * 4;
+      if (px[k] || px[k + 1] || px[k + 2]) blank = false;
+      const v = vals[i];
+      if (v === null || v !== v || v !== jobCap) continue;
+      if (px[k] === 0 && px[k + 1] === 0 && px[k + 2] === 0) black++;
+      else { notBlack++; if (firstBad === null) firstBad = [px[k], px[k + 1], px[k + 2]]; }
+    }
+    return { capUsed, nan, inside, black, notBlack, firstBad, blank };
+  }, built.jobCap);
+  console.log(`[D1 pin6] jobCap=${built.jobCap} viewerCapAtApply=${built.viewerCapAfterLoad} capUsed=${out.capUsed} ` +
+    `interior=${out.inside} black=${out.black} notBlack=${out.notBlack} firstBad=${JSON.stringify(out.firstBad)} nan=${out.nan}`);
+
+  expect(out.blank, 'the frame must not be blank').toBe(false);
+  expect(out.inside, 'the frame must contain interior cells at the job cap').toBeGreaterThan(100);
+  // A finished frame carries no "not yet calculated" cells, whatever cap it ran at.
+  expect(out.nan, 'a finished frame must contain no uncalculated/placeholder cells').toBe(0);
+  // THE PIN: the frame is indexed at the cap ITS OWN JOB ran at, not at whatever
+  // the viewer happens to hold when the frame lands...
+  expect(out.capUsed, 'the cap a finished frame is indexed at').toBe(built.jobCap);
+  // ...which is exactly what keeps a cell the JOB called inside black instead of a
+  // palette colour (control: with `viewer.maxIter` here, all 3989 interior cells
+  // render [255,26,0] and this is the assertion that goes red).
+  expect(out.notBlack, 'every cell the job called inside must be black').toBe(0);
+
+  expect(pageErrors).toEqual([]);
+});

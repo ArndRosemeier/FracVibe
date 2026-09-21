@@ -1435,6 +1435,12 @@ window.__fv = Object.freeze({
   // The whole escape-value buffer as a plain array (the pin computes its
   // statistics inside the page, so this never crosses the wire).
   iterBufferAll: () => (viewer.imageData ? Array.from(viewer.imageData) : null),
+  // Paint the CURRENT buffer through the app's ORIGINAL 2D renderer, once. While
+  // GPU mode is active the mode dispatch sends `viewer.render()` to WebGL, so this
+  // is the only way to observe what the CPU renderer would show for the frame the
+  // worker produced — the same function CPU mode calls, on the same buffer and the
+  // viewer's own cap. It adds no production path.
+  paintCpuFrame: () => { originalRender(); },
   // Render the CURRENT buffer with every finite escape value shifted by `epsilon`,
   // through the REAL `setData`/`render` path. This models a precision hop exactly:
   // the same view, the same buffer, escape values differing by a sub-iteration
