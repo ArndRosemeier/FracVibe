@@ -58,5 +58,8 @@ GATE_TIER=compile bash scripts/gate.sh  # cheap: syntax only, no browser
 - Never touch `~/.openclaw`.
 
 ## This project's traps
-See `docs/STATE.md` §TRAP. Live ones: `dist/` is a stale duplicate of `public/`
-(never edit it), and `MODERNIZATION.md` §1 describes the *pre-fix* revision.
+See `docs/STATE.md` §TRAP. Live ones: **`dist/` is the source of the LIVE site**
+(`https://apps.futuremagic.de/fracvibe/`, via the `~/apps/fracvibe` symlink) — edit
+`public/`, then re-stage with `rsync -a --delete --exclude '.git*' public/ dist/`
+(the `--delete` is required or deleted files stay published); and
+`MODERNIZATION.md` §1 describes the *pre-fix* revision.
