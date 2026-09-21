@@ -39,10 +39,16 @@ const BAND_CAP = 50;
 // The scale sweep: 0.05 down to the cap's own minimum (1/10000), log-spaced.
 const SWEEP_LO = 0.05;
 const SWEEP_STEPS = 14;
-// The deepest scale the CPU-lane hop sweep uses. Chosen where the D2 budget is
-// large enough that the frame is not saturated to black: measured `finite` counts
-// stay in the thousands here, against a handful at the 1e-20 cap.
-const SWEEP_HI_SCALE = 1e-8;
+// The deepest scale the hop sweep uses, and WHY it is not the app's cap.
+// GPU-ARBITRARY lifted the app's zoom cap to 1e-6, so the perturbation (deep) lane's
+// boundary at 1e-4 is now INSIDE the reachable range. That boundary is a program
+// SWITCH and a sweep that crosses it measures the switch rather than the colour
+// mapping: probed at scale 6.7e-5 the step-to-step hop fraction jumps to 0.469
+// (13404 of 13404 sub-iteration pixels) purely from the lane change. This pin's
+// subject is the COLOUR mapping, so its sweep stops at the boundary; a companion pin
+// (D1 pin 7) reports the lane switch's own magnitude instead of pretending it does
+// not exist.
+const SWEEP_HI_SCALE = 1.2e-4;
 
 async function waitIdle(page) {
   await expect

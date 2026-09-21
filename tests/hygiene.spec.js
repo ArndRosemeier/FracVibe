@@ -169,7 +169,7 @@ test('S6 pin: no alert/confirm/prompt is called; both non-modal flows stay usabl
   // cap still applies, the app still REPORTS it (non-modally), and the renderer
   // checkbox is untouched by it.
   const capped = await page.evaluate(() => {
-    window.__fv.setScale(1e-21);
+    window.__fv.setScale(1e-8);
     return {
       scale: window.__fv.getView().scale,
       minScale: window.__fv.minScale,
@@ -198,7 +198,7 @@ test('S6 pin: no alert/confirm/prompt is called; both non-modal flows stay usabl
   const again = await page.evaluate(() => {
     const seen = [];
     window.addEventListener('fv-zoom-limit', (e) => seen.push(e.detail));
-    window.__fv.setScale(1e-21);
+    window.__fv.setScale(1e-8);
     return seen;
   });
   expect(again.map((d) => d.prompted)).toEqual([false]);
@@ -229,7 +229,7 @@ test('GPU-ARBITRARY pin: the zoom-cap notice is non-modal and never switches ren
   await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
 
   const first = await page.evaluate(() => {
-    window.__fv.setScale(1e-21);
+    window.__fv.setScale(1e-8);
     return {
       scale: window.__fv.getView().scale,
       minScale: window.__fv.minScale,
@@ -246,11 +246,15 @@ test('GPU-ARBITRARY pin: the zoom-cap notice is non-modal and never switches ren
     // GPU lane stays the active renderer throughout.
     let events = 0;
     window.addEventListener('fv-zoom-limit', () => { events++; });
-    for (let i = 0; i < 12; i++) window.__fv.setScale(1e-21);
+    // Three further capped ticks: each one is a real capped render at the deep cap,
+    // so the count is small deliberately. The assertion is that EVERY tick reports
+    // and the throttle keeps the message from stacking.
+    for (let i = 0; i < 3; i++) window.__fv.setScale(1e-8);
     return {
       events,
       events2: 0,
       webgl: document.getElementById('webglRender').checked,
+      minScale: window.__fv.minScale,
       offered: window.__fv.zoomCapOffered(),
       prompted: window.__fv.zoomCapPrompted(),
       offerNodes: document.querySelectorAll('#zoomCapOffer').length,
@@ -258,7 +262,7 @@ test('GPU-ARBITRARY pin: the zoom-cap notice is non-modal and never switches ren
       scale: window.__fv.getView().scale,
     };
   });
-  expect(after.events, 'every capped tick still REPORTS').toBe(12);
+  expect(after.events, 'every capped tick still REPORTS').toBe(3);
   expect(after.scale).toBe(after.minScale);
   expect(after.webgl, 'the renderer never switches itself').toBe(true);
   expect(after.offered).toBe(false);

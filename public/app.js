@@ -422,12 +422,19 @@ viewer.view.scale = 300;
 // produce the SAME value. This module only DECIDES the cap and what to say when
 // it is reached. There is no monkey-patching of viewer methods any more.
 // GPU-ARBITRARY: the cap is no longer the PRECISION wall — it is the measured
-// cost wall. `WEBGL_ZOOM_CAP = 1e20` (scale 1e-20) is where a full image measured
-// ~285 ms at 640x480 on this host (SwiftShader software rasteriser), against
-// ~14 ms at the old 1e4 cap and ~640 ms at 1e-40; a real GPU is faster, and the
-// number is stated so the choice can be re-made. The DELTA-RANGE mechanism is
-// correct far past it (verified to 1e-40, docs/DECISIONS.md), so this is the
-// performance bound the deliverable calls for — not a representability bound.
+// cost wall. It was 1e4 because float32 could not seed a delta deeper than ~1e-38;
+// the exponent mechanism removes that, so the same measured frame cost now lands
+// much deeper. MEASURED ms per full image at 640x480 on this host (ANGLE +
+// SwiftShader SOFTWARE rasteriser, so these are software numbers, not hardware
+// ones): 1e-4 -> 14 ms, 1e-8 -> 106 ms, 1e-12 -> 150 ms, 1e-16 -> 211 ms,
+// 1e-20 -> 285 ms, 1e-40 -> 640 ms. `1e6` (scale 1e-6) is where a full image is
+// still well under a tenth of a second for a user pressing the wheel, and the
+// D2 budget floor inside it stays at 512 (its knee, `ITER_BUDGET_MIN_SCALE`, is
+// 1e-4 and is now strictly shallower than the cap — it is the scale the deep lane
+// opens at, not the cap). The DELTA-RANGE mechanism itself is verified to 1e-40
+// (tests/gpu-arbitrary.spec.js pin 1, reached through the real deep-view path), so
+// the cap is a cost bound and NOT a representability bound: the math does not stop
+// here.
 //
 // The owner's invariant is explicit and is NOT a heuristic: "If a GPU is present,
 // complete depth needs to be calculated there, period." There is no depth- or
@@ -435,9 +442,9 @@ viewer.view.scale = 300;
 // made VISIBLE (the per-image render-time readout) rather than traded for a mode
 // switch. The CPU lane stays reachable ONLY as the genuine no-GPU path (WebGL
 // absent/failed) and through the manual renderer checkbox the owner kept.
-const WEBGL_ZOOM_CAP = 1e20;
+const WEBGL_ZOOM_CAP = 1e6;
 const WEBGL_MIN_SCALE = 1 / WEBGL_ZOOM_CAP;
-let zoomCapNoticeAt = 0;
+let zoomCapNoticeAt = -Infinity;
 let askedCpuSwitchAtZoomCap = false;   // kept for the observables the suite reads
 let deniedCpuSwitchAtZoomCap = false;
 let cpuSwitchOfferVisible = false;
@@ -1431,6 +1438,14 @@ window.__fv = Object.freeze({
   // zoom-sweep pin needs a centre whose window actually crosses the set boundary.
   setView: (view) => viewer.setView({ ...viewer.view, ...view }),
   runAnimationFrame: () => { viewer.setView({ ...viewer.view, scale: viewer.view.scale }); },
+  // S1 observation hook: ONE real wheel tick through the viewer's OWN `onWheel`
+  // handler (the same function the canvas listener calls), so a pin can drive the
+  // wheel path without dispatching events. It adds no production path.
+  wheelTick: (deltaY) => viewer.onWheel({
+    deltaY: typeof deltaY === 'number' ? deltaY : -2000,
+    clientX: 0, clientY: 0,
+    preventDefault() {},
+  }),
   renderWebGL: () => renderWebGL(),
   forceFallback: () => handleWebGLFailure('WebGL failure forced for observation.'),
   simulateContextLoss: () => handleWebGLLoss('Context loss simulated.'),
@@ -1587,7 +1602,7 @@ window.__fv = Object.freeze({
   iterBudgetPerDecade: FractalKernel.ITER_BUDGET_PER_DECADE,
   // The scale of the shipped GPU zoom cap, below which the floor starts. A pin
   // holds this equal to `minScale` so the rule cannot silently drift from the cap.
-  iterBudgetMinScale: FractalKernel.ITER_BUDGET_MIN_SCALE,
+  iterBudgetMinScale: () => FractalKernel.ITER_BUDGET_MIN_SCALE,
   // D2 colour-table cost, counted: builds of the table and of the reused ImageData,
   // and the entry count of the table the last build produced (sized by the cap the
   // frame was indexed at, never by the module maximum).

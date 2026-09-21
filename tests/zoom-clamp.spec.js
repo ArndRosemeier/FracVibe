@@ -26,27 +26,28 @@ test('wheel, startup-animation setView and render all clamp to the same scale', 
     window.addEventListener('fv-zoom-limit', (e) => limitEvents.push(e.detail));
 
     // Path 1 — the wheel, the way the user reaches the cap. Zoom OUT is what
-    // lowers `scale`, so every wheel step goes far past the cap.
+    // lowers `scale`, so every wheel step goes far past the cap. The cap is now
+    // 1e6 (scale 1e-6), deep enough that a full-viewport render per tick is
+    // expensive on a software rasteriser, so the canvas is SHRUNK for the storm:
+    // the zoom maths does not depend on the canvas size, and the dimensions are
+    // restored before the paths that must render at full size.
     const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('fractalCanvasWebGL'));
-    const rect = canvas.getBoundingClientRect();
-    for (let i = 0; i < 20; i++) {
-      canvas.dispatchEvent(new WheelEvent('wheel', {
-        deltaY: -2000,
-        clientX: rect.left + rect.width / 2,
-        clientY: rect.top + rect.height / 2,
-        bubbles: true,
-        cancelable: true,
-      }));
-    }
+    const fullW = canvas.width, fullH = canvas.height;
+    canvas.width = 16; canvas.height = 16;
+    // ONE real wheel tick through the viewer's own `onWheel` handler. The startup
+    // animation settles at scale 3 and one tick is e^-0.3, so ~48 ticks are needed
+    // to pass the 1e-6 cap; 60 over-shoots it and lands on the clamp.
+    for (let i = 0; i < 60; i++) fv.wheelTick(-300);
     const afterWheel = fv.getView().scale;
+    canvas.width = fullW; canvas.height = fullH;
 
     // Path 2 — the startup animation's path: a plain setView with an over-cap
     // scale, applied to a fresh object (never the live one).
-    fv.setScale(1e-21);
+    fv.setScale(1e-9);
     const afterAnimationPath = fv.getView().scale;
 
     // Path 3 — an explicit render must not change what was clamped.
-    fv.setScale(1e-21);
+    fv.setScale(1e-9);
     fv.renderWebGL();
     const afterRender = fv.getView().scale;
 

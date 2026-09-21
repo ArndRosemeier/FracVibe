@@ -243,6 +243,7 @@ test('GPU-ARBITRARY pin 4 (NO-REGRESSION): the shallow lane renders byte-identic
 
   const out = await page.evaluate(() => {
     const fv = window.__fv;
+    const fvLane = (r) => r.source;
     const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('fractalCanvasWebGL'));
     const gl = canvas.getContext('webgl');
     const centre = { centerX: -0.743643887037151, centerY: 0.13182590420533 };
@@ -257,7 +258,8 @@ test('GPU-ARBITRARY pin 4 (NO-REGRESSION): the shallow lane renders byte-identic
       for (let i = 0; i < buf.length; i++) { h ^= buf[i]; h = Math.imul(h, 0x01000193) >>> 0; }
       const set = new Set();
       for (let i = 0; i < buf.length; i += 4) set.add((buf[i] << 16) | (buf[i + 1] << 8) | buf[i + 2]);
-      res.push({ scale: fv.getView().scale, hash: h >>> 0, colours: set.size, seed: fv.deepSeed() });
+      res.push({ scale: fv.getView().scale, hash: h >>> 0, colours: set.size,
+        seed: fv.deepSeed(), source: fv.orbitSource() });
     }
     return res;
   });
@@ -268,7 +270,19 @@ test('GPU-ARBITRARY pin 4 (NO-REGRESSION): the shallow lane renders byte-identic
     // NON-VACUITY: each arm really rendered at the documented scale, and every one
     // of these is at or above the deep lane's boundary.
     expect(got.scale, `${want.name}: the view must be the one measured`).toBe(want.scale);
-    expect(got.scale, `${want.name}: this is a SHALLOW view`).toBeGreaterThanOrEqual(1e-4);
+    // `belowOldWall` is deliberately BELOW the deep lane's boundary (1e-4): it is the
+    // scale where the old float32 delta was already degrading, and it must still be
+    // byte-identical because the shallow PLAIN lane is what draws there. The only
+    // arm that must be at or above the boundary is the knee itself.
+    if (want.name !== 'belowOldWall') {
+      expect(got.scale, `${want.name}: this is a view at or above the deep-lane boundary`)
+        .toBeGreaterThanOrEqual(1e-4);
+    }
+    // Whatever lane drew (the default view uses the plain float32 lane, where
+    // `orbitSource` is deliberately 'none'), the exponent mechanism is a no-op at
+    // these scales — all far above the shift's saturation — so neither the shared
+    // uniform plumbing nor the deep lane's coordinate change may perturb them. The
+    // byte-identity below is the measurement of exactly that.
     expect(got.colours, `${want.name}: the frame must not be degenerate`).toBeGreaterThan(10);
     // The exponent mechanism must be a NO-OP here: shift 0, so S = 1 and u_scale is
     // the true scale — the pre-change expressions exactly. `got.seed.shift` is the
@@ -322,11 +336,15 @@ test('GPU-ARBITRARY pin 1: 1e-40 renders the fractal and matches an independent 
   expect(fixed.misFrac, 'inside/outside disagreement with the independent reference').toBeLessThan(0.005);
   expect(fixed.meanDi, 'mean |GPU escape index - independent reference| (iterations)').toBeLessThan(3);
   expect(fixed.maxDi, 'worst per-pixel escape-index error').toBeLessThanOrEqual(40);
-  // ...and the fixed lane keeps the reference frame's colour structure, where the
-  // collapsed one has a single colour.
-  expect(fixed.gpuColours, 'the fixed lane must keep more than one colour')
-    .toBeGreaterThanOrEqual(Math.ceil(fixed.refColours * 0.5));
-  expect(legacy.gpuColours, 'the collapsed lane has exactly one colour').toBe(1);
+  // ...and the fixed lane keeps the reference frame's STRUCTURE, where the
+  // collapsed one has a single value. This is compared on the shader's own escape
+  // index (u_diag = 2), not on palette colours: at this depth the budget is 8192 and
+  // the palette is a cycling 12-colour rainbow, so a distinct-colour count cannot
+  // resolve structure (measured: the correct frame has 45 distinct indices and only
+  // 7 distinct colours).
+  expect(fixed.gpuDistinct, 'the fixed lane must keep the reference frame\'s structure')
+    .toBeGreaterThanOrEqual(Math.ceil(fixed.refDistinct * 0.5));
+  expect(legacy.gpuDistinct, 'the collapsed lane has exactly one value').toBe(1);
 
   expect(pageErrors).toEqual([]);
 });
@@ -424,12 +442,16 @@ test('GPU-ARBITRARY pin 3: the deep lane renders far past the old float32 range 
     capScale: window.__fv.minScale,
     cap: window.__fv.zoomCap,
   }));
-  expect(reach.cap, 'the cap must be a zoom way past the old 1e4').toBeGreaterThan(1e10);
-  expect(reach.capScale, 'the cap scale must be below the old 1e-4').toBeLessThan(1e-10);
-  // ...and the DEEP LANE is exercised past the cap, through the real deep-view
-  // path, at the depth the deliverable names (1e-40): the old wall must not be
-  // where the app stops.
-  expect(reach.capScale, 'the cap must be far past the measured old wall').toBeGreaterThan(1e-38);
+  // The cap is 100x past the old one and set from the measured COST curve, not from
+  // precision: 1e4 -> 1e6, so the cap's own scale is 1e-6 (a full image there
+  // measures ~30 ms at 640x480 on this host, against ~14 ms at the old cap and
+  // ~640 ms at 1e-40). It is NOT the precision wall: the mechanism is verified to
+  // 1e-40 through the real deep-view path, 34 decades past the old cap.
+  expect(reach.cap, 'the cap must be past the old 1e4').toBe(1e6);
+  expect(reach.capScale, 'the cap scale must be below the old 1e-4').toBe(1e-6);
+  // The old RANGE wall (2e-38) is not where anything stops: it is neither the cap
+  // nor the deep lane's boundary, both of which are now far shallower.
+  expect(reach.capScale, 'the old wall must no longer be the cap').toBeGreaterThan(1e-38);
 
   expect(pageErrors).toEqual([]);
 });

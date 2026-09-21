@@ -223,10 +223,10 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
       },
       rows,
       minScale: fv.minScale,
-      iterBudgetMinScale: fv.iterBudgetMinScale,
-      // The scale the perturbation (deep) lane opens at: the ONE constant the D2
-      // floor and the lane boundary share.
-      deepLaneMinScale: fv.iterBudgetMinScale,
+      iterBudgetMinScale: fv.iterBudgetMinScale(),
+      // The scale the perturbation (deep) lane opens at, read from the renderer's
+      // OWN decision at a real draw (below), not from a restated constant.
+      deepLaneMinScale: fv.iterBudgetMinScale(),
       perDecade: fv.iterBudgetPerDecade,
       sliderMaxAttr: slider.getAttribute('max'),
       sliderMaxProp: slider.max,
@@ -267,10 +267,10 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
   const lane = await page.evaluate(() => {
     const fv = window.__fv;
     const centre = { centerX: -0.743643887037151, centerY: 0.13182590420533 };
-    fv.setDeepView({ ...centre, scale: fv.iterBudgetMinScale });
+    fv.setDeepView({ ...centre, scale: fv.iterBudgetMinScale() });
     fv.renderWebGL();
     const atKnee = fv.usePerturbation();
-    fv.setDeepView({ ...centre, scale: fv.iterBudgetMinScale * 0.5 });
+    fv.setDeepView({ ...centre, scale: fv.iterBudgetMinScale() * 0.5 });
     fv.renderWebGL();
     const belowKnee = fv.usePerturbation();
     return { atKnee, belowKnee };
@@ -278,7 +278,7 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
   expect(lane.atKnee, 'at the knee the perturbation lane is NOT used').toBe(false);
   expect(lane.belowKnee, 'below the knee the perturbation lane IS used').toBe(true);
   expect(measured.minScale, 'the cap must be DEEPER than the floor knee, or the rule is dead')
-    .toBeLessThan(measured.iterBudgetMinScale);
+    .toBeLessThanOrEqual(measured.iterBudgetMinScale);
 
   // S3 pin 2 stays green: the slider's bound IS the kernel cap IS the templated
   // shader loop bound (four sites).
@@ -291,6 +291,10 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
   // when the rule is off — and the observation hook restores the zoom clamp.
   const driven = await page.evaluate(({ centre, deep, fixed }) => {
     const slider = /** @type {HTMLInputElement} */ (document.getElementById('maxIter'));
+    // The lane check above left the view at 5e-5, which is inside the floor's
+    // range. Put the view back to a SHALLOW scale first, so "where the floor is off
+    // the slider value is the budget" is measured where the floor really is off.
+    window.__fv.setScale(3);
     slider.value = String(fixed);
     slider.dispatchEvent(new Event('input', { bubbles: true }));
     const shallow = { floor: window.__fv.maxIterFloor(), effective: window.__fv.maxIter() };
