@@ -28,7 +28,7 @@
 
 ---
 
-## 2. P0 — repairs (B1–B8; all fixed — B1–B3 in Phase 0, B4–B7 in S1–S4, B8 in S5)
+## 2. P0 — repairs (B1–B8; all fixed — B1–B3 in Phase 0, B4–B7 in S1–S4, B8 in S5; the §3 hygiene items in S6)
 
 **Status.** B1, B2 and B3 are fixed in this working tree (`public/app.js`,
 `public/index.html`, `public/styles.css`) and covered by `tests/smoke.spec.js`
@@ -152,6 +152,14 @@ the 2D canvases are hidden only after a successful init. Pinned by
 `tests/webgl-fallback.spec.js:228`, which denies every WebGL context through the ONE S1
 helper (now shared at `tests/helpers/webgl.js`).
 
+**S6 hygiene (this audit's §3 "Dead / orphan files", "Debug instrumentation left in
+production" and the `window.prompt` half of "UI layer").** Closed in slice S6: the four
+surviving `[FractalMouse]` logs and the four dead state declarations are deleted, the two
+surviving modals are replaced by non-modal in-page surfaces, and the four orphan files are
+deleted. The details and the pins are in §3 below; the decisions are `docs/DECISIONS.md`
+rows 25–26. Deliberately NOT in S6: `<dialog>`/ARIA/focus, pointer/touch input, and the P1
+allocation/worker-pool remainder.
+
 ---
 
 ## 3. P1 — architecture and correctness debt
@@ -180,11 +188,18 @@ Still open in this section: per-frame allocation in the 2D renderer, the per-pas
 `Uint32Array(maxIter+2)` LUT and calls `ctx.createImageData(w,h)` on every call — including
 every `mousemove` during a drag (`fractalViewer.js:135-158`). Cache the LUT (key on
 scheme/offset/maxIter) and reuse one `ImageData`.
+*Still open after S6 — and NOT dead code:* this is the `progressiveState.jobParams`/render
+path (`app.js` job setup) plus `fractalViewer.js:135-158`, both live. The four declarations
+S6 deleted (`currentResult`, `aborting`, `debounceTimer`, `lastJobParams` at `app.js:427-430`
+pre-S6) were a different, genuinely unread set, which is why they could go without touching
+this.
 
 **Progressive refinement copies the whole buffer per pass** (`fractalWorker.js:12`
 `job.prior.slice()`, plus `{...job, chunk}` per chunk) and runs on a single worker. A
 worker pool sized to `navigator.hardwareConcurrency`, tiles instead of grid halving, and
 transferable buffers would be the modern shape.
+*Still open after S6:* explicitly out of S6's scope (P1 remainder; the brief excludes the
+worker pool and the per-frame LUT allocation).
 
 **Zoom-cap logic is triplicated** (`app.js:279-298`, `app.js:650-672`, `app.js:701-714`
 pre-fix), `FractalViewer.setView`/`onWheel` are monkey-patched from `app.js`, and the clamp
@@ -198,15 +213,30 @@ produce the same scale) by `tests/zoom-clamp.spec.js`.
 
 **Dead / orphan files.**
 - `recursiveFractalVibe.js`, `recursiveFractalLetter.js`, `splashMandelbrotCurve.js` — never
-  imported by anything; they query `#fractVibeSplashCanvas` / `#fractVibeSplashCurveCanvas`,
+  imported by anything; they query `#fractVibeSplash` / `#fractVibeSplashCurveCanvas`,
   IDs that no longer exist. Superseded by the CSS-only `#fractVibeSplash` div.
 - `styles/fractSplashFractalText.css` — not linked from `index.html`, and still carries debug
   leftovers (`border: 2px solid red`, "fallback for debug").
+*Fixed (S6):* all four are **DELETED** (`git rm`), confirmed imported/linked by nothing
+  before deletion, and confirmed gone three ways by `tests/hygiene.spec.js`: absent from
+  `public/`, untracked by git (`git ls-files --error-unmatch`), and served 404 by the dev
+  server. The disk and HTTP halves were each shown to fail independently on a build that
+  restored the files.
 
 **Debug instrumentation left in production.** ~15 `console.log`s per interaction
 (`app.js:440-460`, `app.js:715`, `webglFractal.js:233` pre-fix), plus a `MutationObserver`
 installed *only to log* canvas style changes (`app.js:635-644` pre-fix), plus
 `alert`/`confirm`/`prompt` for naming, import errors and zoom-cap decisions.
+*Fixed (S6):* the `MutationObserver` was already deleted by S1 — S6 confirms its absence
+and did not remove it. Exactly **four** `[FractalMouse]` logs survived to S6 and were
+re-located at `app.js:764` (mousedown), `:768` (wheel), `:780`/`:783` (the render trigger);
+all four are DELETED and replaced by nothing, because each sat on a hot interaction path.
+Pinned by `tests/hygiene.spec.js`, whose filter records the URL of the script that made
+every console call (`addInitScript` + `Error().stack`) and asserts zero calls from
+`app.js`; re-adding ONE log to `onMouseDown` turns it RED. The `alert` of the malformed-JSON
+import path was already replaced by `#appMessage` in S1/S4; the two survivor modals
+(`window.prompt` for naming, `window.confirm` for the zoom-cap offer) are replaced in S6 by
+`#saveLocationPanel` and `#zoomCapOffer` — see `docs/DECISIONS.md` row 25.
 
 **UI layer.** The DOM is built with `createElement` + dozens of inline style assignments in
 JS (`app.js:185-266` pre-fix); the "save location" flow uses `window.prompt`; the modal is
@@ -214,6 +244,11 @@ three nested `div`s instead of `<dialog>`; there is no focus management, no ARIA
 keyboard path to the canvas, and no touch/pointer events at all (mouse-only: `mousedown`,
 `mousemove`, `wheel`) — so the app is unusable on touch devices. `Space` toggling 3D mode is
 undocumented in the UI.
+*Partly fixed (S6):* the "save location" flow no longer uses `window.prompt` (it is the
+non-modal `#saveLocationPanel`), and the zoom-cap decision no longer uses `window.confirm`
+(`#zoomCapOffer`); the import path already reported through `#appMessage`. **Still open and
+deliberately out of this campaign** (Phase 3, `docs/PLAN.md` §3): `<dialog>`/ARIA/focus
+management, a keyboard path to the canvas, and pointer/touch input.
 
 **Persistence.** `FractalMemoryRepository` is session-only by design, so Saved Locations die
 on reload while Export/Import implies durability. `localStorage`/IndexedDB is the obvious
@@ -230,7 +265,7 @@ upgrade, and the repo abstraction is already the right seam for it.
 | Delivery | raw files, no bundling, no minification, no cache headers (Netlify adds gzip, the Express dev server does not) | Vite (dev server + build), content-hashed assets, `immutable` caching; keep `public/` as the Netlify publish dir or move to `dist/` |
 | Node | `netlify.toml` pins `NODE_VERSION = "18"` — **EOL 2025-04-30** | Node 24 (active LTS, EOL 2028-04-30); 22 still in extended support |
 | Dependencies | `express@5.1.0`; `npm audit` reports 3 advisories (1 high) in transitive `body-parser`/`path-to-regexp`/`qs` | `npm audit fix` (patch-level); low real exposure — the Express server is a dev convenience, Netlify serves `public/` statically |
-| Quality | no README, no LICENSE, no CI, no `.editorconfig`, no linter/formatter, **zero tests** | **partly done:** Playwright smoke suite added; still want README + LICENSE, ESLint/Prettier, `.editorconfig`, GitHub Actions running `npm test` |
+| Quality | no README, no LICENSE, no CI, no `.editorconfig`, no linter/formatter, **zero tests** (audit-time) | **partly done:** the Playwright suite grew from the Phase 0 smoke tests to **43 tests** across `tests/*.spec.js` (S1–S6), still run through the ONE gate command `bash scripts/gate.sh`; `README` + LICENSE, ESLint/Prettier, `.editorconfig` and GitHub Actions running the gate are still wanted |
 | Dev server | `server/server.js`: CommonJS, hardcoded `PORT=3000`, no compression/caching/error handling, duplicates Netlify static hosting | ESM, `process.env.PORT ?? 3000`, `compression` + cache headers; or drop it once Vite owns `dev` |
 | Types | plain JS | incremental TypeScript (`checkJs` first) is the highest-leverage step for the kernel/view-state refactors above |
 | `.gitignore` | ignores `node_modules/` (good) and `.git/` (meaningless); now also `test-results/`, `playwright-report/` | drop `.git/`, add `.env*`, editor/OS noise |
@@ -246,6 +281,9 @@ upgrade, and the repo abstraction is already the right seam for it.
    this landed.
 2. **Phase 1 — correctness & feel (1–2 days).** B4–B8, delete the dead code and debug
    instrumentation, consolidate the zoom/view-state patching.
+   **DONE through S1–S6** (B4–B8 in S1–S5; the dead files, dead state, debug logs and the
+   two surviving modals in S6). The one Phase-1 item still open is the P1 remainder in §3:
+   per-frame LUT/`ImageData` allocation and the single-worker progressive copies.
 3. **Phase 2 — foundation (2–4 days).** Vite build, `three` from npm, Node 24, ESM dev
    server, lint/format/CI, single fractal kernel (+ its palette table) shared by
    worker/main/shader, worker pool.
@@ -260,9 +298,9 @@ All are reasonable later; none are needed to fix the current defects.
 ## 6. Reproducing the checks
 
 ```bash
-# full suite: 39 tests — the B1–B3 smoke tests (tests/smoke.spec.js) plus the
-# S1–S5 pins (tests/*.spec.js); per-slice counts are in docs/PLAN.md
-npm test                      # expects 39 passed
+# full suite: 43 tests — the B1–B3 smoke tests (tests/smoke.spec.js) plus the
+# S1–S6 pins (tests/*.spec.js); per-slice counts are in docs/PLAN.md
+npm test                      # expects 43 passed
 # Uses host Chrome via `channel: 'chrome'` in playwright.config.js, so no browser
 # download is needed; elsewhere run `npx playwright install chromium` and drop the channel.
 

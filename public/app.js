@@ -36,6 +36,11 @@ const importLocationsBtn = document.getElementById('importLocationsBtn');
 // These live in index.html; the modal is shown/hidden rather than built on demand.
 const savedLocationsList = document.getElementById('savedLocationsList');
 const locationSortSelect = document.getElementById('locationSortSelect');
+// S6: the two non-modal surfaces that replace `window.prompt` (save/naming) and
+// `window.confirm` (GPU zoom-cap offer). Queried here with every other element.
+const zoomCapOffer = document.getElementById('zoomCapOffer');
+const zoomCapSwitchBtn = document.getElementById('zoomCapSwitchToCpu');
+const zoomCapDismissBtn = document.getElementById('zoomCapDismiss');
 
 // --- S3: the ONE type/palette table and the ONE iteration cap ---------------
 // The <select> option lists and the slider's `max` are DERIVED from the kernel
@@ -82,12 +87,24 @@ function getCurrentLocationState() {
   };
 }
 
-saveLocationBtn.addEventListener('click', () => {
+// --- S6: the save/naming flow is NON-MODAL --------------------------------
+// The three elements live in index.html. Before S6 the name came from
+// `window.prompt('Name this location (optional):', defaultName)` (old
+// `app.js:88`), which blocks the page, is unstyled and un-dismissible by the
+// app, and is unavailable in embedded/automated contexts. The panel below
+// carries the same contract — an optional name, prefilled with the SAME
+// generated default, Save stores it, Cancel stores nothing — without a dialog.
+// The fade-out `#saveLocationConfirmation` surface is reused unchanged.
+const saveLocationPanel = document.getElementById('saveLocationPanel');
+const saveLocationNameInput = document.getElementById('saveLocationName');
+const saveLocationConfirmBtn = document.getElementById('saveLocationConfirm');
+const saveLocationCancelBtn = document.getElementById('saveLocationCancel');
+
+// The ONE place a named location is committed; reached only from the Save
+// button below, so the UI path and the storage path cannot diverge.
+function commitNamedLocation(rawName, defaultName) {
   const state = getCurrentLocationState();
-  const defaultName = `Location (${state.centerX.toFixed(3)}, ${state.centerY.toFixed(3)}, zoom ${(1/state.scale).toFixed(2)})`;
-  const userName = window.prompt('Name this location (optional):', defaultName);
-  if (userName === null) return; // Cancelled
-  state.name = userName && userName.trim() ? userName.trim() : defaultName;
+  state.name = rawName && rawName.trim() ? rawName.trim() : defaultName;
   memoryRepo.save(state);
   // Non-modal fade-out confirmation
   const conf = document.getElementById('saveLocationConfirmation');
@@ -97,11 +114,47 @@ saveLocationBtn.addEventListener('click', () => {
     conf.style.opacity = '0';
     setTimeout(() => { conf.style.display = 'none'; }, 700);
   }, 1200);
-  // If the modal is open, update it
+  // If the locations list is open, refresh it (it may be the modal list).
   if (loadLocationModal.style.display !== 'none') {
     renderSavedLocations();
   }
+  return state;
+}
+
+function hideSaveLocationPanel() {
+  if (saveLocationPanel) saveLocationPanel.style.display = 'none';
+}
+
+saveLocationBtn.addEventListener('click', () => {
+  const state = getCurrentLocationState();
+  const defaultName = `Location (${state.centerX.toFixed(3)}, ${state.centerY.toFixed(3)}, zoom ${(1/state.scale).toFixed(2)})`;
+  if (!saveLocationPanel || !saveLocationNameInput) return;
+  // Prefill with the same generated default the prompt offered, so accepting
+  // the default is one Enter away and the stored name is identical.
+  saveLocationNameInput.value = defaultName;
+  saveLocationPanel.style.display = 'flex';
+  saveLocationNameInput.focus();
+  saveLocationNameInput.select();
 });
+
+// Save is the only commit; Enter in the field takes the same path.
+saveLocationConfirmBtn.addEventListener('click', () => {
+  const state = getCurrentLocationState();
+  const defaultName = `Location (${state.centerX.toFixed(3)}, ${state.centerY.toFixed(3)}, zoom ${(1/state.scale).toFixed(2)})`;
+  commitNamedLocation(saveLocationNameInput ? saveLocationNameInput.value : '', defaultName);
+  hideSaveLocationPanel();
+});
+saveLocationNameInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    if (saveLocationConfirmBtn) saveLocationConfirmBtn.click();
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    hideSaveLocationPanel();
+  }
+});
+// Cancel stores NOTHING (the `prompt === null` branch it replaces).
+saveLocationCancelBtn.addEventListener('click', hideSaveLocationPanel);
 
 loadLocationBtn.addEventListener('click', () => {
   // A fresh page load of counts for the loads the user is about to trigger.
@@ -372,12 +425,46 @@ const WEBGL_ZOOM_CAP = 10000;
 const WEBGL_MIN_SCALE = 1 / WEBGL_ZOOM_CAP;
 let askedCpuSwitchAtZoomCap = false;
 let deniedCpuSwitchAtZoomCap = false;
+// S6: the offer is non-modal and shown AT MOST ONCE. This remembers whether the
+// offer is currently on screen, so the pin can observe "the user was actually
+// asked" as a DOM fact rather than inferring it from a deferred callback.
+let cpuSwitchOfferVisible = false;
+
+function showZoomCapOffer() {
+  if (!zoomCapOffer) return;
+  cpuSwitchOfferVisible = true;
+  zoomCapOffer.style.display = 'flex';
+}
+
+function hideZoomCapOffer() {
+  cpuSwitchOfferVisible = false;
+  if (zoomCapOffer) zoomCapOffer.style.display = 'none';
+}
+
+// The user asked for the CPU renderer from the cap offer. This is the SAME
+// action as unticking the checkbox: it unchecks, which fires the checkbox's ONE
+// change handler (updateWebGLState + a real CPU calculation). The cap itself was
+// already applied by FractalViewer.clampScale before this ran.
+function acceptCpuSwitchAtZoomCap() {
+  hideZoomCapOffer();
+  webglCheckbox.checked = false;
+  webglCheckbox.dispatchEvent(new Event('change'));
+}
+
+// The user declined (or dismissed) the offer. The cap stays applied; the offer
+// is never shown again, and `fv-zoom-limit` keeps reporting `prompted: false`
+// for every further capped tick, so "once" stays observable.
+function declineCpuSwitchAtZoomCap() {
+  hideZoomCapOffer();
+  deniedCpuSwitchAtZoomCap = true;
+}
 
 function handleZoomLimitReached() {
   showMessage('Zoom limit reached for GPU mode (~' + WEBGL_ZOOM_CAP.toLocaleString() + 'x). Offer to switch to CPU for deeper zoom.');
-  // The cap is hit on every further wheel tick, but the user is PROMPTED only
-  // once. Report both facts to the observer so "once" is observable, not
-  // asserted from behaviour.
+  // The cap is hit on every further wheel tick, but the user is ASKED only once.
+  // Report both facts to the observer so "once" is observable, not asserted from
+  // behaviour. `prompted` means exactly "the user was actually asked", i.e. this
+  // is the one tick that puts the offer on screen.
   const prompted = !askedCpuSwitchAtZoomCap && !deniedCpuSwitchAtZoomCap;
   try {
     window.dispatchEvent(new CustomEvent('fv-zoom-limit', {
@@ -386,21 +473,19 @@ function handleZoomLimitReached() {
   } catch (_) { /* observation only */ }
   if (!prompted) return;
   askedCpuSwitchAtZoomCap = true;
-  // Deferred so the clamp (and the render it triggers) is not blocked by the
-  // modal; the cap itself is already applied by the caller.
-  setTimeout(() => {
-    let switchToCpu = false;
-    try {
-      switchToCpu = window.confirm('Zoom level limit reached for GPU mode. Switch to CPU mode for deeper zoom?');
-    } catch (_) { /* a blocked/absent dialog must not break zoom */ }
-    if (switchToCpu) {
-      webglCheckbox.checked = false;
-      updateWebGLState();
-    } else {
-      deniedCpuSwitchAtZoomCap = true;
-    }
-  }, 10);
+  // NON-MODAL (S6): the offer is a positioned element with two buttons, shown
+  // synchronously. It blocks nothing — the clamp was already applied by the
+  // caller and the render it triggers proceeds — and BOTH answers leave the cap
+  // in force, because neither one touches `viewer.zoomLimit`. This replaces the
+  // S1 `window.confirm` (old `app.js:394`), retired as the smell row 9 recorded.
+  showZoomCapOffer();
 }
+
+// The offer's two real answers. They are wired once, here, so the offer cannot
+// be shown without a way to answer it.
+if (zoomCapSwitchBtn) zoomCapSwitchBtn.addEventListener('click', acceptCpuSwitchAtZoomCap);
+if (zoomCapDismissBtn) zoomCapDismissBtn.addEventListener('click', declineCpuSwitchAtZoomCap);
+
 
 viewer.setZoomLimit(WEBGL_MIN_SCALE, handleZoomLimitReached);
 
@@ -422,12 +507,10 @@ let progressFrameCount = 0; // of those, the non-final ones
 let appliedJobToken = null; // the job whose frames are on screen; null when idle
 let jobSequence = 0; // monotonic id of every job started
 const appliedFramesByJob = new Map(); // jobSequence -> frames applied for that job
-// The variables below belong to S6 (hygiene) and are deliberately left alone: they
-// are declared and never read. S2 does not make them any less dead.
-let currentResult = null;
-let aborting = false;
-let debounceTimer = null;
-let lastJobParams = null; // Store last parameters for progressive refinement
+// S6 deleted four variables that were declared here and never read anywhere:
+// `currentResult`, `aborting`, `debounceTimer` and `lastJobParams`. S2 had
+// already replaced the abort-flag and debounce designs they belonged to; the
+// dead declarations survived until S6 (the probe's "dead module state").
 
 // --- 3D Mode Integration ---
 let fractal3D = null;
@@ -760,12 +843,15 @@ function cancelJob() {
 }
 
 // --- Mouse event wrappers to delegate to viewer and update view state ---
+// These run on the hottest interaction paths (every mousedown, every wheel tick,
+// every view-change render). They carry NO logging: the four `[FractalMouse]`
+// console.logs that used to sit here were removed by S6, and nothing replaced
+// them, because a log on this path is per-event work on the render loop (S6 pin:
+// tests/hygiene.spec.js "no app console output during a scripted interaction").
 function onMouseDown(e) {
-  console.log('[FractalMouse] mousedown on', e.target.id, 'mode:', webglCheckbox.checked ? 'WebGL' : 'CPU');
   if (viewer && viewer.onMouseDown) viewer.onMouseDown(e);
 }
 function onWheel(e) {
-  console.log('[FractalMouse] wheel (zoom) on', e.target.id, 'mode:', webglCheckbox.checked ? 'WebGL' : 'CPU');
   if (viewer && viewer.onWheel) viewer.onWheel(e);
 }
 function onMouseMove(e) {
@@ -777,10 +863,8 @@ function onMouseUp(e) {
 
 function triggerFractalRender() {
   if (webglCheckbox.checked) {
-    console.log('[FractalMouse] Trigger: renderWebGL()');
     renderWebGL();
   } else {
-    console.log('[FractalMouse] Trigger: viewer.render()');
     viewer.render();
   }
 }
@@ -1233,6 +1317,12 @@ window.__fv = Object.freeze({
   simulateContextLoss: () => handleWebGLLoss('Context loss simulated.'),
   zoomCap: WEBGL_ZOOM_CAP,
   minScale: WEBGL_MIN_SCALE,
+  // S6: the non-modal zoom-cap offer, observed as a DOM fact. `offered` is
+  // "the offer is on screen right now"; `prompted` is "the one-time ask has
+  // happened" (which is exactly what `fv-zoom-limit`'s `prompted` reports), so a
+  // one-line regression in either mechanism is visible without pixel inference.
+  zoomCapOffered: () => cpuSwitchOfferVisible,
+  zoomCapPrompted: () => askedCpuSwitchAtZoomCap,
   liveRenderers: () => (typeof window.__fvLiveWebglRenderers === 'number' ? window.__fvLiveWebglRenderers : 0),
   animationSettled: () => zoomAnimationSettled,
   // --- S5 3D-truth observables (B8 + the awaited 3D failure path) ---
@@ -1380,6 +1470,10 @@ window.__fv = Object.freeze({
   },
   // The ids the store currently holds, in display order.
   storedLocationIds: () => memoryRepo.getAll('timestamp').map(loc => loc.id),
+  // S6: the stored records themselves (names included), so the save/naming pin
+  // can prove the non-modal panel commits the SAME record the prompt used to.
+  // Read-only copy; the schema still owns what a stored record may contain.
+  storedLocations: () => memoryRepo.getAll('timestamp').map(loc => ({ ...loc })),
   // Store a record WITHOUT the schema, then render the list. This is not a
   // bypass of the import boundary — it exists so the RENDERING pin can be driven
   // with a hostile `renderer`/`fractalType` that the schema would otherwise
