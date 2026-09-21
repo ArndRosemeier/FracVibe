@@ -18,17 +18,17 @@ const { test, expect } = require('@playwright/test');
 
 const HEADER = '===== GPU DIAGNOSTIC (FracVibe) =====';
 
-// The FIXED emission order. A missing or extra item is a defect: a phase that
-// cannot run must still report SKIP/FAIL.
-const EXPECTED_ITEMS = [
-  'ua', 'gl_vendor', 'gl_renderer', 'gl_version', 'webgl2',
-  'oes_texture_float', 'oes_texture_float_linear', 'max_texture_size',
-  'max_vertex_texture_units', 'float_texture_sampleable',
-  'ds_precision', 'ds_readback', 'ds_low_component', 'ds_low_changes_result', 'ds_twoprod_low',
-  'deep_view', 'deep_ref_float64', 'deep_ref_bigint', 'app_readback',
-  'cost_1e-4', 'cost_1e-6', 'cost_1e-8',
-  'gl_error', 'readpixels_plausible',
+// The FIXED emission order, grouped by the section header the report prints. A
+// missing or extra item is a defect: a phase that cannot run must still report
+// SKIP/FAIL.
+const GROUPS = [
+  { section: 'IDENTITY', ids: ['ua', 'gl_vendor', 'gl_renderer', 'gl_version', 'webgl2'] },
+  { section: 'FEATURE GATES', ids: ['oes_texture_float', 'oes_texture_float_linear', 'max_texture_size', 'max_vertex_texture_units', 'float_texture_sampleable'] },
+  { section: 'DOUBLE-SINGLE RESIDUAL', ids: ['ds_precision', 'ds_readback', 'ds_low_component', 'ds_low_changes_result', 'ds_twoprod_low'] },
+  { section: 'DEEP LANE', ids: ['deep_view', 'deep_ref_float64', 'deep_ref_bigint', 'app_readback', 'cost_1e-4', 'cost_1e-6', 'cost_1e-8'] },
+  { section: 'READBACK & ERRORS', ids: ['gl_error', 'readpixels_plausible'] },
 ];
+const EXPECTED_ITEMS = GROUPS.flatMap((g) => g.ids);
 
 // Values that must never appear in a report the owner reads.
 const FORBIDDEN_SUBSTRINGS = ['undefined', 'NaN', '[object Object]'];
@@ -71,9 +71,7 @@ function assertStructure(report, consoleTexts) {
 
   // (2) every item section is one of the declared groups.
   const sections = new Set(parsed.items.map((it) => it.section));
-  expect([...sections].sort()).toEqual([
-    'DEEP LANE', 'DOUBLE-SINGLE RESIDUAL', 'FEATURE GATES', 'IDENTITY', 'READBACK & ERRORS',
-  ]);
+  expect([...sections].sort()).toEqual(GROUPS.map((g) => g.section).sort());
 
   // (3) each item is a value or an explicit SKIP/FAIL with a reason.
   for (const it of parsed.items) {
@@ -195,5 +193,47 @@ test.describe('GPU diagnostic (hardware-certification instrument)', () => {
     assertStructure(second, consoleTexts[1]);
 
     expect(pageErrors, 'no uncaught page error across both presses').toEqual([]);
+  });
+
+  // NON-VACUITY: a structure checker that accepts anything proves nothing. This
+  // runs no browser — it feeds assertStructure a report missing 23 of its 24 items
+  // and requires it to reject.
+  test('the structure checker is not vacuous: a malformed report is rejected', async () => {
+    const summary = 'renderer="x" kind=SOFTWARE floatTex=SAMPLES dsLow=UNAVAILABLE deepLane=none cost: 1e-4=n/a 1e-6=n/a 1e-8=n/a';
+    const badText = [
+      HEADER,
+      'SUMMARY: ' + summary,
+      '--- IDENTITY ---',
+      '  ua: Mozilla/5.0',
+      '===== END: 1 OK, 0 SKIP, 0 FAIL =====',
+    ].join('\n');
+    const fakeReport = {
+      id: 'gpuDiagnostic/1',
+      summary: summary,
+      items: [{ section: 'IDENTITY', id: 'ua', status: 'OK', value: 'Mozilla/5.0' }],
+      counts: { ok: 1, skip: 0, fail: 0 },
+      errors: [],
+    };
+    expect(() => assertStructure(fakeReport, badText),
+      'a report missing 23 of its 24 items must be rejected').toThrow();
+
+    // And a report whose item set and sections are right but whose values contain
+    // 'undefined' must ALSO be rejected, so "the right ids are present" cannot pass
+    // for "every number is a real number".
+    const badValueLines = [HEADER, 'SUMMARY: ' + summary];
+    for (const group of GROUPS) {
+      badValueLines.push('--- ' + group.section + ' ---');
+      for (const id of group.ids) badValueLines.push('  ' + id + ': undefined');
+    }
+    badValueLines.push('===== END: 24 OK, 0 SKIP, 0 FAIL =====');
+    const items = [];
+    for (const group of GROUPS) for (const id of group.ids) items.push({ section: group.section, id: id, status: 'OK', value: 'undefined' });
+    const undefinedReport = {
+      id: 'gpuDiagnostic/1', summary: summary,
+      items: items,
+      counts: { ok: 24, skip: 0, fail: 0 }, errors: [],
+    };
+    expect(() => assertStructure(undefinedReport, badValueLines.join('\n')),
+      "an 'undefined' item value must be rejected").toThrow();
   });
 });
