@@ -581,7 +581,7 @@ async function runBattery() {
       try { maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE); } catch (_) { maxTex = 0; }
       try { maxVtu = gl.getParameter(gl.MAX_VERTEX_TEXTURE_IMAGE_UNITS); } catch (_) { maxVtu = 0; }
       ok('FEATURE GATES', 'max_texture_size', maxTex + ' px (MAX_TEXTURE_SIZE)');
-      ok('FEATURE GATES', 'max_vertex_texture_units', maxVtu + ' (MAX_VERTEX_TEXTURE_IMAGE_UNITS)');
+      ok('FEATURE GATES', 'max_vertex_texture_units', maxVtu + ' texture units (MAX_VERTEX_TEXTURE_IMAGE_UNITS)');
       try { floatTex = floatTextureProbe(probe); } catch (err) { floatTex = { status: 'FAIL', reason: 'threw: ' + errText(err) }; }
       if (floatTex.status === 'OK') ok('FEATURE GATES', 'float_texture_sampleable', floatTex.value);
       else if (floatTex.status === 'SKIP') skip('FEATURE GATES', 'float_texture_sampleable', floatTex.reason);
@@ -697,8 +697,8 @@ async function runBattery() {
               }
               const misPct = (mis / count) * 100;
               const meanAbs = sumAbs / count;
-              const value = 'scale=' + FLOAT_DEEP_SCALE + ' src=' + src + ' cap=' + cap
-                + ' sampled=' + count + ' refEscaped=' + refEscaped
+              const value = 'scale=' + FLOAT_DEEP_SCALE + ' src=' + src + ' capIter=' + cap
+                + ' sampledPx=' + count + ' refEscaped=' + refEscaped
                 + ' misclassified=' + misPct.toFixed(3) + '% mean|dn|=' + meanAbs.toFixed(3) + ' max|dn|=' + maxAbs;
               deepOk('deep_view', 'scale=' + FLOAT_DEEP_SCALE + ' centre=' + FLOAT_DEEP_X + ',' + FLOAT_DEEP_Y + ' lane=' + src);
               if (refEscaped === 0) deepFail('deep_ref_float64', 'the reference frame is degenerate (no escaped pixels): ' + value);
@@ -773,9 +773,9 @@ async function runBattery() {
                 }
                 const misPct = (mis / count) * 100;
                 const meanAbs = sumAbs / count;
-                const value = 'scale=' + BIGINT_SCALE + ' src=' + src + ' bits=' + bits + ' cap=' + cap
-                  + ' orbitW=' + (info ? info.width : '?')
-                  + ' sampled=' + count + ' refEscaped=' + refEscaped
+                const value = 'scale=' + BIGINT_SCALE + ' src=' + src + ' bits=' + bits + ' capIter=' + cap
+                  + ' orbitTexels=' + (info ? info.width : '?')
+                  + ' sampledPx=' + count + ' refEscaped=' + refEscaped
                   + ' misclassified=' + misPct.toFixed(3) + '% mean|dn|=' + meanAbs.toFixed(3) + ' max|dn|=' + maxAbs;
                 if (refEscaped === 0) deepFail('deep_ref_bigint', 'the reference frame is degenerate (no escaped pixels): ' + value);
                 else if (misPct > 5) deepFail('deep_ref_bigint', 'the GPU disagrees with the direct BigInt reference: ' + value);
@@ -808,7 +808,7 @@ async function runBattery() {
               const src = fv.orbitSource();
               deepSources.push(src);
               const passes = (passesBefore !== null && passesAfter !== null) ? (passesAfter - passesBefore) : '?';
-              const value = ms.toFixed(1) + ' ms (scale=' + step.scale + ' cap=' + fv.maxIter() + ' lane=' + src + ' passes=' + passes + ')';
+              const value = ms.toFixed(1) + ' ms (scale=' + step.scale + ' capIter=' + fv.maxIter() + ' lane=' + src + ' passes=' + passes + ')';
               if (typeof ms === 'number' && isFinite(ms) && ms >= 0) deepOk(id, value);
               else deepFail(id, 'renderTimeMs() is not a finite number: ' + value);
             } catch (err) {
