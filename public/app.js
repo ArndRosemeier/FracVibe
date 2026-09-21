@@ -1540,6 +1540,47 @@ window.__fv = Object.freeze({
   // The fragment source as generated. Read-only; the shader-formula pin reads the
   // smooth expression out of it rather than inferring it from pixels.
   shaderSource: () => (webglRenderer && webglRenderer.shaderSource ? webglRenderer.shaderSource : null),
+  // --- P1 perturbation observables (the reference orbit and its mechanisms) ---
+  // Counted, never inferred: how many times the CPU built a reference orbit. A
+  // colour change, a resize or a repeated draw of the SAME view must not move it;
+  // a view change must move it by exactly one.
+  orbitComputations: () => (webglRenderer ? webglRenderer.orbitComputations : 0),
+  // The cached float64 orbit itself, so the suite can compute a float64
+  // PERTURBATION reference. That reference is valid at any depth, unlike the CPU
+  // renderer's absolute float64 coordinate, which the centre's own ULP (~1e-16
+  // near |c| ~ 0.74) makes degenerate past zoom ~1e16. Observation only.
+  orbitValues: () => (webglRenderer && webglRenderer.getOrbit ? webglRenderer.getOrbit() : null),
+  // Whether the last draw used the perturbation lane (false on a context with no
+  // OES_texture_float, and for the non-Mandelbrot types).
+  usePerturbation: () => !!(webglRenderer && webglRenderer.usePerturbation),
+  // The perturbation constants as ACTUALLY templated, so a pin compares numbers
+  // rather than source text.
+  perturbConstants: () => ({
+    glitchG: FractalKernel.PERTURB_GLITCH_G,
+    rescaleInterval: FractalKernel.PERTURB_RESCALE_INTERVAL,
+    hasFloatTexture: !!(webglRenderer && webglRenderer.hasFloatTexture),
+    orbitWidth: webglRenderer ? webglRenderer._orbitW : 0,
+  }),
+  // Run the REAL perturbation draw with the diagnostic output (the Pauldelbrot
+  // glitch level in place of the colour) and read the GPU's own count back. This
+  // adds no production path: production always draws with the diagnostic off, and
+  // the same view/orbit/budget/type are used.
+  glitchFrame: () => {
+    if (!webglRenderer) return null;
+    return webglRenderer.renderGlitchFrame(
+      viewer.view,
+      viewer.maxIter,
+      FractalKernel.indexForType(viewer.fractalType),
+      viewer.fractalType === 'julia' ? viewer.juliaParams : undefined,
+    );
+  },
+  // Reset the orbit cache so the next draw rebuilds it. Observation-only: it exists
+  // so the "once per view" pin can distinguish a view change from a cache clear.
+  invalidateOrbit: () => {
+    if (!webglRenderer) return false;
+    webglRenderer._orbitKey = null;
+    return true;
+  },
   // The kernel's own tables, so a test can drive every supported type/palette
   // without restating the list in a second fixture.
   fractalTypes: () => FractalKernel.FRACTAL_TYPES.map((t) => t.value),

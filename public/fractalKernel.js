@@ -163,6 +163,42 @@
   // 4096 at 1e8 is EXACTLY the budget the probe used to turn that 100%-black frame
   // into a real one, and 3086 < 4096, so the centre escapes.
   const ITER_BUDGET_PER_DECADE = 512;
+  // --- P1: the perturbation core's two named constants ------------------------
+  // Pauldelbrot's glitch test is |Z+z|^2 < G |Z|^2. The sources put G anywhere in
+  // 1e-2..1e-8 and publish no principled value at all (Kalles Fraktaler exposes it
+  // as a user slider whose extremes are "good but very slow" and "fast but bad
+  // images"; Claude Heiland-Allen's blog says choosing it "remains open"). This is
+  // therefore a CHOSEN value, not a derived one, and it is stated here so the
+  // shader and every measurement name the same number:
+  //
+  //   PERTURB_GLITCH_G = 1e-4
+  //
+  // WHY 1e-4: it is the middle of the published band, it is the threshold the
+  // committed perturbation probe (docs/PROBE-2026-09-21-perturbation.md) reported
+  // its glitch fractions at, and the choice is MEASURED to be discriminating
+  // rather than asserted. At zoom 1e15 on the probe's centre, the fraction of
+  // pixels the detector fires on is 0.000% once same-reference rebasing is in
+  // force and 74.6% with rebasing disabled (docs/DECISIONS.md row 33) — i.e. at
+  // this G the detector tracks exactly the structural collapse rebasing repairs.
+  const PERTURB_GLITCH_G = 1e-4;
+  // Rescaling in the delta iteration: z = S*w, c = S*d, w -> 2Zw + S w^2 + d, with
+  // S renormalised so |w| is near 1. The sources say "typically a few hundred
+  // iterations" and give no exact value, so this is a CHOSEN interval:
+  //
+  //   PERTURB_RESCALE_INTERVAL = 256
+  //
+  // 256 is a power of two, so the rescale factor S is an exact float32 scaling and
+  // the trigger `mod(iter, 256) == 0` is exact. MEASURED: over the whole range a
+  // float64 reference orbit can reach (<=1e16), rescaling is INERT — the image is
+  // bit-identical with the interval at 256, at 64, at 1024 and with rescaling
+  // disabled entirely. It exists for the range below, not for the range above:
+  // the delta's square underflows in float32 at |z| < ~1e-19, which is a zoom
+  // around 1e19, and a float64 view centre has already lost all of its pixels to
+  // its own ULP (~1.1e-16 near |c|~0.74) by 1e16. So rescaling is the mechanism
+  // P2 (an arbitrary-precision reference orbit) needs, and it is implemented and
+  // range-preserving here; its contribution is NOT measurable within P1's reach
+  // (docs/DECISIONS.md row 34 records the measurement that says so).
+  const PERTURB_RESCALE_INTERVAL = 256;
   // The scale of the app's GPU zoom cap (`WEBGL_ZOOM_CAP = 10000` in app.js ->
   // `WEBGL_MIN_SCALE = 1 / WEBGL_ZOOM_CAP`). The floor starts strictly BELOW this
   // scale, so a view clamped at the cap gets no floor at all. This is the one
@@ -490,6 +526,9 @@
     colorTableSize: colorTableSize,
     ITER_BUDGET_PER_DECADE: ITER_BUDGET_PER_DECADE,
     ITER_BUDGET_MIN_SCALE: ITER_BUDGET_MIN_SCALE,
+    // P1: the perturbation core's chosen constants (see their definitions above).
+    PERTURB_GLITCH_G: PERTURB_GLITCH_G,
+    PERTURB_RESCALE_INTERVAL: PERTURB_RESCALE_INTERVAL,
     iterBudgetForScale: iterBudgetForScale,
     effectiveMaxIter: effectiveMaxIter,
     UNCALCULATED_COLOR: Object.freeze(UNCALCULATED_COLOR.slice()),
