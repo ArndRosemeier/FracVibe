@@ -65,6 +65,29 @@ small. **This is needed under every route, which is why it is D1.**
 | **D6** | **Align the CPU and GPU sample points.** `FractalKernel.pixelToCoord` samples pixel CORNERS while the shader samples CENTRES, so the two renderers disagree by 1.26% (1e3) / 9.0% (1e5) — **more than the GPU's float32 error at shallow zoom**, and it inflates the parity pins' tolerances. | CPU and GPU agree at the same sample points to the float32 floor; the parity pins' thresholds can tighten and are tightened | queued |
 
 ### Acceptance criterion for EVERY slice (the owner's requirement, made measurable)
+
+> **⚠ RE-SPECIFIED 2026-09-21, after P1 measured the rule below to be BOTH unachievable and
+> non-discriminating at the current stage.** The operative criterion is now:
+>
+> **A differential, correctness-at-depth test against a float64 PERTURBATION reference**, with four
+> stated thresholds — `misclassification %`, `mean per-channel |ΔRGB|`, `largest connected Δ>32 blob`,
+> `distinct-colour count` — and **the failing/naive baseline shown inside the same pin**, so it cannot
+> pass vacuously. Removing the mechanism must break it, and it does: rebase-disabled gives a 90-px
+> blob and **6 colours against the reference's 136**.
+>
+> **Why the hop rule below cannot be used yet.** P1 swept 0.1 %-per-step with the cap at 7680 and
+> measured **1–4 hopping pixels per step at 1e-8 and 7–16 at 1e-13** out of ~10 500 sub-iteration
+> pixels — never 0. Worse, the **rebase-disabled** build scores **0–1** and passes the rule
+> *vacuously*, because it has collapsed to 6 colours (mean step change 0.90) against the correct
+> build's 9.8. The rule compares each pixel's GPU colour against the float64 reference's value change,
+> so at chaotic boundary pixels it measures **float32 delta ACCURACY** (measured: mean 6.6, max 2656
+> iterations of error), not smoothness; reformulated on the GPU's own value it reads 0 on every build
+> — non-discriminating the other way. Shipping a nonzero threshold to make it pass would be massaging
+> the test, and the writer refused to do it — correctly.
+>
+> **The strict sweep criterion remains the owner's requirement and is DEFERRED to P2/P3**, where an
+> arbitrary-precision coordinate and accurate deltas can make a hop measurement separable from
+> accuracy noise. It must be re-attempted there, not quietly dropped.
 **Corrected after D1, which measured the original version of this criterion to be
 NON-DISCRIMINATING.** The original wording — *"a continuous zoom sweep must show no
 step-to-step image-difference spike"* — was wrong: at deep zoom the frame-to-frame
