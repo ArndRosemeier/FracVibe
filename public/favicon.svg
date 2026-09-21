@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Fract Vibe">
+  <!-- Fract Vibe favicon: a dark tile with the app's accent-yellow arc standing
+       for the orbit |z| = 1.6 and the dot for its escaping point z^2 + c.
+       No external fonts or images: it must render identically at 16 px. -->
+  <rect width="64" height="64" rx="13" fill="#181818"/>
+  <circle cx="28" cy="34" r="16.5" fill="none" stroke="#ffe066" stroke-width="7.5"
+          stroke-linecap="round" stroke-dasharray="66 38" transform="rotate(-40 28 34)"/>
+  <circle cx="48" cy="24" r="6.2" fill="#ffe066"/>
+</svg>

@@ -263,3 +263,47 @@ test('S6 pin: the four dead files are not tracked, not on disk and not served', 
     expect(res.status(), `GET ${rel}`).toBe(404);
   }
 });
+
+// --- favicon -------------------------------------------------------------------
+// The page declared NO icon, so the browser fell back to /favicon.ico at the HOST
+// ROOT, which 404s (it belongs to the host, not to this app). That 404 showed up
+// as a console error in every verification run and was chased twice as an app
+// defect (docs/STATE.md TRAP). This pin holds the fix at each link in the chain:
+// the app DECLARES the icon, the icon is REALLY served, and a browser really
+// receives it. Declaration alone is the trap — `href="favicon.svg"` passes even
+// if the file 404s, which is the exact shape of the bug being fixed.
+test('pin: the app declares an icon and the browser really receives it', async ({ request, page }) => {
+  // 1. index.html declares exactly one icon, with a RELATIVE href (this app is
+  //    served from a subpath; a root-absolute href would 404 in production).
+  const html = fs.readFileSync(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
+  const hrefs = [...html.matchAll(/<link[^>]*rel=["']icon["'][^>]*href=["']([^"']+)["']/g)].map((m) => m[1]);
+  expect(hrefs.length, 'index.html must declare exactly one rel="icon"').toBe(1);
+  expect(hrefs[0].startsWith('/'), `icon href must be relative, got ${hrefs[0]}`).toBe(false);
+  expect(hrefs[0].includes('..')).toBe(false);
+
+  // 2. the declared icon is on disk and is a real standalone SVG (no external
+  //    font/image reference, which would silently fail when served as an icon).
+  const iconPath = path.join(PUBLIC_DIR, hrefs[0]);
+  expect(fs.existsSync(iconPath), `${hrefs[0]} is not on disk`).toBe(true);
+  const svg = fs.readFileSync(iconPath, 'utf8');
+  expect(svg.includes('<svg')).toBe(true);
+  expect(svg).not.toMatch(/<image\b|xlink:href|@font-face/);
+
+  // 3. it is really SERVED by the app server, at the declared URL.
+  const res = await request.get(hrefs[0]);
+  expect(res.status(), `GET ${hrefs[0]}`).toBe(200);
+  expect((res.headers()['content-type'] || '').toLowerCase()).toContain('svg');
+
+  // 4. and a REAL browser receives it: load the page and watch the network. This
+  //    is the step that distinguishes "declared" from "delivered" — and the step
+  //    that would have caught the original host-root 404.
+  const seen = [];
+  page.on('response', (r) => {
+    if (/favicon/.test(r.url())) seen.push({ status: r.status(), url: r.url(), type: r.headers()['content-type'] || '' });
+  });
+  await page.goto('./');
+  await page.waitForFunction(() => window.__fv && typeof window.__fv.orbitFrame === 'function', null, { timeout: 30_000 });
+  await expect.poll(() => seen.length, { timeout: 15_000 }).toBeGreaterThan(0);
+  expect(seen.some((s) => s.status === 200), `icon responses: ${JSON.stringify(seen)}`).toBe(true);
+  expect(seen.some((s) => s.status >= 400), `a favicon request failed: ${JSON.stringify(seen)}`).toBe(false);
+});
