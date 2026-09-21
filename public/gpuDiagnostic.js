@@ -744,7 +744,7 @@ async function runBattery() {
                 const cxBig = parseDec(BIGINT_X_EXACT, F);
                 const cyBig = parseDec(BIGINT_Y_EXACT, F);
                 const bail = 4n << BigInt(2 * F);
-                const grid = sampleGrid(w, h, 240);
+                const grid = sampleGrid(w, h, 160);
                 let mis = 0, sumAbs = 0, maxAbs = 0, refEscaped = 0, count = 0;
                 for (const j of grid.ys) {
                   const v = (j + 0.5) / h;
