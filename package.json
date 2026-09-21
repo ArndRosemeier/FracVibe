@@ -1,5 +1,16 @@
 {
+  "name": "fracvibe",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Interactive 2D/WebGL/3D fractal explorer",
+  "scripts": {
+    "start": "node server/server.js",
+    "test": "playwright test"
+  },
   "dependencies": {
     "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0"
   }
 }

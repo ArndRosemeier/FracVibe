@@ -10,3 +10,7 @@ dist/
 .idea/
 .vscode/
 .git/
+
+# Playwright artifacts
+test-results/
+playwright-report/

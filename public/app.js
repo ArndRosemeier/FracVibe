@@ -21,11 +21,13 @@ let viewer = new FractalViewer(canvas, updateInfo);
 const memoryRepo = new FractalMemoryRepository();
 const saveLocationBtn = document.getElementById('saveLocationBtn');
 const loadLocationBtn = document.getElementById('loadLocationBtn');
-const loadLocationSidebar = document.getElementById('loadLocationSidebar');
-const closeLoadLocationSidebar = document.getElementById('closeLoadLocationSidebar');
-// We'll create the savedLocationsList and locationSortSelect elements dynamically in the sidebar
-let savedLocationsList = null;
-let locationSortSelect = null;
+const loadLocationModal = document.getElementById('loadLocationModal');
+const closeLoadLocationModal = document.getElementById('closeLoadLocationModal');
+const exportLocationsBtn = document.getElementById('exportLocationsBtn');
+const importLocationsBtn = document.getElementById('importLocationsBtn');
+// These live in index.html; the modal is shown/hidden rather than built on demand.
+const savedLocationsList = document.getElementById('savedLocationsList');
+const locationSortSelect = document.getElementById('locationSortSelect');
 
 function getCurrentLocationState() {
   return {
@@ -56,130 +58,71 @@ saveLocationBtn.addEventListener('click', () => {
     conf.style.opacity = '0';
     setTimeout(() => { conf.style.display = 'none'; }, 700);
   }, 1200);
-  // If sidebar is open, update it
-  if (loadLocationSidebar && loadLocationSidebar.style.display !== 'none') {
+  // If the modal is open, update it
+  if (loadLocationModal.style.display !== 'none') {
     renderSavedLocations();
   }
 });
 
 loadLocationBtn.addEventListener('click', () => {
-  // Build sidebar content if not already present
-  if (!savedLocationsList) {
-    savedLocationsList = document.createElement('div');
-    savedLocationsList.id = 'savedLocationsList';
-    savedLocationsList.style.maxHeight = '70vh';
-    savedLocationsList.style.overflowY = 'auto';
-    savedLocationsList.style.margin = '0 1.3em 1em 1.3em';
-    // Insert after sort row
-    const sidebar = loadLocationSidebar;
-    const sortRow = document.createElement('div');
-    sortRow.style.display = 'flex';
-    sortRow.style.alignItems = 'center';
-    sortRow.style.gap = '1em';
-    sortRow.style.margin = '0 1.3em 0.5em 1.3em';
-    const sortLabel = document.createElement('label');
-    sortLabel.textContent = 'Sort by:';
-    sortLabel.htmlFor = 'locationSortSelect';
-    locationSortSelect = document.createElement('select');
-    locationSortSelect.id = 'locationSortSelect';
-    locationSortSelect.style.fontSize = '1em';
-    locationSortSelect.style.padding = '0.1em 0.5em';
-    locationSortSelect.innerHTML = `<option value="timestamp">Most Recent</option><option value="name">Name</option>`;
-    sortRow.appendChild(sortLabel);
-    sortRow.appendChild(locationSortSelect);
-    sidebar.appendChild(sortRow);
-    sidebar.appendChild(savedLocationsList);
-    locationSortSelect.addEventListener('change', renderSavedLocations);
-  }
   renderSavedLocations();
-  // Add export/import buttons at the bottom of the sidebar
-  let sidebarFooter = document.getElementById('sidebarFooter');
-  if (!sidebarFooter) {
-    sidebarFooter = document.createElement('div');
-    sidebarFooter.id = 'sidebarFooter';
-    sidebarFooter.style.display = 'flex';
-    sidebarFooter.style.justifyContent = 'flex-start';
-    sidebarFooter.style.alignItems = 'center';
-    sidebarFooter.style.gap = '1em';
-    sidebarFooter.style.padding = '1em 1.3em 1em 1.3em';
-    sidebarFooter.style.borderTop = '1px solid #333';
-    sidebarFooter.style.position = 'absolute';
-    sidebarFooter.style.bottom = '0';
-    sidebarFooter.style.width = '100%';
-    // Export button
-    const exportBtn = document.createElement('button');
-    exportBtn.textContent = 'Export';
-    exportBtn.style.background = '#444';
-    exportBtn.style.color = '#ffe066';
-    exportBtn.style.border = 'none';
-    exportBtn.style.borderRadius = '5px';
-    exportBtn.style.padding = '0.4em 1.2em';
-    exportBtn.style.cursor = 'pointer';
-    exportBtn.addEventListener('click', () => {
-      const data = JSON.stringify(memoryRepo.getAll('timestamp'), null, 2);
-      const blob = new Blob([data], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'fractal_locations.json';
-      document.body.appendChild(a);
-      a.click();
-      setTimeout(() => {
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-      }, 100);
-    });
-    // Import button
-    const importBtn = document.createElement('button');
-    importBtn.textContent = 'Import';
-    importBtn.style.background = '#ffe066';
-    importBtn.style.color = '#222';
-    importBtn.style.border = 'none';
-    importBtn.style.borderRadius = '5px';
-    importBtn.style.padding = '0.4em 1.2em';
-    importBtn.style.cursor = 'pointer';
-    importBtn.addEventListener('click', () => {
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = '.json,application/json';
-      input.style.display = 'none';
-      input.addEventListener('change', (e) => {
-        const file = e.target.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = (evt) => {
-          try {
-            const imported = JSON.parse(evt.target.result);
-            if (Array.isArray(imported)) {
-              imported.forEach(loc => {
-                // Remove existing with same id, then add
-                memoryRepo.remove(loc.id);
-                memoryRepo.save(loc);
-              });
-              renderSavedLocations();
-              alert('Locations imported successfully.');
-            } else {
-              alert('Invalid file format.');
-            }
-          } catch (err) {
-            alert('Error importing locations: ' + err.message);
-          }
-        };
-        reader.readAsText(file);
-      });
-      document.body.appendChild(input);
-      input.click();
-      setTimeout(() => document.body.removeChild(input), 5000);
-    });
-    sidebarFooter.appendChild(exportBtn);
-    sidebarFooter.appendChild(importBtn);
-    loadLocationSidebar.appendChild(sidebarFooter);
-  }
-  loadLocationSidebar.style.display = 'block';
+  // The modal is a flex container (centring relies on display:flex).
+  loadLocationModal.style.display = 'flex';
 });
 
-closeLoadLocationSidebar.addEventListener('click', () => {
-  loadLocationSidebar.style.display = 'none';
+closeLoadLocationModal.addEventListener('click', () => {
+  loadLocationModal.style.display = 'none';
+});
+
+locationSortSelect.addEventListener('change', renderSavedLocations);
+
+exportLocationsBtn.addEventListener('click', () => {
+  const data = JSON.stringify(memoryRepo.getAll('timestamp'), null, 2);
+  const blob = new Blob([data], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'fractal_locations.json';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 100);
+});
+
+importLocationsBtn.addEventListener('click', () => {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json,application/json';
+  input.style.display = 'none';
+  input.addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      try {
+        const imported = JSON.parse(evt.target.result);
+        if (Array.isArray(imported)) {
+          imported.forEach(loc => {
+            // Remove existing with same id, then add
+            memoryRepo.remove(loc.id);
+            memoryRepo.save(loc);
+          });
+          renderSavedLocations();
+          alert('Locations imported successfully.');
+        } else {
+          alert('Invalid file format.');
+        }
+      } catch (err) {
+        alert('Error importing locations: ' + err.message);
+      }
+    };
+    reader.readAsText(file);
+  });
+  document.body.appendChild(input);
+  input.click();
+  setTimeout(() => document.body.removeChild(input), 5000);
 });
 
 function renderSavedLocations() {
@@ -350,7 +293,10 @@ function enter3DMode() {
   in3DMode = true;
   fractal3D = new Fractal3DViewer(document.body, FractalEngine, getFractalParams);
   fractal3D.init();
+  // Hide BOTH 2D canvases: three.js appends its own canvas to <body>, and a
+  // visible in-flow canvas would push that one below the fold.
   canvas.style.display = 'none';
+  canvasWebGL.style.display = 'none';
   infoElem.style.display = 'none';
 }
 
@@ -359,8 +305,9 @@ function exit3DMode() {
   in3DMode = false;
   if (fractal3D) fractal3D.exit();
   fractal3D = null;
-  canvas.style.display = '';
   infoElem.style.display = '';
+  // Restores the canvas that matches the active renderer (also re-renders).
+  updateWebGLState();
 }
 
 function updateInfo(view) {
@@ -506,6 +453,10 @@ updateWebGLState();
       // Animation done, show splash
       updateInfo(viewer.view);
       showFractVibeSplash();
+      // The animation moved the view without going through the view-change
+      // path, so the CPU renderer is still showing the pre-animation image.
+      // (GPU mode re-renders every frame from the uniforms, so it needs nothing.)
+      if (!webglCheckbox.checked) startFractalCalculationWithTiming();
     }
   }
   loop();
