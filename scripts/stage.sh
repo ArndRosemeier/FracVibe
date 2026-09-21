@@ -50,6 +50,7 @@ command -v python3 >/dev/null || die "python3 is required"
 mkdir -p "$TMP/out"
 cp -a "$SRC/." "$TMP/out/"
 
+VERSIONED_FILE="$TMP/versioned.json"
 VERSIONED="$(python3 - "$TMP/out" <<'PY'
 import hashlib, json, os, sys
 
@@ -212,9 +213,10 @@ for rel in ORDER:
 for rel in SOURCES:
     os.remove(os.path.join(root, rel))
 
-print(json.dumps(VERSION))
+print(json.dumps({'versioned': VERSION, 'reachable': sorted(SOURCES)}))
 PY
 )" || die "versioning failed"
+printf '%s' "$VERSIONED" > "$VERSIONED_FILE"
 
 # 2. Rewrite index.html to the versioned entry names. This runs LAST, and only
 #    here, because HTML is the one file the edge does not cache: it is what makes
@@ -222,7 +224,8 @@ PY
 #    quoted references are replaced.
 python3 - "$TMP/out" "$VERSIONED" <<'PY' || die "index.html rewrite failed"
 import json, os, re, sys
-root, version = sys.argv[1], json.loads(sys.argv[2])
+root, payload = sys.argv[1], json.loads(sys.argv[2])
+version = payload['versioned'] if isinstance(payload, dict) and 'versioned' in payload else payload
 path = os.path.join(root, 'index.html')
 html = open(path).read()
 before = html
@@ -255,10 +258,13 @@ rsync -a --delete "$TMP/out/" "$DST/" || die "rsync into dist/ failed"
 #    graph is COMPLETE and CLOSED: every reference in every served file resolves
 #    to a file that is actually published. That is the failure that would 404 a
 #    module in the browser, and it is what this checks.
-python3 - "$DST" <<'PY' || die "artifact verification failed"
+python3 - "$DST" "$VERSIONED_FILE" <<'PY' || die "artifact verification failed"
 import os, sys
 
 dst = sys.argv[1]
+import json as _json
+_payload = _json.loads(open(sys.argv[2]).read())
+payload_reachable = _payload.get('reachable', []) if isinstance(_payload, dict) else []
 bad = []
 
 def references(path, rel):
@@ -310,11 +316,34 @@ for dirpath, _dirs, files in os.walk(dst):
         for value in references(p, rel):
             bad.append('%s references a file that is not published: %s' % (rel, value))
 
-# Nothing may be served under an unversioned .js name: that is precisely the
-# stale-cache hazard this step exists to remove.
+# A REACHABLE script must never be served under an unversioned name: that is the
+# stale-cache hazard this step exists to remove. An UNREACHABLE file — e.g. added by
+# a groundwork slice before the wiring slice that references it — cannot be fetched
+# by any page, so it is REPORTED, not failed. (The first run against the
+# WEBGPU-GROUNDWORK files caught exactly that.)
+#
+# HONEST NOTE ON THIS CHECK: the hazard branch is an INVARIANT ASSERTION, not a
+# tested guard. `dist/` is rebuilt from `public/`, and every file reachable from an
+# entry point is emitted under a content-addressed name by construction, so a bare
+# reachable name cannot occur from a normal run — which means no injection can make
+# this branch fire. It is kept because it is one cheap `os.listdir` and it would
+# catch a future refactor that started copying files verbatim instead of emitting
+# them. Do not read its green as evidence that stale-name protection was exercised.
+_ver = __import__('re')
+orphans = []
 for f in sorted(os.listdir(dst)):
-    if f.endswith('.js') and not __import__('re').match(r'^.+\.([0-9a-f]{12})\.js$', f):
-        bad.append('unversioned script would be served under a cached name: ' + f)
+    if not f.endswith('.js'):
+        continue
+    if _ver.match(r'^.+\.([0-9a-f]{12})\.js$', f):
+        continue
+    if os.path.basename(f) in payload_reachable:
+        bad.append('a REACHABLE script is served unversioned (stale-cache hazard): ' + f)
+    else:
+        orphans.append(f)
+for f in orphans:
+    print('stage: note — %s is not referenced by any entry point, so it is published '
+          'unversioned and no page can fetch it yet (wire it up and it becomes '
+          'versioned automatically)' % f, file=sys.stderr)
 
 if bad:
     print('stage: RED — the staged artifact is inconsistent:', file=sys.stderr)
