@@ -55,10 +55,13 @@ small. **This is needed under every route, which is why it is D1.**
 | id | intent | pins (must go RED when broken) | status |
 |---|---|---|---|
 | **D1** | **Continuous escape-time colour**, one definition shared by the kernel and the GLSL; the iterated buffer becomes continuous (the `-1` sentinel represented in a float buffer); the integer LUT is replaced; colour cycling applies to the continuous value. Removes the amplifier and kills visible banding. | colour is **Lipschitz** in the escape value; a continuous zoom sweep shows **no frame-to-frame spike**; CPU/GPU parity (`kernel-parity.spec.js:210`, `meanAbs < 6`) still holds; inside stays black, uncalculated stays the placeholder | **IN FLIGHT** |
-| **D2** | **Zoom-scaled iteration budget.** The probe proved the view centre escapes only at iteration **3085**, so at the shipped maxIter (512/2000) every deep frame saturates to "inside" — 1e6/512 = 90.8% inside, 1e8/512 = 100%. **Without this, no deep zoom is meaningful at any precision.** Scale maxIter with zoom (and surface it), so detail appears instead of black. | at a fixed deep view, raising the budget changes the image (it is no longer saturated) and the reference classification is reproduced; the budget follows zoom monotonically; the existing maxIter cap/UI pins still hold | queued |
-| **D3** | **Compensated float32 on the GPU** (hi+lo for coordinates *and* iteration). **Measured to hold to ≥1e10** — ~1e6× beyond today — at ~10–12× fragment work, with no reference orbit, no glitch detection and no rebasing. | at 1e6/1e8 the GPU matches a float64 reference within a stated threshold (the probe's rig is the model); the compensated path is selected only where it is needed; the switch into it shows no visible change (see the acceptance criterion) | queued |
-| **D4** | **Retire the CPU handoff** over the range the GPU now covers, and raise the plain-float32 cap to its measured limit for the cheap path. Keep CPU as an explicit option, not the automatic fallback; `#zoomCapOffer` stops appearing where it no longer applies. | beyond the old cap the GPU stays selected and the image is correct; the offer does not appear in the covered range; CPU stays reachable | queued |
-| **D5** | **Perturbation theory** — the only route beyond ~1e10. Reference orbit at >float64 precision, delta iteration, glitch detection **and exact rebasing**, series approximation. | a rebase changes the image **only by reducing error** (no pop); a known glitch converges to the float64 reference; a zoom sweep across each rebase shows no spike | **deferred pending the owner's call on the §6 fork**; entirely UNMEASURED |
+| **D2** | **Zoom-scaled iteration budget.** The probe proved the view centre escapes only at iteration **3085**, so at the shipped maxIter (512/2000) every deep frame saturates to "inside" — 1e6/512 = 90.8% inside, 1e8/512 = 100%. **Without this, no deep zoom is meaningful at any precision.** Scale maxIter with zoom (and surface it), so detail appears instead of black. | at a fixed deep view, raising the budget changes the image (it is no longer saturated) and the reference classification is reproduced; the budget follows zoom monotonically; the existing maxIter cap/UI pins still hold | **NEXT after D1 — prerequisite for P1** |
+| **P1** | **The perturbation core** (the owner's chosen route, §6). A **reference orbit** for the view centre computed ONCE per view at float64 precision on the CPU and uploaded to the GPU, then per-pixel **delta** iteration `dz ← 2·Z·dz + dz² + dc` in the shader, with compensation wherever cancellation bites (the probe measured that hi+lo compensation works). This is what removes the handoff. | on a glitch-free deep view the GPU matches a float64 reference within a stated threshold at 1e6 and beyond; the orbit is computed **once per view, not per pixel** (counted, never inferred); the delta path reproduces the reference's inside/outside classification | **NEXT** |
+| **P2** | **Exact rebasing.** Detect glitches — pixels whose orbit departs from the reference — and re-render them against a better reference. **A rebase may only REDUCE error.** This is the slice that carries the owner's smoothness requirement. | a zoom sweep across each rebase shows **no spike**; a known glitch case converges to the float64 reference; the frame AFTER a rebase differs from the frame before by less than the visual threshold | queued |
+| **P3** | **The path switch** — plain float32 ↔ perturbation — placed where the plain path's error is already sub-pixel, with no visible change across the boundary. | a zoom sweep across the switch shows no spike; at the switch the two paths agree within the stated threshold | queued |
+| **P4** | **Retire the CPU handoff** over the range the GPU now covers. Keep CPU as an explicit option, not the automatic fallback; `#zoomCapOffer` stops appearing where it no longer applies. | beyond the old cap the GPU stays selected and correct; the offer does not appear in the covered range; CPU stays reachable | queued |
+| **P5** | **Series approximation** — speed, not correctness: skip the first N delta iterations with a polynomial in `dc`. | an SA-skipped render equals the non-skipped render within the stated threshold | queued |
+| **P6** | **Reference orbits beyond float64.** A float64 orbit reaches roughly 1e15; past that the ORBIT itself needs big-float precision. This is where "unlimited" actually lives. | beyond the float64 range the image stays correct and the sweep shows no spike | **deferred until/unless >1e15 is wanted** |
 | **D6** | **Align the CPU and GPU sample points.** `FractalKernel.pixelToCoord` samples pixel CORNERS while the shader samples CENTRES, so the two renderers disagree by 1.26% (1e3) / 9.0% (1e5) — **more than the GPU's float32 error at shallow zoom**, and it inflates the parity pins' tolerances. | CPU and GPU agree at the same sample points to the float32 floor; the parity pins' thresholds can tighten and are tightened | queued |
 
 ### Acceptance criterion for EVERY slice (the owner's requirement, made measurable)
@@ -98,28 +101,30 @@ zooms beyond 1e10, non-Mandelbrot types, the CPU/3D paths, interactive FPS, and 
 hazards (FMA contraction, `mediump` fallback — on GPUs without fragment `highp` the cliff
 is far worse than 1e4).
 
-## 6 · THE FORK (for the owner — the evidence changed the answer)
-The owner picked C when the alternatives were unmeasured. Now:
+## 6 · DECISION (owner, 2026-09-21) — Route 2: perturbation now
+The owner was shown the measured fork and chose **Route 2: go straight to perturbation**, taking the
+only route past ~1e10 and accepting that it is unmeasured here and that its rebasing is itself a
+pop mechanism. The compensated route is therefore **not built** — but the probe's compensation
+measurements are retained, because P1's delta arithmetic needs exactly that kind of compensation.
 
-- **Route 1 — staged (RECOMMENDED).** D1 (continuous colour, in flight) → D2 (budget) →
-  **D3 compensated float32**: measured to ≥1e10, i.e. ~1e6× deeper than today, in one
-  self-contained shader change with **no reference orbit, no glitch detection, no
-  rebasing** — so the only hop is the plain→compensated switch, which D1's continuity plus
-  a threshold chosen where the error is already sub-pixel makes invisible. Then, only if
-  zoom beyond ~1e10 is actually wanted, build the reference-orbit machinery.
-- **Route 2 — perturbation now (as originally chosen).** The only route beyond ~1e10, but
-  unmeasured, needs >float64 reference orbits (big-float on the CPU), glitch detection and
-  **exact rebasing** — and rebasing is precisely a visible-pop mechanism, so it carries the
-  hop risk the owner explicitly wants avoided and needs the continuity design anyway.
+**Honest scope of what this buys.** With a **float64 reference orbit** the practical reach is
+roughly **1e15** — the orbit needs about as many digits as the zoom — i.e. about 1e11× beyond
+today's 1e4 cap. Past ~1e15 the *orbit itself* needs big-float precision, which is P6 and is
+deferred. "Unlimited" lives at P6, not at P1.
 
-**Recommendation: Route 1.** It reaches a depth no user will exhaust in normal use, for far
-less work and with materially less pop risk, and it does not foreclose perturbation later —
-D5 simply moves behind D3. Rejected: Route 2 now, because it buys zoom we have measured
-nothing about while taking on the machinery most likely to produce the exact artifact the
-requirement forbids.
+**Good news on the owner's specific worry.** While the orbit stays float64 there is **no precision
+hop inside the deep path at all** — the orbit is recomputed each view at a fixed precision. So the
+hop sources in this design are exactly two, and each is its own slice: the **path switch** (P3) and
+**rebasing** (P2). Continuity is enforced on those two by the acceptance criterion above, not by
+luck — and rebasing is where the risk actually lives, which is why it gets its own slice and its
+own "may only reduce error" pin rather than being folded into P1.
+
+**Also confirmed by the owner:** continuous colour as the ONLY mode, with no banded toggle. That is
+what D1 is already building.
 
 ## 7 · Out of scope
-WebGPU, WASM/SIMD kernels, and any change to the CPU kernel's float64 accuracy. The
-deliberately deferred items from the previous campaign (`MODERNIZATION.md` §3–§5) stay
-deferred unless a slice here proves one is required — in which case it goes to the owner as
-a fork, not in silently.
+WebGPU, WASM/SIMD kernels, and any change to the CPU kernel's float64 accuracy. The compensated
+float32 route is deliberately **not** built (owner decision, §6) though its measurements inform P1.
+The deliberately deferred items from the previous campaign (`MODERNIZATION.md` §3–§5) stay deferred
+unless a slice here proves one is required — in which case it goes to the owner as a fork, not in
+silently.
