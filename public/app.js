@@ -308,7 +308,7 @@ function applyLoadedRecord(loc) {
   // the readout never promises more than the renderers honour (S3/B5).
   maxIterSlider.value = String(loc.maxIter);
   viewer.setMaxIter(parseInt(maxIterSlider.value, 10));
-  maxIterValue.textContent = String(viewer.maxIter);
+  updateMaxIterReadout();
   // Switch (or keep) the renderer for the record, then render exactly once.
   updateWebGLState();
   if (webglCheckbox.checked) renderWebGL();
@@ -633,6 +633,24 @@ function exit3DMode() {
 
 function updateInfo(view) {
   infoElem.textContent = `Center: (${view.centerX.toFixed(5)}, ${view.centerY.toFixed(5)})  Zoom: ${(1/view.scale).toFixed(2)}`;
+  // D2: the iteration readout reports the budget the NEXT job will run at — which
+  // may be higher than the slider's value, because the slider is a FLOOR and the
+  // zoom-derived floor raises it. The "(auto)" mark is what makes the UI honest
+  // about which of the two is in force; without it the slider would silently show
+  // a number the renderer is not using.
+  updateMaxIterReadout();
+}
+
+function updateMaxIterReadout() {
+  if (!maxIterValue) return;
+  const floor = viewer.maxIterFloor;
+  const effective = viewer.maxIter;
+  maxIterValue.textContent = effective > floor ? `${effective} (auto)` : String(effective);
+  if (maxIterValue.title !== undefined) {
+    maxIterValue.title = effective > floor
+      ? `raised from the slider's ${floor} to ${effective} for this zoom (the slider sets a floor)`
+      : '';
+  }
 }
 
 // --- Non-modal failure / status surface (S1/B9) ---
@@ -1112,14 +1130,16 @@ viewer.setColorOffset(0);
 if (fractal3D && fractal3D.setColorOffset) fractal3D.setColorOffset(0);
 
 // Set initial slider value and display
-maxIterSlider.value = viewer.maxIter;
-maxIterValue.textContent = viewer.maxIter;
+maxIterSlider.value = viewer.maxIterFloor;
+updateMaxIterReadout();
 
 maxIterSlider.addEventListener('input', () => {
   // `setMaxIter` applies the kernel's ONE clamp; the slider cannot exceed the cap,
-  // but the stored value must still be the clamped one (S3/B5).
+  // but the stored value must still be the clamped one (S3/B5). D2: the value is
+  // stored as the FLOOR and the readout shows the effective (possibly auto-raised)
+  // budget, so the slider never silently promises a number the job does not use.
   viewer.setMaxIter(parseInt(maxIterSlider.value, 10));
-  maxIterValue.textContent = viewer.maxIter;
+  updateMaxIterReadout();
   startFractalCalculationWithTiming();
 });
 
@@ -1476,6 +1496,40 @@ window.__fv = Object.freeze({
   // site in it — so the suite can see the template, not just the constant.
   maxIterCap: FractalKernel.MAX_ITER,
   maxIter: () => viewer.maxIter,
+  // --- D2 zoom-scaled-budget observables (measured, never inferred) ---
+  // `maxIterFloor` is the user's slider value; `maxIter` above is the budget the
+  // next job will run at. They differ exactly when the zoom-derived floor raised it.
+  maxIterFloor: () => viewer.maxIterFloor,
+  // The pure rule, so a pin can check monotonicity and the cap WITHOUT a view change.
+  iterBudgetForScale: (scale) => FractalKernel.iterBudgetForScale(scale),
+  // The floor the CURRENT view asks for (MIN_ITER means "no floor").
+  iterBudget: () => FractalKernel.iterBudgetForScale(viewer.view.scale),
+  iterBudgetPerDecade: FractalKernel.ITER_BUDGET_PER_DECADE,
+  // The scale of the shipped GPU zoom cap, below which the floor starts. A pin
+  // holds this equal to `minScale` so the rule cannot silently drift from the cap.
+  iterBudgetMinScale: FractalKernel.ITER_BUDGET_MIN_SCALE,
+  // D2 colour-table cost, counted: builds of the table and of the reused ImageData,
+  // and the entry count of the table the last build produced (sized by the cap the
+  // frame was indexed at, never by the module maximum).
+  colorTableBuilds: () => viewer.colorTableBuilds,
+  colorTableEntries: () => viewer.colorTableEntries(),
+  colorImageDataBuilds: () => viewer.colorImageDataBuilds,
+  // The kernel's ONE table stride, so the cost pin derives the expected entry count
+  // instead of restating it.
+  colorLutStride: FractalKernel.COLORS_LUT_STRIDE,
+  // Drive the REAL view/render/budget path at a scale the shipped GPU zoom cap does
+  // not admit, bypassing ONLY that clamp — which is not part of this slice (P4 lifts
+  // it). The view object, the budget rule, the worker job, the kernel and the colour
+  // path are the production ones; this adds no production path, and the clamp is
+  // restored before the call returns.
+  setDeepView: (view) => {
+    viewer.setZoomLimit(null, null);
+    try {
+      viewer.setView({ ...viewer.view, ...view });
+    } finally {
+      viewer.setZoomLimit(WEBGL_MIN_SCALE, handleZoomLimitReached);
+    }
+  },
   shaderMaxIter: () => (webglRenderer ? webglRenderer.shaderMaxIter : null),
   shaderLoopBounds: () => (webglRenderer && webglRenderer.shaderLoopBounds
     ? webglRenderer.shaderLoopBounds.slice()

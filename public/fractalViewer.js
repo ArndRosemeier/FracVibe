@@ -26,7 +26,23 @@ function FractalViewer(canvas, infoCallback) {
   // D1: a Float32Array of SMOOTH (continuous) escape values, with NaN in the
   // cells the worker has not calculated yet (an Int32Array cannot hold the value).
   this.imageData = null;
-  this.maxIter = FractalKernel.clampMaxIter(512);
+  // D2: `maxIterFloor` is the USER's slider value and `maxIter` is the budget the
+  // next job runs at. They differ when the zoom-derived floor raises the budget
+  // above the slider (see refreshBudget and kernel.iterBudgetForScale); the frame
+  // currently on screen is always indexed at `maxIter` (D1 pin 6).
+  this.maxIterFloor = FractalKernel.clampMaxIter(512);
+  this.maxIter = FractalKernel.effectiveMaxIter(this.maxIterFloor, this.view.scale);
+  // D2: the colour table is built ONCE per (scheme, colour offset, cap) and reused;
+  // `colorTableBuilds` counts the builds so "the table is not rebuilt per frame" is
+  // measured, not inferred, and `_colorImage`/`_colorU32` reuse one ImageData and
+  // its 32-bit view instead of allocating them on every render (MODERNIZATION.md's
+  // per-frame-allocation finding). Both counters are read through `window.__fv`.
+  this.colorTableBuilds = 0;
+  this.colorImageDataBuilds = 0;
+  this._colorTable = null;
+  this._colorTableKey = null;
+  this._colorImage = null;
+  this._colorU32 = null;
   this.fractalType = 'mandelbrot';
   this.juliaParams = { c: [-0.4, 0.6] };
   this.colorScheme = 'rainbow';
@@ -88,6 +104,7 @@ FractalViewer.prototype.setZoomLimit = function(minScale, onLimitReached) {
 FractalViewer.prototype.setView = function(view) {
   const { scale, clamped } = this.clampScale(view.scale);
   this.view = { ...view, scale };
+  this.refreshBudget();
   this.render();
   if (this.infoCallback) this.infoCallback(this.view);
   if (clamped && this.onZoomLimit) this.onZoomLimit(this.view);
@@ -105,10 +122,27 @@ FractalViewer.prototype.setData = function(iterArray, maxIter) {
 // The ONE way an iteration count is stored in the 2D viewer. The clamp lives in
 // the kernel (public/fractalKernel.js), which also bounds the worker chunk, the
 // 3D heightmap and the shader, so the UI, both CPU paths and the GPU cannot
-// disagree about what "the cap" is (S3/B5). Returns the clamped value so callers
-// can reflect it in the slider readout.
+// disagree about what "the cap" is (S3/B5). Returns the budget the next job will
+// run at.
+//
+// D2: the value passed here is the USER's slider value and is kept as a FLOOR; the
+// effective budget is the floor raised by the zoom (refreshBudget). The floor is
+// what a saved record stores, and the zoom re-derives the effective budget from it
+// on load — so a location saved at a deep view does not freeze a cap that a
+// different zoom would make wrong.
 FractalViewer.prototype.setMaxIter = function(value) {
-  this.maxIter = FractalKernel.clampMaxIter(value);
+  this.maxIterFloor = FractalKernel.clampMaxIter(value);
+  this.refreshBudget();
+  return this.maxIter;
+};
+
+// Recompute the effective budget from the user's floor and the current zoom. D2:
+// the zoom-derived floor may raise the budget above the slider; MAX_ITER bounds
+// both. Called on every path that changes the scale (setView, the wheel) and on
+// setMaxIter, and NOT on setData — a finished frame is indexed at the cap its own
+// job ran at (D1 pin 6), so `maxIter` is overwritten there, deliberately.
+FractalViewer.prototype.refreshBudget = function() {
+  this.maxIter = FractalKernel.effectiveMaxIter(this.maxIterFloor, this.view.scale);
   return this.maxIter;
 };
 
@@ -184,6 +218,7 @@ FractalViewer.prototype.onWheel = function(e) {
   zoomView(this.view, zoom);
   const { scale, clamped } = this.clampScale(this.view.scale);
   this.view.scale = scale;
+  this.refreshBudget();
   this.render();
   if (this.infoCallback) this.infoCallback(this.view);
   if (clamped && this.onZoomLimit) this.onZoomLimit(this.view);
@@ -197,19 +232,39 @@ FractalViewer.prototype.onWheel = function(e) {
 // 1/255 unit. It is also the ONLY place the palette is evaluated, so the pixel
 // loop below is a lookup — the same shape the old integer LUT had, at a resolution
 // that cannot alias. The uncalculated placeholder is the table's last index.
+//
+// D2: the table is sized by THIS frame's cap — `colorTableSize(maxIter)`, never the
+// module MAXIMUM — and cached under (scheme, colour offset, cap), so a progressive
+// job's 4 frames, a resize repaint or a repeated render do not rebuild it. The
+// build count and the entry count are exposed (`colorTableBuilds`,
+// `colorTableEntries`) so the cost claim is measured, and a key change still
+// rebuilds (the cache is not a way to render the wrong palette).
 FractalViewer.prototype.buildColorTable = function() {
-  const size = this.maxIter * FractalKernel.COLORS_LUT_STRIDE + 1;
+  const cap = this.maxIter;
+  const key = this.colorScheme + '|' + this.colorOffset + '|' + cap;
+  if (this._colorTable && this._colorTableKey === key) return this._colorTable;
+  const size = FractalKernel.colorTableSize(cap);
   // size real entries + 1 inside-the-set entry + 1 uncalculated-placeholder entry.
   const table = new Uint32Array(size + 2);
   for (let i = 0; i < size; ++i) {
-    table[i] = FractalKernel.toRGBA(FractalKernel.colorAtLutIndex(i, this.maxIter, this.colorScheme, this.colorOffset));
+    table[i] = FractalKernel.toRGBA(FractalKernel.colorAtLutIndex(i, cap, this.colorScheme, this.colorOffset));
   }
   // Entry `size` is exactly maxIter: the point never escaped, so it is black
   // (matching the GPU's `iter == u_maxIter` test), and index `size + 1` is the
   // "not yet calculated" placeholder — NaN is not a smooth value at all.
   table[size] = FractalKernel.toRGBA([0, 0, 0]);
   table[size + 1] = FractalKernel.toRGBA(FractalKernel.UNCALCULATED_COLOR);
+  this._colorTable = table;
+  this._colorTableKey = key;
+  this.colorTableBuilds++;
   return table;
+};
+
+// The size in ENTRIES of the table the last build produced (null before any build).
+// Read through `window.__fv` so the D2 pin can hold the allocation to the JOB's cap
+// rather than the module maximum.
+FractalViewer.prototype.colorTableEntries = function() {
+  return this._colorTable ? this._colorTable.length : null;
 };
 
 FractalViewer.prototype.render = function() {
@@ -232,8 +287,18 @@ FractalViewer.prototype.render = function() {
   const placeholderIndex = table.length - 1;
   const cap = this.maxIter;
   try {
-    const img = this.ctx.createImageData(this.width, this.height);
-    const buf32 = new Uint32Array(img.data.buffer);
+    // D2: reuse ONE ImageData and its Uint32 view while the backing store size is
+    // unchanged. Every entry is written below, so no stale pixel can survive. This
+    // is the second half of MODERNIZATION.md's per-frame-allocation finding; the
+    // build is counted so a regression to per-render allocation is measurable.
+    let img = this._colorImage;
+    if (!img || img.width !== this.width || img.height !== this.height) {
+      img = this.ctx.createImageData(this.width, this.height);
+      this._colorImage = img;
+      this._colorU32 = new Uint32Array(img.data.buffer);
+      this.colorImageDataBuilds++;
+    }
+    const buf32 = this._colorU32;
     for (let i = 0; i < buf32.length; ++i) {
       const value = this.imageData[i];
       // NaN is the "not yet calculated" sentinel (it used to be -1). It is NOT a

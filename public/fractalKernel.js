@@ -30,7 +30,16 @@
   // (webglFractal.js). Before S3 the slider allowed 2000 while the shader looped
   // to a hardcoded 1024, so every pixel that needed more than 1024 iterations was
   // silently coloured as if it had escaped (finding B5).
-  const MAX_ITER = 2000;
+  //
+  // D2 raised it 2000 -> 8192. The zoom-scaled budget below (§D2) needs more than
+  // 2000 to resolve a deep view — the probe's view centre escapes only at iteration
+  // 3086 — and it asks for 4096 at zoom 1e8 and 7680 at zoom 1e15 (the practical
+  // reach of a float64 reference orbit, P6). 8192 is the smallest power of two that
+  // lets the RULE, not the cap, decide over that whole reachable range, so nothing
+  // reachable is truncated by the cap. Raising the cap alone does NOT raise any
+  // frame's cost: a job still runs at its own (scaled) budget, and the colour table
+  // is sized by that job's cap, never by this maximum (see colorTableSize below).
+  const MAX_ITER = 8192;
   const MIN_ITER = 1;
   const BAILOUT = 4;
   // The escape radius squared at which the iteration test fires. ONE constant,
@@ -128,6 +137,56 @@
     return n;
   }
 
+  // --- D2: the zoom-scaled iteration budget -----------------------------------
+  // The probe proved the iteration budget — not precision — masks deep zoom today:
+  // its view centre escapes only at iteration 3086 (float64, stable across budgets
+  // 2e4..2e6), so at the shipped budget of 512 the centre is called "inside" and a
+  // 1e8 frame is 100% black. Measured here with this kernel: the probe's centre at
+  // scale 1e-8 is 100.0% inside at cap 512 and 0.0% inside at cap 4096, and 1e6/512
+  // is 90.9% inside. Until the budget follows the zoom, no deep view is meaningful
+  // at any arithmetic precision (docs/PROBE-2026-09-21-gpu-precision.md item 7).
+  //
+  // THE RULE. The budget is `max(the user's slider value, floor(zoom))`: the
+  // slider's value is a FLOOR, and the floor may raise the effective budget above
+  // it. The floor is OFF at and above the app's shipped GPU zoom cap — the probe
+  // measured no saturation there (1e4/512 = 0.7% inside) and D1's pins deliberately
+  // hold a cap of 50 at zooms up to 1e4 to make one iteration a visible colour band,
+  // so a floor there would silently override an explicit user budget and destroy the
+  // band those pins measure. Below that scale it grows 512 iterations per DECADE of
+  // zoom. Why that shape: the escape count of an exterior point goes as log2(1/d)
+  // for the quadratic map, so the budget must be linear in the LOGARITHM of the
+  // zoom, not in the zoom; one decade of zoom is 3.32 doublings of the boundary
+  // distance, and 512 per decade is 154 per doubling, which covers the probe's
+  // measured 3086 with the budget it actually needed:
+  //     zoom 1e5 -> 2560     zoom 1e6 -> 3072     zoom 1e8 -> 4096
+  //     zoom 1e9 -> 4608     zoom 1e12 -> 6144    zoom 1e15 -> 7680
+  // 4096 at 1e8 is EXACTLY the budget the probe used to turn that 100%-black frame
+  // into a real one, and 3086 < 4096, so the centre escapes.
+  const ITER_BUDGET_PER_DECADE = 512;
+  // The scale of the app's GPU zoom cap (`WEBGL_ZOOM_CAP = 10000` in app.js ->
+  // `WEBGL_MIN_SCALE = 1 / WEBGL_ZOOM_CAP`). The floor starts strictly BELOW this
+  // scale, so a view clamped at the cap gets no floor at all. This is the one
+  // number this rule shares with app.js; it is not a silent duplicate: a pin holds
+  // `iterBudgetMinScale` exactly equal to `window.__fv.minScale`, so the slice that
+  // lifts the zoom cap (P4) is forced to revisit the rule.
+  const ITER_BUDGET_MIN_SCALE = 1e-4;
+
+  // The FLOOR the zoom asks for, clamped to [MIN_ITER, MAX_ITER]. `MIN_ITER` means
+  // "no floor": the user's slider value is the whole budget. Monotone non-decreasing
+  // as the scale falls (the zoom rises), with one step at the shipped zoom cap.
+  function iterBudgetForScale(scale) {
+    if (typeof scale !== 'number' || !isFinite(scale) || scale <= 0) return MIN_ITER;
+    if (!(scale < ITER_BUDGET_MIN_SCALE)) return MIN_ITER;
+    return clampMaxIter(Math.ceil(ITER_BUDGET_PER_DECADE * Math.log10(1 / scale)));
+  }
+
+  // The budget a job actually runs at. The user's slider value is a FLOOR: the
+  // zoom-derived floor raises it, and the ONE cap bounds both. A caller that wants
+  // the user's own value (for a readout or a saved record) asks for it directly.
+  function effectiveMaxIter(maxIter, scale) {
+    return Math.max(clampMaxIter(maxIter), iterBudgetForScale(scale));
+  }
+
   function findIndex(table, value) {
     for (let i = 0; i < table.length; ++i) {
       if (table[i].value === value) return table[i].index;
@@ -208,15 +267,26 @@
   // half-stride palette step — at 256 steps/iteration for a palette whose fastest
   // segment changes ~1/255 per 1/255 of t, under 1 RGB unit out of 255, i.e. below
   // the quantisation the canvas can display at all — and it does NOT grow with
-  // maxIter (a maxIter-proportional table WOULD: at maxIter 2000 it could not
+  // maxIter (a maxIter-proportional table WOULD: at maxIter 8192 it could not
   // resolve neighbouring escape values at all). See docs/DECISIONS.md row 27.
   const COLORS_LUT_STRIDE = 256;
-  // +1 for the inside-the-set entry at exactly maxIter.
-  const COLORS_LUT_SIZE = MAX_ITER * COLORS_LUT_STRIDE + 1;
   // The colour an uncalculated cell is painted with. Deliberately NOT a palette
   // colour, so a cell the worker has not reached can never be mistaken for a
   // rendered value (pinned by tests/smooth-color.spec.js).
   const UNCALCULATED_COLOR = [40, 40, 40];
+
+  // --- D2: the colour table is sized by the cap A JOB RAN AT -------------------
+  // D1 exported `COLORS_LUT_SIZE = MAX_ITER * STRIDE + 1`, the size of a table for
+  // the module MAXIMUM. Nothing allocated it, but it named the wrong quantity: at
+  // MAX_ITER 8192 it would be 2 097 153 entries (~8 MB) for EVERY frame, whatever
+  // cap that frame actually ran at. The table a frame needs is a function of ITS
+  // cap (D1's pin 6: a finished frame is indexed at its own job's cap), so the size
+  // is a function, not a constant, and the renderer allocates only that (plus one
+  // placeholder entry) and reuses it while the key (scheme, offset, cap) holds.
+  // +1 is the inside-the-set entry at exactly maxIter.
+  function colorTableSize(maxIter) {
+    return clampMaxIter(maxIter) * COLORS_LUT_STRIDE + 1;
+  }
 
   // The LUT entry a smooth value maps to:
   //   0 .. cap*STRIDE - 1   an escaped value (palette colour)
@@ -415,7 +485,13 @@
     // templated with, so both renderers evaluate the identical expression.
     SMOOTH_LOG_BAILOUT: SMOOTH_LOG_BAILOUT,
     COLORS_LUT_STRIDE: COLORS_LUT_STRIDE,
-    COLORS_LUT_SIZE: COLORS_LUT_SIZE,
+    // D2: the size of the table a frame at THIS cap needs (a function, not the
+    // module-maximum constant D1 exported), and the zoom-scaled budget rule.
+    colorTableSize: colorTableSize,
+    ITER_BUDGET_PER_DECADE: ITER_BUDGET_PER_DECADE,
+    ITER_BUDGET_MIN_SCALE: ITER_BUDGET_MIN_SCALE,
+    iterBudgetForScale: iterBudgetForScale,
+    effectiveMaxIter: effectiveMaxIter,
     UNCALCULATED_COLOR: Object.freeze(UNCALCULATED_COLOR.slice()),
     FRACTAL_TYPES: Object.freeze(FRACTAL_TYPES),
     COLOR_SCHEMES: Object.freeze(COLOR_SCHEMES),

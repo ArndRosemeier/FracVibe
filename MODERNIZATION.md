@@ -181,8 +181,8 @@ overrides" is what was true, not that the dead code was `fractalEngine.js` itsel
 override in `fractalWorker.js` is gone (that file went 127 → 69 lines), and the type/palette
 tables live in the kernel and are templated into the GLSL as `#define FT_*` / `#define CS_*`.
 The GLSL remains the one documented exception. Pinned by `tests/kernel-parity.spec.js` pins 2–3.
-Still open in this section: per-frame allocation in the 2D renderer, the per-pass buffer copies
-/ single worker, and the prefix/`colorSchemes.js` re-export.
+Still open in this section: the per-pass buffer copies / single worker and the prefix/`colorSchemes.js`
+re-export (the per-frame allocation in the 2D renderer was closed by D2, below).
 
 **Per-frame allocation in the 2D renderer.** `FractalViewer.render()` rebuilds its colour
 table and calls `ctx.createImageData(w,h)` on every call — including every `mousemove`
@@ -197,9 +197,20 @@ entry per INTEGER iteration. It is built over the **quantised continuous escape 
 `COLORS_LUT_STRIDE = 256` entries per iteration — a fixed resolution independent of
 `maxIter`, plus an inside entry and a `NaN` placeholder — because the buffer is now a
 `Float32Array` of smooth values and an integer LUT cannot index it (`docs/DECISIONS.md`
-row 27). The allocation is still per render, so this finding stands; the table is larger
-(at `maxIter` 2000: 512 002 entries ≈ 2 MB) and is therefore a *better* caching candidate
+row 27). The allocation was still per render at D1, so this finding stood then; the table was
+larger (at `maxIter` 2000: 512 002 entries ≈ 2 MB) and therefore a *better* caching candidate
 than before, not a worse one.
+*Fixed (D2, 2026-09-21):* the colour table is **sized by the cap the frame's own job ran at**
+(`FractalKernel.colorTableSize(maxIter)`, not the module maximum) and **cached on
+`(scheme, colour offset, cap)`**; one `ImageData` and its `Uint32Array` view are reused while
+the backing-store size holds. This matters more at D2's raised cap: sized by the module
+maximum (`MAX_ITER` = 8192) every frame would allocate 2 097 155 entries ≈ 8.0 MB whatever
+cap it ran at, where a 512-cap frame needs 131 075 entries (0.5 MB) and the rule's 4096-cap
+deep frame needs 1 048 579 (4.0 MB). Measured by `tests/iter-budget.spec.js` pin 3 through the
+app's own counters: five consecutive renders at the same key build **zero** tables and **zero**
+`ImageData`, a palette change builds exactly one (so the counter is live), and the deep
+frame's table is 4.0 MB, not 8.0 MB. `docs/DECISIONS.md` row 32. The remaining render-path
+allocation is the per-pass buffer copy in the next paragraph, which is unchanged.
 
 **Progressive refinement copies the whole buffer per pass** (`fractalWorker.js:12`
 `job.prior.slice()`, plus `{...job, chunk}` per chunk) and runs on a single worker. A
