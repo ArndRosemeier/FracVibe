@@ -1,5 +1,10 @@
 # Ignore node_modules, build, and system files
 node_modules/
+# The pattern above ends in a slash, so it matches DIRECTORIES only. Writer
+# worktrees symlink their dependencies instead of installing them, and a symlink
+# is not a directory — without this line `git status` shows node_modules as
+# untracked and a `git add -A` would commit the symlink.
+node_modules
 build/
 dist/
 .env
