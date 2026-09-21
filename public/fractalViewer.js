@@ -1,5 +1,9 @@
 // Import color schemes (as ESM)
 import { colorSchemes } from './colorSchemes.js';
+// The ONE kernel: iteration cap, type table, palette table (see that file). It is
+// imported for its side effect because it deliberately has no `export`.
+import './fractalKernel.js';
+const FractalKernel = globalThis.FractalKernel;
 
 // FractalViewer: Handles canvas rendering, pan/zoom, and partial data display
 function FractalViewer(canvas, infoCallback) {
@@ -19,7 +23,7 @@ function FractalViewer(canvas, infoCallback) {
   this.onZoomLimit = null;
   this.view = { centerX: -0.5, centerY: 0, scale: 3 };
   this.imageData = null; // Int32Array of iterations
-  this.maxIter = 512;
+  this.maxIter = FractalKernel.clampMaxIter(512);
   this.fractalType = 'mandelbrot';
   this.juliaParams = { c: [-0.4, 0.6] };
   this.colorScheme = 'rainbow';
@@ -90,6 +94,16 @@ FractalViewer.prototype.setData = function(iterArray, maxIter) {
   this.imageData = iterArray;
   this.maxIter = maxIter;
   this.render();
+};
+
+// The ONE way an iteration count is stored in the 2D viewer. The clamp lives in
+// the kernel (public/fractalKernel.js), which also bounds the worker chunk, the
+// 3D heightmap and the shader, so the UI, both CPU paths and the GPU cannot
+// disagree about what "the cap" is (S3/B5). Returns the clamped value so callers
+// can reflect it in the slider readout.
+FractalViewer.prototype.setMaxIter = function(value) {
+  this.maxIter = FractalKernel.clampMaxIter(value);
+  return this.maxIter;
 };
 
 FractalViewer.prototype.setColorScheme = function(scheme) {

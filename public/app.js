@@ -1,9 +1,16 @@
 // Use ESM imports for all modules
 import { FractalViewer } from './fractalViewer.js';
 import { Fractal3DViewer } from './fractal3d.js';
-import { FractalEngine } from './fractalEngineMain.js';
+// The ONE kernel, shared with the classic render worker and the shader. It has no
+// `export` on purpose (so `importScripts` can load the same file), hence the
+// side-effect import + global read.
+import './fractalKernel.js';
 import { WebGLFractalRenderer } from './webglFractal.js';
 import { FractalMemoryRepository } from './memoryRepository.js';
+
+// The single source of truth for the iteration cap, the fractal-type table and
+// the palette table (public/fractalKernel.js).
+const FractalKernel = globalThis.FractalKernel;
 
 const canvas = document.getElementById('fractalCanvas');
 // `let`: a real WebGL context loss replaces this element (see swapCanvasWebGL).
@@ -29,6 +36,27 @@ const importLocationsBtn = document.getElementById('importLocationsBtn');
 // These live in index.html; the modal is shown/hidden rather than built on demand.
 const savedLocationsList = document.getElementById('savedLocationsList');
 const locationSortSelect = document.getElementById('locationSortSelect');
+
+// --- S3: the ONE type/palette table and the ONE iteration cap ---------------
+// The <select> option lists and the slider's `max` are DERIVED from the kernel
+// (public/fractalKernel.js) instead of being restated in index.html. The UI can
+// then never name a fractal, a palette or an iteration count the renderers do not
+// honour. Before S3 index.html hardcoded max="2000" while the shader's loop bound
+// was a literal 1024, so everything above 1024 was silently mis-coloured (B5).
+function populateSelect(select, entries) {
+  select.innerHTML = '';
+  for (const entry of entries) {
+    const option = document.createElement('option');
+    option.value = entry.value;
+    option.textContent = entry.label;
+    select.appendChild(option);
+  }
+}
+populateSelect(typeSelect, FractalKernel.FRACTAL_TYPES);
+populateSelect(colorSchemeSelect, FractalKernel.COLOR_SCHEMES);
+// The slider's upper bound IS the kernel cap; the kernel clamps worker, 3D and
+// shader to the same number, so the UI cannot offer more than they honour.
+maxIterSlider.max = String(FractalKernel.MAX_ITER);
 
 function getCurrentLocationState() {
   return {
@@ -166,12 +194,16 @@ function renderSavedLocations() {
     loadBtn.style.cursor = 'pointer';
     loadBtn.addEventListener('click', () => {
       typeSelect.value = loc.fractalType;
-      maxIterSlider.value = loc.maxIter;
-      maxIterValue.textContent = loc.maxIter;
       webglCheckbox.checked = (loc.renderer === 'GPU');
       viewer.setFractal(loc.fractalType);
       viewer.setView({ centerX: loc.centerX, centerY: loc.centerY, scale: loc.scale });
-      viewer.maxIter = loc.maxIter;
+      // A saved/imported record can carry any iteration count. The slider clamps
+      // it to what the UI can display and the kernel clamps what is actually
+      // stored, so the readout never promises more than the renderers honour
+      // (S3/B5).
+      maxIterSlider.value = String(loc.maxIter);
+      viewer.setMaxIter(parseInt(maxIterSlider.value, 10));
+      maxIterValue.textContent = String(viewer.maxIter);
       if (webglCheckbox.checked) {
         updateWebGLState();
         // After changing mode, re-apply the loaded view
@@ -334,7 +366,7 @@ function getFractalParams() {
 function enter3DMode() {
   if (in3DMode) return;
   in3DMode = true;
-  fractal3D = new Fractal3DViewer(document.body, FractalEngine, getFractalParams);
+  fractal3D = new Fractal3DViewer(document.body, FractalKernel, getFractalParams);
   fractal3D.init();
   // Hide BOTH 2D canvases: three.js appends its own canvas to <body>, and a
   // visible in-flow canvas would push that one below the fold.
@@ -825,22 +857,18 @@ maxIterSlider.value = viewer.maxIter;
 maxIterValue.textContent = viewer.maxIter;
 
 maxIterSlider.addEventListener('input', () => {
-  viewer.maxIter = parseInt(maxIterSlider.value, 10);
+  // `setMaxIter` applies the kernel's ONE clamp; the slider cannot exceed the cap,
+  // but the stored value must still be the clamped one (S3/B5).
+  viewer.setMaxIter(parseInt(maxIterSlider.value, 10));
   maxIterValue.textContent = viewer.maxIter;
   startFractalCalculationWithTiming();
 });
 
-// --- Helper: Map color scheme string to shader index ---
-const colorSchemeMap = {
-  'rainbow': 0,
-  'fire': 1,
-  'ocean': 2,
-  'grayscale': 3,
-  'viridis': 4
-};
-
+// --- Helper: map a palette name to the shader's index ------------------------
+// The map itself lives in the kernel's COLOR_SCHEMES table (templated into the
+// shader as `#define CS_*`), so the CPU name and the GPU index cannot drift.
 function getColorSchemeIdx() {
-  return colorSchemeMap[viewer.colorScheme] ?? 0;
+  return FractalKernel.indexForColorScheme(viewer.colorScheme);
 }
 
 // --- S1: renderer selection and the WebGL failure path ------------------------
@@ -951,10 +979,11 @@ function renderWebGL() {
     return;
   }
   try {
-    // Map fractal type string to int
-    const typeMap = { mandelbrot: 0, julia: 1, burningship: 2, tricorn: 3 };
-    const fractalTypeInt = typeMap[viewer.fractalType] || 0;
-    const juliaParams = (fractalTypeInt === 1) ? viewer.juliaParams : undefined;
+    // The fractal-type index comes from the kernel's FRACTAL_TYPES table, which is
+    // the same table the shader's `#define FT_*` values are templated from, so a
+    // type name and its GLSL branch can never disagree (S3 pin 3).
+    const fractalTypeInt = FractalKernel.indexForType(viewer.fractalType);
+    const juliaParams = (fractalTypeInt === FractalKernel.indexForType('julia')) ? viewer.juliaParams : undefined;
     renderingWebGL = true;
     webglRenderer.render(
       viewer.view,
@@ -1042,6 +1071,21 @@ window.__fv = Object.freeze({
   minScale: WEBGL_MIN_SCALE,
   liveRenderers: () => (typeof window.__fvLiveWebglRenderers === 'number' ? window.__fvLiveWebglRenderers : 0),
   animationSettled: () => zoomAnimationSettled,
+  // --- S3 kernel observables (the ONE cap, observed not inferred) ---
+  // `maxIterCap` is the kernel constant the slider max, the clamps and the shader
+  // loop bound all derive from. `shaderMaxIter` is the value actually templated
+  // into the fragment source, and `shaderLoopBounds` the bound token of every loop
+  // site in it — so the suite can see the template, not just the constant.
+  maxIterCap: FractalKernel.MAX_ITER,
+  maxIter: () => viewer.maxIter,
+  shaderMaxIter: () => (webglRenderer ? webglRenderer.shaderMaxIter : null),
+  shaderLoopBounds: () => (webglRenderer && webglRenderer.shaderLoopBounds
+    ? webglRenderer.shaderLoopBounds.slice()
+    : null),
+  // The kernel's own tables, so a test can drive every supported type/palette
+  // without restating the list in a second fixture.
+  fractalTypes: () => FractalKernel.FRACTAL_TYPES.map((t) => t.value),
+  colorSchemes: () => FractalKernel.COLOR_SCHEMES.map((s) => s.value),
   // --- S2 worker observables (counted, never inferred) ---
   // How many Workers this page has constructed, and how many live jobs a terminate
   // killed. A cancellation is proven by the second number going up, not by watching

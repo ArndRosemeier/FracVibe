@@ -15,22 +15,16 @@
   </div>
   <div id="controls">
     <label for="fractalType">Fractal:</label>
-    <select id="fractalType">
-      <option value="mandelbrot">Mandelbrot</option>
-      <option value="julia">Julia</option>
-      <option value="burningship">Burning Ship</option>
-      <option value="tricorn">Tricorn</option>
-    </select>
+    <!-- No <option> markup: app.js populates both selects from the kernel's ONE
+         type/palette table (public/fractalKernel.js), so no name is restated here. -->
+    <select id="fractalType"></select>
     <label for="colorScheme">Color Scheme:</label>
-    <select id="colorScheme">
-      <option value="rainbow">Rainbow</option>
-      <option value="fire">Fire</option>
-      <option value="ocean">Ocean</option>
-      <option value="grayscale">Grayscale</option>
-      <option value="viridis">Viridis</option>
-    </select>
+    <select id="colorScheme"></select>
     <label for="maxIter">Iterations:</label>
-    <input type="range" id="maxIter" min="50" max="2000" value="256" step="1" style="vertical-align:middle;">
+    <!-- No `max` attribute: app.js sets it from the kernel's MAX_ITER, the same
+         constant the worker, the 3D heightmap and the shader loop bound derive
+         from. The old hardcoded max="2000" was the UI half of B5. -->
+    <input type="range" id="maxIter" min="50" value="256" step="1" style="vertical-align:middle;">
     <span id="maxIterValue">256</span>
     <label for="cycleColors"><input type="checkbox" id="cycleColors" checked> Cycle Colors</label>
     <label for="webglRender"><input type="checkbox" id="webglRender" checked> WebGL GPU Rendering</label>

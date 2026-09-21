@@ -1,4 +1,8 @@
-importScripts('fractalEngine.js');
+// The worker is CLASSIC (app.js: `new Worker('fractalWorker.js')`), so the kernel
+// it loads must be a classic script. public/fractalKernel.js deliberately has no
+// import/export, so this same file is also a valid ES module for the main thread
+// (see the header of that file and docs/DECISIONS.md row 14).
+importScripts('fractalKernel.js');
 
 // --- S2: progressive refinement that is actually visible -------------------------
 // The job is one gridStep 8 -> 4 -> 2 -> 1 refinement sequence over a SINGLE buffer.
@@ -48,7 +52,7 @@ onmessage = function(e) {
     for (let offset = 0; offset < indices.length; offset += chunkSize) {
       if (abortFlag) return;
       jobForLevel.chunk = indices.slice(offset, offset + chunkSize);
-      self.calcFractalChunk(jobForLevel, result);
+      self.FractalKernel.calcFractalChunk(jobForLevel, result);
     }
     const isFinal = l === levels.length - 1;
     // The final level transfers the buffer; every earlier level copies it. The
@@ -61,67 +65,5 @@ onmessage = function(e) {
     };
     if (isFinal) postMessage(msg, [result.buffer]);
     else postMessage(msg);
-  }
-};
-
-// Helper for chunked calculation
-self.calcFractalChunk = function(job, result) {
-  const width = job.width, height = job.height;
-  const chunk = job.chunk;
-  const type = job.type;
-  const maxIter = job.maxIter;
-  const bailout = 4;
-  const view = job.view;
-  const params = job.params;
-  const aspect = width / height;
-  const scale = view.scale;
-  let c_julia_x, c_julia_y;
-  if (type === 'julia' && params && params.c) {
-    c_julia_x = params.c[0];
-    c_julia_y = params.c[1];
-  }
-  for (let i = 0; i < chunk.length; ++i) {
-    const idx = chunk[i];
-    if (result[idx] !== -1) continue;
-    // Inline pixelToCoord
-    const x = idx % width;
-    const y = Math.floor(idx / width);
-    let cx = view.centerX + (x - width/2) * scale / width * aspect;
-    let cy = view.centerY + (y - height/2) * scale / height;
-    let zx, zy;
-    if (type === 'mandelbrot') {
-      zx = 0; zy = 0;
-    } else if (type === 'julia') {
-      zx = cx; zy = cy; cx = c_julia_x; cy = c_julia_y;
-    } else if (type === 'burningship') {
-      zx = 0; zy = 0;
-    } else if (type === 'tricorn') {
-      zx = 0; zy = 0;
-    } else {
-      zx = 0; zy = 0;
-    }
-    let iter = 0;
-    let escape = false;
-    while (iter < maxIter) {
-      let zx2 = zx * zx, zy2 = zy * zy;
-      if (zx2 + zy2 > bailout) { escape = true; break; }
-      if (type === 'mandelbrot') {
-        zy = 2*zx*zy + cy;
-        zx = zx2 - zy2 + cx;
-      } else if (type === 'julia') {
-        zy = 2*zx*zy + cy;
-        zx = zx2 - zy2 + cx;
-      } else if (type === 'burningship') {
-        zy = Math.abs(2*zx*zy) + cy;
-        zx = zx2 - zy2 + cx;
-        zx = Math.abs(zx);
-        zy = Math.abs(zy);
-      } else if (type === 'tricorn') {
-        zy = -2*zx*zy + cy;
-        zx = zx2 - zy2 + cx;
-      }
-      iter++;
-    }
-    result[idx] = escape ? iter : maxIter;
   }
 };
