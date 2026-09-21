@@ -146,6 +146,9 @@ test.describe('GPU diagnostic (hardware-certification instrument)', () => {
     // CDP delivers console events asynchronously, so wait for the block rather
     // than racing it against the status flip.
     await expect.poll(() => consoleTexts.length, { timeout: 10_000 }).toBe(1);
+    // Echo the EXACT block into the runner log, so the gate log carries the
+    // software baseline the owner's hardware report is compared against.
+    console.log('\n' + consoleTexts[0] + '\n');
     assertStructure(report, consoleTexts[0]);
 
     expect(pageErrors, 'no uncaught page error').toEqual([]);
