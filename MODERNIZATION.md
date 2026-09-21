@@ -117,9 +117,13 @@ of rebuilding, so a colour tick performs **zero** fractal evaluations and builds
 `PlaneGeometry`. The result is unchanged by construction: a rebuild ends in the same
 `applyColors()` the colour tick uses, so there is one palette mapping, not two. Pinned by
 `tests/3d-truth.spec.js` — a counted evaluation total that must not advance across real
-colour-cycle ticks (non-vacuous: the ticks and the 3D offset are counted too), and a
-sampled colour-attribute comparison against `FractalKernel.paletteFunction` derived from
-the geometry's own vertex heights, tolerance 1/255. Deliberately NOT taken: a 3D palette
+colour-cycle ticks (non-vacuous: the ticks and the 3D offset are counted too), a sampled
+colour-attribute comparison against `FractalKernel.paletteFunction` derived from the
+geometry's own vertex heights (tolerance 1/255), and an UPLOAD check that the colour
+buffer's three.js `BufferAttribute.version` advances on every tick. The upload check was
+added after the dispatcher's probe showed the value comparison alone cannot see a missing
+`attr.needsUpdate = true;` — the CPU array stays correct while the GPU mesh freezes
+(`docs/DECISIONS.md` row 24). Deliberately NOT taken: a 3D palette
 shader uniform, which the paragraph above allows but which rewrites the `MeshStandardMaterial`
 and its GLSL for no behaviour this slice needs (`docs/DECISIONS.md` row 21).
 
@@ -256,9 +260,9 @@ All are reasonable later; none are needed to fix the current defects.
 ## 6. Reproducing the checks
 
 ```bash
-# full suite: 38 tests — the B1–B3 smoke tests (tests/smoke.spec.js) plus the
+# full suite: 39 tests — the B1–B3 smoke tests (tests/smoke.spec.js) plus the
 # S1–S5 pins (tests/*.spec.js); per-slice counts are in docs/PLAN.md
-npm test                      # expects 38 passed
+npm test                      # expects 39 passed
 # Uses host Chrome via `channel: 'chrome'` in playwright.config.js, so no browser
 # download is needed; elsewhere run `npx playwright install chromium` and drop the channel.
 

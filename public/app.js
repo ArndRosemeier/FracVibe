@@ -1281,6 +1281,17 @@ window.__fv = Object.freeze({
       b: col.getZ(i)
     }));
   },
+  // three.js `BufferAttribute.version`: it is incremented by `needsUpdate = true`
+  // and `WebGLAttributes.update` re-uploads a buffer exactly when
+  // `cached.version < attribute.version`. So this counter observes whether a
+  // colour rewrite was actually MARKED FOR UPLOAD, which the CPU-side values in
+  // `sample3DTerrain` cannot show (a rewrite that never sets `needsUpdate` leaves
+  // the GPU mesh frozen with correct-looking array values).
+  colorAttributeVersion: () => {
+    const terrain = fractal3D && fractal3D.terrain;
+    const col = terrain && terrain.geometry && terrain.geometry.attributes.color;
+    return col ? col.version : -1;
+  },
   // Drive the REAL 3D colour paths with known values (the same way
   // `forceFallback` and `importPayload` drive theirs); adds no production path.
   set3DColorOffset: (offset) => {

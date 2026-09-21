@@ -1,11 +1,15 @@
 // @ts-check
-// S5 / B8 — 3D truth. Two independent guarantees:
+// S5 / B8 — 3D truth. Three independent guarantees:
 //
 //   1. A colour change (offset or scheme) rewrites the geometry's `color`
 //      attribute and NEVER re-evaluates the fractal. Observed by a counted
 //      heightmap-evaluation counter, never inferred from pixels or frame time.
 //   2. The rewrite is CORRECT: the colour attribute after an offset tick equals
 //      the kernel palette applied to the heights that are actually on the mesh.
+//   3. The rewrite is UPLOADED: the colour buffer is marked for a GPU re-upload
+//      on every tick (three.js `BufferAttribute.version`). Guarantee 2 reads the
+//      CPU-side array and so cannot see a rewrite that never reaches the GPU —
+//      the gap the dispatcher's probe found at `fractal3d.js` `applyColors`.
 //
 // The harness style is tests/smoke.spec.js's: drive the real app in the real
 // browser through `window.__fv`, never a second fixture set.
@@ -161,5 +165,60 @@ test('an offset tick rewrites the colour attribute to the palette values for the
   expect(check.maxDiff, `worst mismatch ${JSON.stringify(check.worst)}`).toBeLessThanOrEqual(PALETTE_TOLERANCE);
   // And the colour rewrite evaluated the fractal zero times.
   expect(check.callsAfter - check.callsBefore).toBe(0);
+  expect(pageErrors).toEqual([]);
+});
+
+// Guarantee 3 (added after the dispatcher's probe): the palette pin above reads
+// the geometry's `color` ARRAY, so `applyColors()` can compute every value
+// correctly and never set `attr.needsUpdate = true` — the array is right, the
+// GPU mesh stays frozen, and that pin still passes (measured: the dispatcher
+// deleted `needsUpdate` and both existing pins stayed GREEN). three.js re-uploads
+// a buffer exactly when `cached.version < attribute.version`, and `version` is
+// incremented by the `needsUpdate = true` setter, so the version counter observes
+// the mark-for-upload step that the values cannot. Deterministic (no pixels).
+test('every colour tick marks the colour buffer for GPU upload (attribute version advances)', async ({ page }) => {
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(String(err)));
+  await page.goto('./', { waitUntil: 'domcontentloaded' });
+  await waitForStartup(page);
+  await enter3D(page);
+
+  // Freeze the cycle (OFF by default, so this is usually a no-op) so each driven
+  // tick below is the only change to the colour state.
+  await page.uncheck('#cycleColors');
+
+  const start = await page.evaluate(() => ({
+    version: window.__fv.colorAttributeVersion(),
+    offset: window.__fv.colorOffset3D(),
+    scheme: window.__fv.colorScheme3D(),
+  }));
+
+  // (a) an offset tick through the REAL setter the colour cycle calls.
+  const afterOffset = await page.evaluate(() => {
+    const next = (window.__fv.colorOffset3D() + 0.25) % 1;
+    window.__fv.set3DColorOffset(next);
+    return { version: window.__fv.colorAttributeVersion(), offset: window.__fv.colorOffset3D() };
+  });
+  expect(afterOffset.offset, 'the offset tick really changed the colour').not.toBe(start.offset);
+  expect(
+    afterOffset.version,
+    'an offset tick must mark the colour buffer for upload (needsUpdate)'
+  ).toBeGreaterThan(start.version);
+
+  // (b) a scheme change through the REAL setter the dropdown uses.
+  const nextScheme = start.scheme === 'fire' ? 'ocean' : 'fire';
+  const afterScheme = await page.evaluate((scheme) => {
+    window.__fv.set3DColorScheme(scheme);
+    return { version: window.__fv.colorAttributeVersion(), scheme: window.__fv.colorScheme3D() };
+  }, nextScheme);
+  expect(afterScheme.scheme).toBe(nextScheme);
+  expect(
+    afterScheme.version,
+    'a scheme change must mark the colour buffer for upload (needsUpdate)'
+  ).toBeGreaterThan(afterOffset.version);
+
+  // The mesh built by init() must already have been marked for its first upload.
+  expect(start.version, 'the initial colour buffer must be marked for upload').toBeGreaterThan(0);
+
   expect(pageErrors).toEqual([]);
 });
