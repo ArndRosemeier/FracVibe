@@ -145,7 +145,7 @@ test('S2 pin: cancelling a running job applies no further frame from that job an
   expect(pageErrors).toEqual([]);
 });
 
-test('S2 pin: a worker that fails produces a visible message and a defined state, not a frozen canvas', async ({ page }) => {
+test('S2 pin: a worker that fails is reported AND self-heals on a fresh worker, not a frozen canvas', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (err) => pageErrors.push(String(err)));
   await page.goto('./', { waitUntil: 'domcontentloaded' });
@@ -159,30 +159,38 @@ test('S2 pin: a worker that fails produces a visible message and a defined state
   // the page's `#appMessage` text can only have come from the worker handler. (The
   // S1 window error net would also surface a *thrown* error, which is exactly why
   // the sentinel is asserted here rather than merely "a message appeared".)
-  await page.evaluate(() => window.__fv.failWorker('S2 worker-failure sentinel'));
+  //
+  // WORKER-CANCEL: a live worker failure must now SELF-HEAL — it retires the dead
+  // worker and retries the in-flight job on a fresh one, with no view change from
+  // the user. The retry starts synchronously inside the handler, so the new job id
+  // and generation are read in the same round-trip.
+  const after = await page.evaluate(() => {
+    window.__fv.failWorker('S2 worker-failure sentinel');
+    return { gen: window.__fv.workerGeneration(), jobId: window.__fv.jobCount(), token: window.__fv.jobToken(), live: window.__fv.liveWorkers() };
+  });
 
   const message = page.locator('#appMessage');
   await expect(message).toBeVisible();
   await expect(message).toContainText('S2 worker-failure sentinel');
+  await expect(message).toContainText(/retrying/i); // actionable, and names the retry
 
-  // Definitive proof the handler is app.js's worker.onerror and not the window net:
-  // it retires the failed worker.
+  // The dead worker is gone and a FRESH one is serving the retried job: the
+  // generation advanced, the live slot is occupied again, and a job is in flight.
+  expect(after.gen, 'a failed worker must be replaced by a fresh one').toBeGreaterThan(baseline);
+  expect(after.live).toBe(1);
+  expect(after.token, 'the in-flight job must be retried, not dropped').not.toBe(null);
+  expect(after.jobId).toBeGreaterThan(job.jobId);
+
+  // The retried job reaches a final frame on its own — the canvas is NOT frozen
+  // and the user did NOT change the view.
   await expect
-    .poll(() => page.evaluate(() => window.__fv.liveWorkers()), { timeout: 10_000 })
-    .toBe(0);
-  expect(await page.evaluate(() => window.__fv.workerGeneration())).toBe(baseline);
-  // The job is over: a failed worker's partial result must never be applied after
-  // the failure was handled. (A frame already in the queue when the failure lands
-  // is real work that arrived before it — the boundary is what happens AFTER.)
-  expect(await page.evaluate(() => window.__fv.jobToken())).toBe(null);
-  const frozen = await appliedFor(page, job.jobId);
-  await page.waitForTimeout(400);
-  expect(await appliedFor(page, job.jobId), 'a failed job must apply no further frame').toBe(frozen);
+    .poll(() => appliedFor(page, after.jobId), { timeout: 30_000 })
+    .toBeGreaterThan(0);
+  await expect.poll(() => page.evaluate(() => window.__fv.jobToken()), { timeout: 30_000 }).toBe(null);
 
-  // The page is still ALIVE: a new job runs on a freshly spawned worker.
+  // The page is still ALIVE: a new job runs on a fresh worker afterwards.
   const next = await startJob(page);
   expect(next.token).not.toBe(null);
-  expect(await page.evaluate(() => window.__fv.workerGeneration())).toBe(baseline + 1);
   await expect
     .poll(() => appliedFor(page, next.jobId), { timeout: 30_000 })
     .toBeGreaterThan(0);

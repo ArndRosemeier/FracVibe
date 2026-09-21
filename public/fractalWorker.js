@@ -70,3 +70,11 @@ onmessage = function(e) {
     else postMessage(msg);
   }
 };
+
+// WORKER-CANCEL load-phase handshake. Sent ONCE, after `importScripts` above has
+// completed and this handler is installed, so the main thread knows the worker is
+// fully loadable. Until it receives this, app.js never terminates this worker and
+// never posts a job to it: terminating a loading worker aborts the kernel fetch
+// and the browser reports that abort as an `error` event, which is how the fatal
+// "Failed to execute 'importScripts' ... failed to load" banner was produced.
+postMessage({ type: 'ready' });

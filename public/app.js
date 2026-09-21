@@ -512,6 +512,18 @@ let progressFrameCount = 0; // of those, the non-final ones
 let appliedJobToken = null; // the job whose frames are on screen; null when idle
 let jobSequence = 0; // monotonic id of every job started
 const appliedFramesByJob = new Map(); // jobSequence -> frames applied for that job
+// WORKER-CANCEL: a Worker announces when its script (and the kernel it imports
+// with `importScripts`) has finished loading. Until that signal arrives it must
+// never be terminated: terminating a worker mid-`importScripts` aborts the
+// kernel fetch, and the browser delivers that abort as an `error` event on the
+// Worker. That event escaped to `window.onerror` and surfaced as the fatal
+// "Error: Uncaught NetworkError: Failed to execute 'importScripts'" banner
+// (measured: the worker's own `onerror` had already been detached by
+// `terminateWorker`, so nothing called `preventDefault()`). A load that fails
+// for a genuine reason retries on a fresh worker, bounded so a worker that
+// fails every time cannot spin forever.
+let workerFailureRetries = 0;
+const MAX_WORKER_FAILURE_RETRIES = 2; // 3 attempts total per user action
 // S6 deleted four variables that were declared here and never read anywhere:
 // `currentResult`, `aborting`, `debounceTimer` and `lastJobParams`. S2 had
 // already replaced the abort-flag and debounce designs they belonged to; the
@@ -560,6 +572,9 @@ let lastRenderDuration = 0;
 // --- Accurate Render Timing ---
 let renderStartTime = 0;
 function startFractalCalculationWithTiming() {
+  // A user-initiated calculation starts with a fresh retry budget; the internal
+  // self-heal retry calls `startFractalCalculation` directly so it does not.
+  workerFailureRetries = 0;
   renderStartTime = performance.now();
   startFractalCalculation();
 }
@@ -713,38 +728,81 @@ function spinUpWorker() {
   if (worker) return worker; // never orphan a live worker
   const w = new Worker('fractalWorker.js');
   w._fvGeneration = ++workerGeneration;
+  // WORKER-CANCEL load phase: `_fvReady` is set by the worker's own 'ready'
+  // message, sent once its script (and the kernel it imports) has finished
+  // loading. A worker is only ever terminated outright once it is ready.
+  w._fvReady = false;
+  w._fvCancelled = false;
+  w._fvTerminateWhenReady = false;
   // A factory, so the handler knows which worker produced the frame even after the
   // slot has moved on to a respawned worker.
-  w.onmessage = makeWorkerMessageHandler(w._fvGeneration);
+  w.onmessage = makeWorkerMessageHandler(w);
   // A worker failure used to be completely silent: no handler existed, so the
-  // canvas kept its last frame and nothing was reported. This surfaces it.
+  // canvas kept its last frame and nothing was reported. This surfaces it AND
+  // self-heals it (a fresh Worker retries the in-flight job).
   w.onerror = (event) => {
-    if (w !== worker) return; // a worker we already retired; its exit is not news
+    // ALWAYS cancel the error at the Worker: an aborted `importScripts` caused by
+    // terminating a worker we no longer want is not a render failure. Letting it
+    // through is exactly what produced the fatal
+    //   Error: Uncaught NetworkError: Failed to execute 'importScripts' ...
+    // banner (the window error net is the only thing that saw it). This runs
+    // BEFORE the guards, so a terminated worker cannot leak its abort to the page.
     if (event && typeof event.preventDefault === 'function') event.preventDefault();
-    if (!progressiveState) return; // no job was in flight: nothing to report
     if (w._fvCancelled) return; // a terminate WE asked for is not a failure
-    progressiveState = null;
-    const msg = errorText(event && (event.message || event.error)) || 'unknown error';
-    showError('Render worker failed: ' + msg + ' The last completed image is still shown; change the view to retry.');
-    terminateWorker();
+    if (w !== worker) return; // a worker we already retired; its exit is not news
+    handleWorkerFailure(w, event);
   };
   worker = w;
   return worker;
+}
+
+// A LIVE worker failed (neither cancelled nor retired). Retire it and RETRY the
+// in-flight job on a fresh Worker, a bounded number of times, so a worker that
+// fails on every load cannot spin forever. The retry is what keeps a worker
+// failure from freezing the canvas until the user happens to change the view.
+function handleWorkerFailure(w, event) {
+  const hadJob = !!progressiveState;
+  const retries = workerFailureRetries;
+  w._fvCancelled = true;
+  w._fvTerminateWhenReady = false;
+  if (w === worker) {
+    worker = null;
+    progressiveState = null;
+  }
+  w.onmessage = null;
+  try { w.terminate(); } catch (_) { /* already gone */ }
+  const msg = errorText(event && (event.message || event.error)) || 'unknown error';
+  if (hadJob && retries < MAX_WORKER_FAILURE_RETRIES) {
+    workerFailureRetries = retries + 1;
+    showError(`Render worker failed: ${msg} Retrying on a fresh worker (attempt ${workerFailureRetries + 1} of ${MAX_WORKER_FAILURE_RETRIES + 1}).`);
+    startFractalCalculation();
+    return;
+  }
+  showError(`Render worker failed: ${msg} The last completed image is still shown; change the view to retry.`);
 }
 
 // Kill the live worker. A worker blocked in its synchronous kernel can never read a
 // posted 'abort' message, so terminate() is the only cancellation that is real.
 // The caller respawns (startFractalCalculation calls spinUpWorker) or leaves the
 // slot empty for the next job to fill.
+//
+// WORKER-CANCEL: a worker that is still LOADING is not terminated here. Terminating
+// it now aborts its `importScripts('fractalKernel.js')`, which the browser reports
+// as an error on the Worker; the worker is marked instead and retires itself from
+// its own 'ready' handler, so the kernel fetch always completes and no aborted
+// load can ever surface. No job is ever posted to a marked worker (see
+// `sendProgressiveJob`), so it burns no CPU on the superseded view.
 function terminateWorker() {
   const w = worker;
   worker = null;
   progressiveState = null;
   if (!w) return;
   w._fvCancelled = true;
-  w.onmessage = null;
-  w.onerror = null;
-  try { w.terminate(); } catch (_) { /* already gone */ }
+  if (w._fvReady) {
+    try { w.terminate(); } catch (_) { /* already gone */ }
+    return;
+  }
+  w._fvTerminateWhenReady = true;
 }
 
 function startFractalCalculation() {
@@ -784,9 +842,16 @@ function startFractalCalculation() {
   sendProgressiveJob();
 }
 
+// Post the in-flight job to the live worker. A worker that is still loading its
+// script is NOT posted to: the job would queue behind the load, and if the view
+// changed again the worker would still burn CPU on the superseded job (the exact
+// waste S2 removed) — while terminating it to stop that aborts the load
+// (WORKER-CANCEL). Instead the 'ready' handler calls this again, so only the
+// CURRENT job is ever sent.
 function sendProgressiveJob() {
   if (!progressiveState) return;
   if (!worker) spinUpWorker(); // e.g. the previous worker failed and was retired
+  if (!worker._fvReady) return;
   worker.postMessage({ ...progressiveState.jobParams, calcToken: progressiveState.calcToken });
 }
 
@@ -830,6 +895,9 @@ function applyWorkerFrame(calcTokenValue, rawResult, final) {
     // no longer describes an in-flight job (jobToken() -> null).
     appliedJobToken = null;
     progressiveState = null;
+    // A job reached its final frame: the worker is demonstrably healthy, so the
+    // next genuine failure gets a fresh self-heal budget.
+    workerFailureRetries = 0;
     setRenderTimeDisplay(performance.now() - renderStartTime);
   }
   return true;
@@ -855,11 +923,28 @@ function handleWorkerFrame(msg) {
 // that is no longer live is dropped: terminate() cannot preempt a synchronous kernel
 // in progress, so the cancelled job's final frame CAN still be handed to this
 // handler, and it must not be applied.
-function makeWorkerMessageHandler(generation) {
+//
+// The 'ready' handshake (WORKER-CANCEL) is handled BEFORE the generation gate: a
+// worker that was cancelled while it was still loading is not the live worker any
+// more, but its ready signal is exactly the moment it can be retired WITHOUT
+// aborting its kernel fetch. It is never sent a job.
+function makeWorkerMessageHandler(w) {
   return function handleWorkerMessage(e) {
-    if (generation !== (worker && worker._fvGeneration)) return;
     const msg = e && e.data;
     if (!msg || typeof msg !== 'object') return; // not ours; ignore rather than throw
+    if (msg.type === 'ready') {
+      w._fvReady = true;
+      if (w._fvTerminateWhenReady) {
+        w._fvTerminateWhenReady = false;
+        try { w.terminate(); } catch (_) { /* already gone */ }
+        return;
+      }
+      if (w === worker && progressiveState && progressiveState.workerGeneration === w._fvGeneration) {
+        sendProgressiveJob();
+      }
+      return;
+    }
+    if (w._fvGeneration !== (worker && worker._fvGeneration)) return;
     handleWorkerFrame(msg);
   };
 }
@@ -869,6 +954,17 @@ function cancelJob() {
   // Returns true when an in-flight job was actually cancelled.
   const wasActive = !!progressiveState;
   if (wasActive) cancelledWorkerCount++;
+  // WORKER-CANCEL: a worker that is still LOADING has no job running on it —
+  // `sendProgressiveJob` never posts to a worker before its 'ready' signal — so
+  // there is nothing to terminate. Keeping it and superseding the pending job
+  // means a wheel storm reuses one loading worker instead of spawning (and
+  // aborting) one per tick; the newest job is posted the moment it is ready.
+  // A READY worker is inside its synchronous kernel and is terminated outright.
+  if (worker && !worker._fvReady) {
+    calcToken++; // invalidate anything a racing frame could still carry
+    progressiveState = null;
+    return wasActive;
+  }
   terminateWorker();
   calcToken++; // invalidate anything a racing frame could still carry
   progressiveState = null;
