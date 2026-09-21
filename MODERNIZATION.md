@@ -72,6 +72,14 @@ one path in `app.js`. Pinned by `tests/canvas-dpr.spec.js`.
 shader loops `for (int i = 0; i < 1024; i++)` (`webglFractal.js:52,63,74,85`). Above 1024,
 GPU-rendered pixels are silently mis-colored as escaped. Make the loop bound a constant
 shared with the UI cap, or clamp the slider per renderer.
+*Fixed (S3):* the cap is now ONE constant, `MAX_ITER = 2000` in `public/fractalKernel.js`; the
+slider's `max` is derived from it (`app.js:59`), and the fragment shader is **templated** —
+`#define MAX_ITER <FractalKernel.MAX_ITER>` (`webglFractal.js:67`) — so its four loop sites
+(`webglFractal.js:89,100,111,122`) and the `u_maxIter` uniform clamp share the kernel's bound by
+construction. GPU==CPU at the cap is pinned by `tests/kernel-parity.spec.js` pin 1, and the
+dispatcher verified that pin goes RED (mean |CPU−GPU| 6.53 vs the <6 threshold) when the uniform
+is pinned to a different value. The anchors quoted above (`webglFractal.js:52,63,74,85`) were
+already stale after S1; at `cef6bcb` the four sites were 71,82,93,104.
 
 **B6. Worker abort is a no-op.** `fractalWorker.js` checks `abortFlag` inside a synchronous
 `while` loop; the abort `postMessage` cannot be dispatched while that loop runs, so the flag
@@ -113,6 +121,17 @@ in `webglFractal.js:44-93`. Every behaviour change currently has to be made 3–
 shader branches). This is the single biggest maintainability problem in the codebase.
 Target: one parameterised kernel (TS) + one palette table, with the shader generated or
 kept as the one documented exception.
+*Fixed (S3):* there is now ONE kernel, `public/fractalKernel.js` — a file with **no
+`import`/`export`** that publishes `globalThis.FractalKernel`, so it is simultaneously a valid
+classic script (loaded by the worker via `importScripts`) and a valid ES module (loaded by the
+main thread). `public/fractalEngine.js` and `public/fractalEngineMain.js` were **DELETED** (both
+were copies; note this paragraph's "which `fractalWorker.js:1` imports and then completely
+overrides" is what was true, not that the dead code was `fractalEngine.js` itself), the inline
+override in `fractalWorker.js` is gone (that file went 127 → 69 lines), and the type/palette
+tables live in the kernel and are templated into the GLSL as `#define FT_*` / `#define CS_*`.
+The GLSL remains the one documented exception. Pinned by `tests/kernel-parity.spec.js` pins 2–3.
+Still open in this section: per-frame allocation in the 2D renderer, the per-pass buffer copies
+/ single worker, and the prefix/`colorSchemes.js` re-export.
 
 **Per-frame allocation in the 2D renderer.** `FractalViewer.render()` rebuilds a
 `Uint32Array(maxIter+2)` LUT and calls `ctx.createImageData(w,h)` on every call — including
