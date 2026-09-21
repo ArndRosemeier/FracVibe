@@ -2,13 +2,18 @@
 
 Interactive 2D / WebGL / 3D fractal explorer. Static ES modules served from
 `public/`; Netlify publishes `public/` with **no build step**. `server/server.js`
-is a dev convenience (Express, :3000). One Playwright suite: `tests/smoke.spec.js`.
+is a dev convenience (Express, :3000). The Playwright suite lives under `tests/`
+(8 spec files, **43 tests**, ~1.9 min) and starts that server itself.
 
 ## Read before you act
 1. **`docs/STATE.md`** — the board: what is happening now, and the one screen a
    successor acts from.
 2. **`MODERNIZATION.md`** — the audited plan of record (findings B1–B8, phases 0–3).
 3. **`docs/DECISIONS.md`** — why it is like this. Append-only.
+4. **`docs/PLAN.md`** — the campaign that closed `MODERNIZATION.md` §2 (slices S1–S6
+   with their footprints, pins and statuses, plus the definition of done and what was
+   deliberately deferred). The seam map with `file:line` anchors is
+   `docs/PROBE-2026-09-21-seams.md` (note: its `app.js` line numbers predate S1).
 
 Nothing is dispatched, and no code is changed, before the board has been
 reconciled against reality: `origin/main` (never a stale local branch), the live
