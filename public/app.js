@@ -255,10 +255,26 @@ viewer.setZoomLimit(WEBGL_MIN_SCALE, handleZoomLimitReached);
 
 viewer.setView(viewer.view);
 updateInfo(viewer.view);
-let worker = new Worker('fractalWorker.js');
+// --- S2: the worker job lifecycle -------------------------------------------------
+// `worker` is now a SLOT, not a permanent object. Cancellation terminates the worker
+// and spins up a fresh one (see cancelJob below): a message cannot reach a worker
+// that is blocked inside a synchronous loop, so `terminate()` is the only real
+// cancel. `calcToken` is the generation that matches results to the latest view; it
+// is still checked on every frame, but after a terminate no frame can even arrive.
+let worker = null;
+let calcToken = 0; // Used to match results to the latest view
+// S2 observables (counted, never inferred). The suite asserts on these.
+let workerGeneration = 0; // how many Workers this page has spawned
+let cancelledWorkerCount = 0; // how many in-flight jobs were killed by terminate()
+let appliedFrameCount = 0; // frames handed to the viewer, progress and final alike
+let progressFrameCount = 0; // of those, the non-final ones
+let appliedJobToken = null; // the job whose frames are on screen; null when idle
+let jobSequence = 0; // monotonic id of every job started
+const appliedFramesByJob = new Map(); // jobSequence -> frames applied for that job
+// The variables below belong to S6 (hygiene) and are deliberately left alone: they
+// are declared and never read. S2 does not make them any less dead.
 let currentResult = null;
 let aborting = false;
-let calcToken = 0; // Used to match results to the latest view
 let debounceTimer = null;
 let lastJobParams = null; // Store last parameters for progressive refinement
 
@@ -387,8 +403,56 @@ typeSelect.addEventListener('change', () => {
   startFractalCalculationWithTiming();
 });
 
+// --- S2: the worker job lifecycle -------------------------------------------------
+// The one place a Worker is constructed. Every frame carries the `calcToken` of the
+// job that produced it, and the handler refuses a frame whose token is not the live
+// job's token. Termination is the real cancel; the token check is the second net,
+// which still catches a frame that raced in before terminate() took effect.
+function spinUpWorker() {
+  if (worker) return worker; // never orphan a live worker
+  const w = new Worker('fractalWorker.js');
+  w._fvGeneration = ++workerGeneration;
+  // A factory, so the handler knows which worker produced the frame even after the
+  // slot has moved on to a respawned worker.
+  w.onmessage = makeWorkerMessageHandler(w._fvGeneration);
+  // A worker failure used to be completely silent: no handler existed, so the
+  // canvas kept its last frame and nothing was reported. This surfaces it.
+  w.onerror = (event) => {
+    if (w !== worker) return; // a worker we already retired; its exit is not news
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    if (!progressiveState) return; // no job was in flight: nothing to report
+    if (w._fvCancelled) return; // a terminate WE asked for is not a failure
+    progressiveState = null;
+    const msg = errorText(event && (event.message || event.error)) || 'unknown error';
+    showError('Render worker failed: ' + msg + ' The last completed image is still shown; change the view to retry.');
+    terminateWorker();
+  };
+  worker = w;
+  return worker;
+}
+
+// Kill the live worker. A worker blocked in its synchronous kernel can never read a
+// posted 'abort' message, so terminate() is the only cancellation that is real.
+// The caller respawns (startFractalCalculation calls spinUpWorker) or leaves the
+// slot empty for the next job to fill.
+function terminateWorker() {
+  const w = worker;
+  worker = null;
+  progressiveState = null;
+  if (!w) return;
+  w._fvCancelled = true;
+  w.onmessage = null;
+  w.onerror = null;
+  try { w.terminate(); } catch (_) { /* already gone */ }
+}
+
 function startFractalCalculation() {
-  // Start with a coarse gridStep for fast preview
+  // A job always runs on a live worker. Starting a job while one is still in flight
+  // is a view change or a control change, and the new job supersedes it.
+  if (progressiveState) cancelJob();
+  else spinUpWorker();
+  // Start with a coarse gridStep; the worker refines it and posts every level as a
+  // frame, so a slow render shows something before it is finished.
   let gridStep = 8;
   let prior = null;
   let width = viewer.width, height = viewer.height;
@@ -397,6 +461,10 @@ function startFractalCalculation() {
 
   progressiveState = {
     calcToken: thisToken,
+    jobId: ++jobSequence,
+    workerGeneration: worker._fvGeneration,
+    width,
+    height,
     jobParams: {
       type: viewer.fractalType,
       width,
@@ -410,37 +478,91 @@ function startFractalCalculation() {
       prior
     }
   };
+  appliedFramesByJob.set(progressiveState.jobId, 0);
 
   sendProgressiveJob();
 }
 
 function sendProgressiveJob() {
   if (!progressiveState) return;
+  if (!worker) spinUpWorker(); // e.g. the previous worker failed and was retired
   worker.postMessage({ ...progressiveState.jobParams, calcToken: progressiveState.calcToken });
 }
 
-worker.onmessage = function(e) {
-  // Only process latest progressive sequence
-  if (!progressiveState || e.data.calcToken !== progressiveState.calcToken) return;
-  if (e.data.type === 'done') {
-    // Always wrap the buffer as Int32Array
-    let intResult = new Int32Array(e.data.result);
-    viewer.setData(intResult, viewer.maxIter);
-    // Refine further if possible
-    let { gridStep } = progressiveState.jobParams;
-    if (gridStep > 1) {
-      let nextStep = Math.floor(gridStep / 2);
-      progressiveState.jobParams.gridStep = nextStep;
-      progressiveState.jobParams.prior = intResult;
-      sendProgressiveJob();
-    } else {
-      // Done, clear state
-      progressiveState = null;
-    }
-    const duration = performance.now() - renderStartTime;
-    setRenderTimeDisplay(duration);
+// The ONE place a worker frame becomes pixels. It is shared by the real message
+// handler and the observation hook, so a test can never exercise a path the app
+// does not use. Returns true when the frame was applied.
+function applyWorkerFrame(calcTokenValue, rawResult, final) {
+  const progress = progressiveState;
+  // Only the live job's frames are applied, and only from the worker that is still
+  // live. A stale frame is dropped, whatever path it arrived by.
+  if (!progress) return false;
+  if (calcTokenValue !== progress.calcToken) return false;
+  if (!worker || worker._fvGeneration !== progress.workerGeneration) return false;
+  if (!rawResult || typeof rawResult.byteLength !== 'number' || rawResult.byteLength % 4 !== 0) {
+    throw new Error('worker result is not an Int32Array payload');
   }
-};
+  const intResult = new Int32Array(rawResult);
+  const expected = progress.width * progress.height;
+  if (intResult.length !== expected) {
+    throw new Error(`worker result has ${intResult.length} entries, expected ${expected}`);
+  }
+  viewer.setData(intResult, viewer.maxIter);
+  const n = (appliedFramesByJob.get(progress.jobId) || 0) + 1;
+  appliedFramesByJob.set(progress.jobId, n);
+  appliedFrameCount++;
+  if (!final) progressFrameCount++;
+  appliedJobToken = calcTokenValue;
+  if (final) {
+    // The frame for THIS job is on screen and the job is finished, so the token
+    // no longer describes an in-flight job (jobToken() -> null).
+    appliedJobToken = null;
+    progressiveState = null;
+    setRenderTimeDisplay(performance.now() - renderStartTime);
+  }
+  return true;
+}
+
+function handleWorkerFrame(msg) {
+  // Progress frames are applied: the worker refines 8 -> 4 -> 2 -> 1 and every
+  // level is a real image, so the user sees the render converge instead of staring
+  // at a stale frame until the last pixel lands.
+  try {
+    const final = msg && msg.type === 'done';
+    applyWorkerFrame(msg && msg.calcToken, msg && msg.result, final);
+  } catch (err) {
+    // A malformed payload must never escape the event handler uncaught: that used
+    // to freeze the render with no message at all.
+    progressiveState = null;
+    showError('Render worker returned a result that could not be applied (' + errorText(err) + '). The last completed image is still shown.');
+  }
+}
+
+// One handler per spawned worker, so a frame can be attributed to the worker that
+// sent it even after the slot has moved on to a respawned one. A frame from a worker
+// that is no longer live is dropped: terminate() cannot preempt a synchronous kernel
+// in progress, so the cancelled job's final frame CAN still be handed to this
+// handler, and it must not be applied.
+function makeWorkerMessageHandler(generation) {
+  return function handleWorkerMessage(e) {
+    if (generation !== (worker && worker._fvGeneration)) return;
+    const msg = e && e.data;
+    if (!msg || typeof msg !== 'object') return; // not ours; ignore rather than throw
+    handleWorkerFrame(msg);
+  };
+}
+
+function cancelJob() {
+  // Real cancellation: kill the worker that is inside the kernel, then respawn.
+  // Returns true when an in-flight job was actually cancelled.
+  const wasActive = !!progressiveState;
+  if (wasActive) cancelledWorkerCount++;
+  terminateWorker();
+  calcToken++; // invalidate anything a racing frame could still carry
+  progressiveState = null;
+  spinUpWorker();
+  return wasActive;
+}
 
 // --- Mouse event wrappers to delegate to viewer and update view state ---
 function onMouseDown(e) {
@@ -480,10 +602,10 @@ attachFractalMouseEvents(canvasWebGL);
 
 // --- Ensure view changes always trigger calculation ---
 function onViewChangeHandler() {
-  // Abort current calculation immediately
-  if (worker) worker.postMessage({type: 'abort'});
-  // Increment token to invalidate old results
-  calcToken++;
+  // Abort current calculation for real: terminate the worker that is inside the
+  // kernel and respawn it (S2). The old `postMessage({type:'abort'})` was a no-op
+  // because the worker cannot read a message while it is in its synchronous loop.
+  cancelJob();
   // Start a new calculation for the new view
   startFractalCalculationWithTiming();
   // Always trigger render in correct mode
@@ -920,6 +1042,43 @@ window.__fv = Object.freeze({
   minScale: WEBGL_MIN_SCALE,
   liveRenderers: () => (typeof window.__fvLiveWebglRenderers === 'number' ? window.__fvLiveWebglRenderers : 0),
   animationSettled: () => zoomAnimationSettled,
+  // --- S2 worker observables (counted, never inferred) ---
+  // How many Workers this page has constructed, and how many live jobs a terminate
+  // killed. A cancellation is proven by the second number going up, not by watching
+  // pixels stop changing.
+  workerGeneration: () => workerGeneration,
+  cancelledWorkers: () => cancelledWorkerCount,
+  liveWorkers: () => (worker ? 1 : 0),
+  // Frames the viewer actually received, progress and final alike.
+  appliedFrames: () => appliedFrameCount,
+  progressFrames: () => progressFrameCount,
+  appliedFramesForJob: (jobId) => appliedFramesByJob.get(jobId) || 0,
+  appliedJobToken: () => appliedJobToken,
+  jobCount: () => jobSequence,
+  // The live job's token, or null when no job is in flight (which is what a
+  // completed or cancelled job leaves behind).
+  jobToken: () => (progressiveState ? progressiveState.calcToken : null),
+  jobSize: () => (progressiveState ? { width: progressiveState.width, height: progressiveState.height } : null),
+  // Start a job of the current view/size through the REAL calculation entry point.
+  // The suite uses this to make a job big enough to cancel mid-flight; it adds no
+  // production path.
+  runJob: () => { startFractalCalculationWithTiming(); },
+  // Cancel exactly as a view change does, and report whether a job was in flight.
+  cancelJob: () => cancelJob(),
+  // Deliver a raw worker message, so a malformed payload can be tested without
+  // waiting for a real worker to produce one. Goes through the real handler.
+  deliverWorkerMessage: (msg) => {
+    const w = worker;
+    if (!w || typeof w.onmessage !== 'function') throw new Error('no live worker');
+    w.onmessage({ data: msg });
+  },
+  // Surface an error through the REAL onerror path (as a worker script/runtime
+  // failure would), without waiting for a worker to actually crash.
+  failWorker: (message) => {
+    const w = worker;
+    if (!w || typeof w.onerror !== 'function') throw new Error('no live worker');
+    w.onerror({ message: String(message), preventDefault() {} });
+  },
 });
 
 // Also update on maxIter/type/params changes
