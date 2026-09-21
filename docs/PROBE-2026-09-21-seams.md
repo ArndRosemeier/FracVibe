@@ -5,6 +5,24 @@
 - **Why kept:** this is the seam map every campaign brief draws its anchors from (`docs/PLAN.md`). It is evidence, so it lives on disk rather than in a session thread.
 - **Corrections found beyond `MODERNIZATION.md`** are marked ⚠.
 
+## ⚠ CORRECTIONS (appended 2026-09-21 — the original text below is kept as evidence)
+
+1. **"`new Int32Array(undefined)` throws" is FALSE.** Verified in node independently by
+   the S2 writer and by the dispatcher: it does **not** throw — it yields an empty array
+   (`length 0`, `byteLength 0`); `null` and a non-numeric string behave the same. The real
+   defect is a *silently wrong* frame: an empty or short buffer passes
+   `FractalViewer.render`'s length guard and paints the background. S2 fixed the real
+   defect (payload shape + length validation) at `63f19c8`. The erroneous claim had already
+   propagated into `docs/PLAN.md`, the board, and a writer brief before the writer caught
+   it — see the board's TRAP on asserting a mechanism from plausibility.
+2. **`worker.terminate()` is NOT a synchronous preemption.** A worker already inside its
+   synchronous kernel finishes that level (measured via CDP process CPU by the S2 writer:
+   ~1.04 s with terminate vs ~1.02 s without). So "cancel stops the CPU immediately" is
+   neither claimed nor pinned.
+3. **The `calcToken` generation check is not the net that drops a late frame** — clearing
+   `progressiveState` on cancel is; the token/generation checks are defence in depth. S2's
+   `docs/DECISIONS.md` row 13 records this rather than asserting otherwise.
+
 ## Flows
 
 | flow | function(s) | file:line range | duplicated / patched / global-state notes |
@@ -40,7 +58,7 @@
 | WebGL context / shader creation failure | `app.js:627-637`; `webglFractal.js:7,11,17,168,174,182` | `alert('WebGL is not supported…')`, unchecks the box, hides the WebGL canvas, calls `viewer.render()` but ⚠ **never starts a CPU calc** → blank `#222` canvas (`fractalViewer.js:128-131`). |
 | WebGL error after init | `app.js:648-680` | No try/catch in `renderWebGL`; GL errors / a null renderer throw uncaught (only 650 early-returns). |
 | Worker script load / runtime error | `app.js:362-383` | ⚠ No `worker.onerror` at all → silent; a worker failure is invisible and the canvas keeps its last frame. |
-| Worker `done` with a bad payload | `app.js:367` | ⚠ `new Int32Array(undefined)` throws inside the event handler, uncaught → render frozen, no message. |
+| Worker `done` with a bad payload | `app.js:367` | ⚠ **CORRECTED — THIS CLAIM IS FALSE.** `new Int32Array(undefined)` does **not** throw in V8; it yields an empty array. The real defect is a silently wrong frame (an empty/short buffer passes the length guard and paints the background). Fixed by S2 at `63f19c8` via payload validation. See CORRECTIONS at the top of this file. (Line numbers here also predate S1's rewrite of `app.js`.) |
 | Worker abort | `app.js:424`; `fractalWorker.js:29-38` | Cancel silently ignored (B6); the stale job runs to completion and its result is dropped by `calcToken`. |
 | Zoom-cap decision | `app.js:230,611,657` | Triplicated `window.confirm`; a denial sets `deniedCpuSwitchAtZoomCap` and zoom clamps silently; no UI feedback. |
 | 3D init failure | `app.js:295`; `fractal3d.js:81` | ⚠ `fractal3D.init()` promise unhandled; `new THREE.WebGLRenderer` unguarded; both canvases are already hidden (`app.js:298-299`) → black screen, no message. |
