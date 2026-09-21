@@ -947,12 +947,25 @@ test('EXPANSIONS pin 7: the ladder buys delta precision on a deep view (vs a 512
         + ' = ' + (100 * e.mis / (W * H)).toFixed(4) + '% mean|d|=' + e.mean.toFixed(4) + ' ms=' + e.ms.toFixed(0));
     }
 
-    // The contract: the ladder must NOT be worse as k grows, and the first rung
-    // must be a strict improvement where the float32 delta is the limiter.
+    // The contract has TWO halves, and the absolute one is what a silent
+    // collapse cannot pass: the ordering alone (k=2 better than k=1) survives a
+    // build whose EX_MUL has collapsed to float32, while the absolute level does
+    // not. Bounds are MEASURED (deep view: k2 = 1.00e-14 = 2^-46.5, k4 =
+    // 2.56e-18 = 2^-58.5) with >2^4 of margin, and a collapsed mul sits ~2^25
+    // above them.
     const d1 = deltaRows[0].meanRel, d2 = deltaRows[1].meanRel, d4 = deltaRows[2].meanRel;
     expect(Number.isFinite(d1) && Number.isFinite(d2), `${view.label}: delta-error samples must be finite`).toBe(true);
-    expect(d2, `${view.label}: k=2 must be more precise than k=1`).toBeLessThan(d1);
+    expect(d2, `${view.label}: k=2 must be more precise than k=1`).toBeLessThan(d1 * 1e-4);
     expect(d4, `${view.label}: k=4 must not be worse than k=2`).toBeLessThanOrEqual(d2 * 1.05);
+    // The floor is set with margin below the WORSE of the two views (shallow
+    // k2 = 2.95e-12 = 2^-38.3) and ~2^10 above the float32 level (~2^-22.4), so it
+    // discriminates a collapse without pinning a host-specific exact value.
+    const k2Floor = Math.pow(2, -32), k4Floor = Math.pow(2, -48);
+    expect(d2, `${view.label}: k=2 delta error must be at the 2-component level, not the f32 level`)
+      .toBeLessThan(k2Floor);
+    if (view.deltaSteps >= 64) {
+      expect(d4, `${view.label}: k=4 delta error must be at the 4-component level`).toBeLessThan(k4Floor);
+    }
     const e1 = escRows[0].mis, e2 = escRows[1].mis;
     expect(e2, `${view.label}: k=2 must not misclassify more pixels than k=1`).toBeLessThanOrEqual(e1);
   }
