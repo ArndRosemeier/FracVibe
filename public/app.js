@@ -5,12 +5,17 @@ import { Fractal3DViewer } from './fractal3d.js';
 // `export` on purpose (so `importScripts` can load the same file), hence the
 // side-effect import + global read.
 import './fractalKernel.js';
+// P2: the arbitrary-precision reference orbit. Side-effect import for the same
+// reason as the kernel: the ONE file is loaded by the orbit Worker too.
+import './bigOrbit.js';
 import { WebGLFractalRenderer } from './webglFractal.js';
 import { FractalMemoryRepository, LOCATION_LIMITS, validateRecords } from './memoryRepository.js';
 
 // The single source of truth for the iteration cap, the fractal-type table and
 // the palette table (public/fractalKernel.js).
 const FractalKernel = globalThis.FractalKernel;
+// P2: the BigInt fixed-point reference-orbit module (public/bigOrbit.js).
+const BigOrbit = globalThis.BigOrbit;
 
 const canvas = document.getElementById('fractalCanvas');
 // `let`: a real WebGL context loss replaces this element (see swapCanvasWebGL).
@@ -1175,6 +1180,13 @@ function updateWebGLState() {
         if (!webglRenderer) {
           swapCanvasWebGL(); // no-op unless the current canvas lost its context
           webglRenderer = new WebGLFractalRenderer(canvasWebGL);
+          // P2: when the arbitrary-precision orbit Worker has finished the orbit
+          // for the current view, draw it through the REAL render path. Until
+          // then the draw falls back to the float64 lane, so the canvas is never
+          // left blank waiting on the Worker.
+          webglRenderer.onBigOrbitReady = () => {
+            if (webglRenderer && !webglRenderer.destroyed) renderWebGL();
+          };
         }
         webglPending = false;
         renderWebGL();
@@ -1525,7 +1537,15 @@ window.__fv = Object.freeze({
   setDeepView: (view) => {
     viewer.setZoomLimit(null, null);
     try {
-      viewer.setView({ ...viewer.view, ...view });
+      // An exact decimal centre (`centerXExact`/`centerYExact`) is what names a
+      // point past a float64 centre's own ULP; the numeric `centerX`/`centerY`
+      // stay the float64 view the rest of the app uses. Exact fields are cleared
+      // when the caller does not supply them, so a stale one cannot leak into a
+      // later view that was meant to be the float64 lane.
+      const next = { ...viewer.view, ...view };
+      if (typeof view.centerXExact !== 'string') delete next.centerXExact;
+      if (typeof view.centerYExact !== 'string') delete next.centerYExact;
+      viewer.setView(next);
     } finally {
       viewer.setZoomLimit(WEBGL_MIN_SCALE, handleZoomLimitReached);
     }
@@ -1580,6 +1600,67 @@ window.__fv = Object.freeze({
     if (!webglRenderer) return false;
     webglRenderer._orbitKey = null;
     return true;
+  },
+  // --- P2 arbitrary-precision-orbit observables ---
+  // The BigInt orbit the renderer is holding: which (centre, budget, bits) key it
+  // belongs to, the working precision actually used and whether the reference
+  // escaped. Null until one has been uploaded.
+  bigOrbitInfo: () => (webglRenderer && webglRenderer.getBigOrbitInfo
+    ? webglRenderer.getBigOrbitInfo()
+    : null),
+  // Counted, never inferred: Worker requests posted, orbits completed, Workers
+  // spawned and errors. "Once per view" is the requests counter not moving on a
+  // redraw of the same view.
+  bigOrbitRequests: () => (webglRenderer ? webglRenderer.bigOrbitRequests : 0),
+  bigOrbitComputations: () => (webglRenderer ? webglRenderer.bigOrbitComputations : 0),
+  bigOrbitWorkerSpawns: () => (webglRenderer ? webglRenderer.bigOrbitWorkerSpawns : 0),
+  bigOrbitErrors: () => (webglRenderer ? webglRenderer.bigOrbitErrors : 0),
+  lastBigOrbitMs: () => (webglRenderer ? webglRenderer.lastBigOrbitMs : 0),
+  // Which orbit source served the LAST draw: 'bigint', 'float64' or 'none'.
+  // This is the observable that distinguishes the P2 lane from the P1 baseline.
+  orbitSource: () => (webglRenderer ? webglRenderer.orbitSource : 'none'),
+  // The precision rule, so a pin checks it instead of restating it.
+  bigOrbitBitsForScale: (scale) => BigOrbit.bitsForScale(scale),
+  bigOrbitMargin: BigOrbit.BIGORBIT_MARGIN,
+  bigOrbitStepBits: BigOrbit.BIGORBIT_STEP_BITS,
+  bigOrbitMaxScale: BigOrbit.BIGORBIT_MAX_SCALE,
+  // Observation only: force the deep-lane orbit source. 'float64' renders the
+  // SAME view through P1's float64 orbit of the rounded centre, which is exactly
+  // the wall this slice removes — used to show the pin's failing baseline.
+  setOrbitMode: (mode) => {
+    if (!webglRenderer) return false;
+    webglRenderer.orbitMode = mode;
+    webglRenderer._bigOrbit = null;
+    webglRenderer._bigOrbitPending = null;
+    webglRenderer._orbitKey = null;
+    return true;
+  },
+  // The KF-2018-class transition corruption, injected from the pin: when set, the
+  // precision step shifts the centre (see public/bigOrbit.js). Default 0.
+  setBigOrbitControl: (n) => BigOrbit.setControlStepShift(n),
+  bigOrbitControl: () => BigOrbit.getControlStepShift(),
+  // Observation only: force the working precision (bits) of the next BigInt orbit
+  // instead of the scale-derived rule, so one fixed view can be rendered on both
+  // sides of a precision step. 0 restores the rule.
+  setBigOrbitBits: (bits) => {
+    if (!webglRenderer) return false;
+    webglRenderer.bigOrbitBitsOverride = bits | 0;
+    webglRenderer._bigOrbit = null;
+    webglRenderer._bigOrbitPending = null;
+    webglRenderer._orbitKey = null;
+    return true;
+  },
+  // Run the REAL perturbation draw with the shader's own escape index as the
+  // output and read it back: the GPU's escape VALUE, for comparison against an
+  // independent reference. Observation only, exactly like `glitchFrame`.
+  orbitFrame: () => {
+    if (!webglRenderer) return null;
+    return webglRenderer.renderOrbitFrame(
+      viewer.view,
+      viewer.maxIter,
+      FractalKernel.indexForType(viewer.fractalType),
+      viewer.fractalType === 'julia' ? viewer.juliaParams : undefined,
+    );
   },
   // The kernel's own tables, so a test can drive every supported type/palette
   // without restating the list in a second fixture.

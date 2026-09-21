@@ -3,7 +3,12 @@
 // module can load the same file (see public/fractalKernel.js and
 // docs/DECISIONS.md row 14).
 import './fractalKernel.js';
+// P2: the arbitrary-precision reference orbit in BigInt fixed point. Loaded for
+// its side effect for the same reason as the kernel: the file has no import and
+// no export, so the classic orbit Worker can `importScripts` the ONE source.
+import './bigOrbit.js';
 const FractalKernel = globalThis.FractalKernel;
+const BigOrbit = globalThis.BigOrbit;
 
 // Accounting for GPU↔CPU teardown. Every constructed renderer increments and
 // every destroyed renderer decrements, so a test can assert that N toggles leave
@@ -52,6 +57,32 @@ export class WebGLFractalRenderer {
     this._orbitZy = null;
     this.hasFloatTexture = false;
     this.maxOrbitWidth = 0;
+    // P2: the arbitrary-precision (BigInt) reference orbit. `orbitMode` selects
+    // the ORBIT SOURCE for a deep view whose exact centre is available:
+    //   'bigint'  (production default) -- the Worker orbit at the working precision
+    //   'float64' (observation only)   -- P1's float64 orbit of the rounded centre,
+    //                                     i.e. exactly the wall this slice removes
+    // `_bigOrbit` caches the completed orbit under its (centre, budget, bits) key;
+    // `_bigOrbitPending` is the key of the one request in flight, so a redraw
+    // while it is being computed does not post a second one. Counters make
+    // "once per view" measured rather than inferred: `bigOrbitRequests` counts
+    // what was ASKED of the Worker, `bigOrbitComputations` what came back.
+    this.orbitMode = 'bigint';
+    // Observation only: force the working precision (bits) used for the next
+    // BigInt orbit instead of the scale-derived rule. Pin 3 uses it to compare the
+    // two sides of a precision STEP at one fixed view.
+    this.bigOrbitBitsOverride = 0;
+    this._orbitWorker = null;
+    this._bigOrbit = null;
+    this._bigOrbitPending = null;
+    this._orbitReqId = 0;
+    this.bigOrbitRequests = 0;
+    this.bigOrbitComputations = 0;
+    this.bigOrbitErrors = 0;
+    this.bigOrbitWorkerSpawns = 0;
+    this.lastBigOrbitMs = 0;
+    this.onBigOrbitReady = null;
+    this.orbitSource = 'none';
     if (!canvas) {
       throw new Error('WebGL initialization failed: canvas is null or undefined');
     }
@@ -378,7 +409,20 @@ ${mandelbrotBody}
         // every production draw (set in render()); the glitch observation hook is
         // the only caller that passes 1, and it reads the Pauldelbrot level the
         // perturbation branch computed instead of a palette colour.
+        //
+        // P2 adds u_diag == 2: the shader's OWN escape index, written in two bytes
+        // so the suite can compare the GPU's ESCAPE VALUE against an independent
+        // per-pixel reference instead of inferring it from a palette colour. The
+        // palette compresses an iteration difference of ~8 to ~0.25 RGB units at a
+        // deep budget, which is not a discriminating measurement; the escape index
+        // itself is. n = iter + 1 is the kernel's own 1-based convention (the
+        // escaping update), and n == u_maxIter + 1 is the INSIDE sentinel, exactly
+        // as the colour branch treats iter == u_maxIter.
         if (u_diag == 1) gl_FragColor = vec4(glitchLevel, 0.0, 0.0, 1.0);
+        else if (u_diag == 2) {
+          float en = float(iter) + 1.0;
+          gl_FragColor = vec4(floor(en / 256.0) / 255.0, mod(en, 256.0) / 255.0, 0.0, 1.0);
+        }
         else gl_FragColor = vec4(color, 1.0);
       }
     `;
@@ -588,6 +632,113 @@ ${mandelbrotBody}
     };
   }
 
+  // --- P2: the arbitrary-precision (BigInt) reference orbit -------------------
+  // The exact centre arrives as a DECIMAL STRING on the view (`centerXExact` /
+  // `centerYExact`), because that is the only representation that can name a point
+  // past a float64 centre's own ULP. The Worker computes the orbit at the working
+  // precision for the view scale and posts back the float32 transport words.
+  //
+  // Returns true when an orbit for this key is ALREADY uploaded (the draw can use
+  // it), false while a request is in flight or after an error (the caller falls
+  // back to the float64 lane for that draw). A completed orbit triggers
+  // `onBigOrbitReady`, wired by app.js to the real render path.
+  ensureBigOrbit(centerXStr, centerYStr, maxIter, scale) {
+    if (typeof Worker === 'undefined') return false;
+    const bits = this.bigOrbitBitsOverride > 0
+      ? this.bigOrbitBitsOverride
+      : BigOrbit.bitsForScale(scale);
+    const key = BigOrbit.orbitKey(centerXStr, centerYStr, maxIter, bits);
+    if (this._bigOrbit && this._bigOrbit.key === key && this._orbitTex) return true;
+    if (this._bigOrbitPending === key) return false;
+    this._bigOrbitPending = key;
+    const reqId = ++this._orbitReqId;
+    if (!this._orbitWorker) {
+      try {
+        this._orbitWorker = new Worker('orbitWorker.js');
+        this.bigOrbitWorkerSpawns++;
+      } catch (err) {
+        this._orbitWorker = null;
+        this._bigOrbitPending = null;
+        this.bigOrbitErrors++;
+        return false;
+      }
+      this._orbitWorker.onmessage = (event) => this._onBigOrbitMessage(event.data);
+      this._orbitWorker.onerror = () => {
+        this.bigOrbitErrors++;
+        this._bigOrbitPending = null;
+      };
+    }
+    this.bigOrbitRequests++;
+    this._lastRequestControl = BigOrbit.getControlStepShift();
+    this._orbitWorker.postMessage({
+      type: 'orbit',
+      id: reqId,
+      key: key,
+      centerX: centerXStr,
+      centerY: centerYStr,
+      maxIter: maxIter,
+      bits: bits,
+      width: this.maxOrbitWidth,
+      // TEST-ONLY transition-corruption injection (default 0), carried to the
+      // Worker because the control is read where the orbit is actually computed.
+      control: this._lastRequestControl,
+    });
+    return false;
+  }
+
+  _onBigOrbitMessage(msg) {
+    if (!msg) return;
+    if (msg.type === 'orbit-error') {
+      this.bigOrbitErrors++;
+      this._bigOrbitPending = null;
+      return;
+    }
+    if (msg.type !== 'orbit' || msg.key !== this._bigOrbitPending) return;
+    this._bigOrbitPending = null;
+    // Upload exactly as the float64 lane does: one float texel per iteration,
+    // .r = Re Z_k, .g = Im Z_k. The BigInt module has already produced the
+    // float32 words (the measured-sufficient transport).
+    const gl = this.gl;
+    const width = Math.max(1, Math.min(msg.width, this.maxOrbitWidth));
+    if (!gl || this.destroyed || gl.isContextLost()) return;
+    if (!this._orbitTex) this._orbitTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this._orbitTex);
+    const data = new Float32Array(width * 4);
+    for (let k = 0; k < width; k++) {
+      data[k * 4] = msg.zx[k];
+      data[k * 4 + 1] = msg.zy[k];
+    }
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, 1, 0, gl.RGBA, gl.FLOAT, data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    this._bigOrbit = { key: msg.key, width: width, bits: msg.bits, escapedAt: msg.escapedAt };
+    this._orbitKey = msg.key;
+    this._orbitW = width;
+    this._orbitZx = msg.zx;
+    this._orbitZy = msg.zy;
+    this.orbitComputations++;
+    this.bigOrbitComputations++;
+    this.lastBigOrbitMs = msg.ms;
+    if (typeof this.onBigOrbitReady === 'function') this.onBigOrbitReady();
+  }
+
+  // Observation only: the cached arbitrary-precision orbit's identity, so the
+  // suite can assert WHICH precision was actually used and that the orbit was
+  // really the BigInt one (no rendered behaviour reads this).
+  getBigOrbitInfo() {
+    if (!this._bigOrbit) return null;
+    return {
+      key: this._bigOrbit.key,
+      width: this._bigOrbit.width,
+      bits: this._bigOrbit.bits,
+      escapedAt: this._bigOrbit.escapedAt,
+      mode: this.orbitMode,
+      control: this._lastRequestControl || 0,
+    };
+  }
+
   render(view, maxIter, colorSchemeIdx = 0, fractalType = 0, juliaParams = undefined) {
     this.draw(view, maxIter, colorSchemeIdx, fractalType, juliaParams, 0);
   }
@@ -611,6 +762,28 @@ ${mandelbrotBody}
     }
     const n = w * h;
     return { n, glitched, glitchedFrac: glitched / n, worst };
+  }
+
+  // P2 observation hook: draw the SAME perturbation pass with u_diag = 2 and read
+  // back the shader's OWN escape index (n = iter + 1; n == maxIter + 1 means
+  // inside). The pin compares this against an independent per-pixel reference, so
+  // the measurement is of the escape VALUE rather than of a palette colour that
+  // compresses it. Production never passes diag = 2, so this adds no production
+  // path; it is the same pattern as P1's renderGlitchFrame.
+  renderOrbitFrame(view, maxIter, fractalType = 0, juliaParams = undefined) {
+    this.draw(view, maxIter, 0, fractalType, juliaParams, 2);
+    const gl = this.gl;
+    if (!gl || this.destroyed || gl.isContextLost()) return null;
+    const w = this.canvas.width, h = this.canvas.height;
+    const px = new Uint8Array(w * h * 4);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const cap = FractalKernel.clampMaxIter(maxIter);
+    const n = new Int32Array(w * h);
+    for (let i = 0; i < w * h; i++) {
+      const k = i * 4;
+      n[i] = Math.round(px[k]) * 256 + Math.round(px[k + 1]);
+    }
+    return { n, w, h, cap, insideSentinel: cap + 1 };
   }
 
   draw(view, maxIter, colorSchemeIdx, fractalType, juliaParams, diag) {
@@ -637,10 +810,29 @@ ${mandelbrotBody}
     // P1: the reference orbit is built/uploaded HERE, keyed on the view identity,
     // so a colour change, a resize or a repeated draw of the same view reuses it
     // (counted, not inferred).
+    //
+    // P2: which ORBIT SOURCE. A view carrying an exact decimal centre deeper than
+    // the float64 lane's reach (`BIGORBIT_MAX_SCALE`) uses the arbitrary-precision
+    // Worker orbit. Until it has arrived, or when the source is forced to
+    // 'float64' for observation, the float64 lane above serves the draw — which at
+    // this depth is exactly the wall P2 removes. The P1 pins run at 1e-15, where
+    // `scale < BIGORBIT_MAX_SCALE` is false and this branch is never taken.
     this.usePerturbation = deepLane;
-    if (deepLane) {
+    this.orbitSource = 'none';
+    const exactCentre = typeof view.centerXExact === 'string'
+      && typeof view.centerYExact === 'string';
+    if (deepLane && exactCentre && this.orbitMode !== 'float64'
+      && view.scale < BigOrbit.BIGORBIT_MAX_SCALE) {
+      const ready = this.ensureBigOrbit(view.centerXExact, view.centerYExact, cap, view.scale);
+      if (ready) {
+        this.usePerturbation = true;
+        this.orbitSource = 'bigint';
+      }
+    }
+    if (deepLane && this.orbitSource !== 'bigint') {
       this.ensureReferenceOrbit(view.centerX, view.centerY, cap);
       this.usePerturbation = !!(this._orbitTex && this._orbitW > 0);
+      if (this.usePerturbation) this.orbitSource = 'float64';
     }
     const program = this.usePerturbation ? this.program : this.plainProgram;
     gl.useProgram(program);
@@ -716,6 +908,13 @@ ${mandelbrotBody}
         try { lose.loseContext(); } catch (_) { /* already gone */ }
       }
     }
+    // P2: the orbit Worker is long-lived per renderer; a teardown must not leave
+    // it running (S1's live-renderer accounting is about GPU resources, this is
+    // the same discipline for the worker).
+    if (this._orbitWorker) {
+      try { this._orbitWorker.terminate(); } catch (_) { /* already gone */ }
+      this._orbitWorker = null;
+    }
     this.program = null;
     this.vsh = null;
     this.fsh = null;
@@ -726,6 +925,8 @@ ${mandelbrotBody}
     this._orbitTex = null;
     this._orbitKey = null;
     this._orbitW = 0;
+    this._bigOrbit = null;
+    this._bigOrbitPending = null;
     this.gl = null;
     trackLiveRenderer(-1);
   }
