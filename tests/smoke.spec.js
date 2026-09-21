@@ -18,10 +18,13 @@ async function countSetPixels(page) {
   });
 }
 
+// Note: every navigation uses './' rather than '/', so the suite can also be run
+// against a subpath deployment (a leading '/' resolves to the origin root and
+// would silently drop a baseURL path such as /fracvibe/).
 test('renders without uncaught errors (B1: dead element IDs crashed the app)', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (err) => pageErrors.push(String(err)));
-  await page.goto('/');
+  await page.goto('./');
 
   // #renderTime is only written after a successful render, and every render call
   // sits below the old crash site (app.js threw at line 181, on a null element).
@@ -35,7 +38,7 @@ test('renders without uncaught errors (B1: dead element IDs crashed the app)', a
 });
 
 test('saved-locations modal opens and closes (B1: the modal IDs are wired up)', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('./');
   await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
 
   await page.click('#loadLocationBtn');
@@ -46,7 +49,7 @@ test('saved-locations modal opens and closes (B1: the modal IDs are wired up)', 
 });
 
 test('Space puts the 3D canvas on screen (B2: it rendered below the fold)', async ({ page }) => {
-  await page.goto('/');
+  await page.goto('./');
   await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
 
   const threeCanvas = page.locator('body > canvas:not([id])'); // appended by three.js
@@ -72,7 +75,7 @@ test('CPU mode recalculates once the startup zoom animation settles (B3)', async
   // possible. The checkbox handler starts a calculation at the *current* animation
   // scale, and the animation itself never recalculates, so a correct final image
   // can only come from the recalculation when the animation settles.
-  await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await page.goto('./', { waitUntil: 'domcontentloaded' });
   await page.uncheck('#webglRender');
 
   const zoom = await page.locator('#info').textContent();
