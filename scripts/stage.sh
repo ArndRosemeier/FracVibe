@@ -322,13 +322,15 @@ for dirpath, _dirs, files in os.walk(dst):
 # by any page, so it is REPORTED, not failed. (The first run against the
 # WEBGPU-GROUNDWORK files caught exactly that.)
 #
-# HONEST NOTE ON THIS CHECK: the hazard branch is an INVARIANT ASSERTION, not a
-# tested guard. `dist/` is rebuilt from `public/`, and every file reachable from an
-# entry point is emitted under a content-addressed name by construction, so a bare
-# reachable name cannot occur from a normal run — which means no injection can make
-# this branch fire. It is kept because it is one cheap `os.listdir` and it would
-# catch a future refactor that started copying files verbatim instead of emitting
-# them. Do not read its green as evidence that stale-name protection was exercised.
+# HONEST NOTE ON THIS CHECK, corrected after trying to test it: every attempted
+# control arm was VOID, and the reason is structural. `dist/` is rebuilt from
+# `public/` and every file reachable from an entry point is emitted under a
+# content-addressed name, so a bare REACHABLE name cannot arise from a normal run
+# (emptying the reachable set just turns everything into an orphan; naming a
+# versioned file as "reachable" finds no bare file to match). This branch is
+# therefore an INVARIANT ASSERTION, not a tested guard: it would only fire if a
+# future refactor copied files verbatim instead of emitting them. Its green must
+# NOT be read as evidence that stale-name protection was exercised.
 _ver = __import__('re')
 orphans = []
 for f in sorted(os.listdir(dst)):
