@@ -96,7 +96,41 @@ test('a WebGL failure AFTER startup starts a NEW CPU calculation', async ({ page
   expect(pageErrors).toEqual([]);
 });
 
-test('a lost WebGL context degrades to the CPU canvas with a message', async ({ page }) => {
+// The REAL event path: the browser fires `webglcontextlost` at the canvas, the
+// listener installed by attachContextLossGuard must call preventDefault() and
+// degrade. A dispatchEvent on a cancelable event returns false exactly when the
+// handler cancelled it, so the guard's preventDefault() is pinned too — not
+// assumed. (The hook-based test below covers the handler, NOT this wiring.)
+test('the real webglcontextlost event degrades to the CPU canvas with a message', async ({ page }) => {
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(String(err)));
+  await page.goto('./', { waitUntil: 'domcontentloaded' });
+  await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
+
+  const dispatch = await page.evaluate(() => {
+    const e = new Event('webglcontextlost', { cancelable: true });
+    const target = document.getElementById('fractalCanvasWebGL');
+    return { returnValue: target.dispatchEvent(e), prevented: e.defaultPrevented };
+  });
+  // false = the guard cancelled the default (i.e. the REAL listener is wired up).
+  expect(dispatch.returnValue, 'attachContextLossGuard must preventDefault()').toBe(false);
+  expect(dispatch.prevented).toBe(true);
+
+  const message = page.locator('#appMessage');
+  await expect(message).toBeVisible();
+  await expect(message).toContainText(/context lost/i);
+  await expect(message).toContainText(/CPU/i);
+  await expect(page.locator('#fractalCanvas')).toBeVisible();
+  await expect(page.locator('#fractalCanvasWebGL')).toBeHidden();
+  await expect(page.locator('#webglRender')).not.toBeChecked();
+  await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
+
+  expect(pageErrors).toEqual([]);
+});
+
+// Coverage of the degradation HANDLER (called directly). This does not exercise
+// the DOM listener wiring — the test above is the one that pins that.
+test('handleWebGLLoss (via the observation hook) degrades to the CPU canvas with a message', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (err) => pageErrors.push(String(err)));
   await page.goto('./', { waitUntil: 'domcontentloaded' });
