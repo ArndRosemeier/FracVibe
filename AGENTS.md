@@ -3,7 +3,7 @@
 Interactive 2D / WebGL / 3D fractal explorer. Static ES modules served from
 `public/`; Netlify publishes `public/` with **no build step**. `server/server.js`
 is a dev convenience (Express, :3000). The Playwright suite lives under `tests/`
-(8 spec files, **43 tests**, ~1.9 min) and starts that server itself.
+(11 spec files, **52 tests**, ~2.9 min) and starts that server itself.
 
 ## Read before you act
 1. **`docs/STATE.md`** — the board: what is happening now, and the one screen a

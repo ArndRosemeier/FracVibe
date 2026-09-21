@@ -107,3 +107,21 @@ Artifacts: `probe.html`, `run-probe.cjs`, `real_frag.glsl`, `df_frag.glsl`,
 `sweepB_timing2.json`, `glitchcheck.json`, `extra_1e9_1e10.json`, `cpucompare.json`,
 `coord_crossing.json`, `sweep.log`. `public/` there is a symlink into the repo, so the
 probe read the real shader without writing into the repo.
+
+## ⚠ CORRECTIONS (appended 2026-09-21, after slice D2 measured against the app's own kernel)
+The original text above is kept as evidence. Two things need qualifying:
+
+1. **The `1e6 / maxIter 32768` row does NOT reproduce** against the app's kernel. D2 measured
+   the same centre at 200×150, scale 1e-6, and found **74.9 % inside at cap 8192** (and
+   90.9 % → 77.2 % → 75.7 % → 74.9 % from cap 512 → 2048 → 4096 → 8192) — not trending to the
+   `0.0` this table records. That row is therefore unreliable. What DOES reproduce, and what
+   the campaign actually relied on, is the **1e8** pair (100.0 % inside at cap 512, 0.0 % at
+   cap 4096) and the 1e6/512 case (90.9 %). **Treat every other deep row as UNVERIFIED until
+   reproduced.**
+2. **The centre's escape count is 3086, not 3085**: the app's kernel counts 1-based where the
+   probe counted 0-based. Immaterial to the rule derived from it (512/decade still covers it),
+   but `/docs/PLAN-DEEPZOOM.md`'s "3085" should be read as ~3086.
+
+Same lesson shape as the earlier `Int32Array` correction on this project: a probe's numbers are
+evidence only for the arms it actually ran, and a cross-check against the SHIPPING kernel is
+what caught this one.
