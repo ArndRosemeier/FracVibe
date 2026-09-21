@@ -61,6 +61,17 @@ export class Fractal3DViewer {
     this.colorScheme = 'rainbow';
     this.colorOffset = 0;
     this.getColorForHeight = this.makeColorForHeightFn('rainbow');
+    // --- S5/B8 split state ---
+    // `heightmapCalls` counts every kernel evaluation this viewer performs. It is
+    // exposed through `window.__fv.heightmapCalls` so "a colour change evaluates
+    // nothing" is COUNTED, not inferred. `heightmap` / `heightMin` / `heightMax`
+    // are the cached results a colour-only rewrite reuses, so the palette mapping
+    // has exactly one implementation whether the mesh was just built or only
+    // recoloured.
+    this.heightmapCalls = 0;
+    this.heightmap = null;
+    this.heightMin = 0;
+    this.heightMax = 0;
   }
 
   async init() {
@@ -112,6 +123,51 @@ export class Fractal3DViewer {
     await this.regenerateMesh();
   }
 
+  // The ONLY fractal evaluation in this file (S5/B8). Every heightmap is
+  // computed here and counted, so a colour change can be PROVEN not to evaluate
+  // the fractal. Called by `regenerateMesh` when the fractal parameters or the
+  // resolution actually changed; never by a colour setter.
+  async evaluateHeightmap() {
+    this.heightmapCalls++;
+    const params = this.getFractalParams();
+    const heights = await this.fractalEngine.calculateHeightmap(
+      this.resolution,
+      this.resolution,
+      {...params, exaggeration: 0.03}
+    );
+    return smoothHeightmap(heights, this.resolution);
+  }
+
+  // The SEPARATE half of the mesh work (S5/B8): rewrite the geometry's `color`
+  // attribute from the CACHED heightmap and height range. It never calls the
+  // kernel and never touches the position attribute, so a colour tick is O(n)
+  // palette lookups instead of a resolution^2 fractal evaluation. Runs once at
+  // the end of a rebuild and on every colour change.
+  applyColors() {
+    const geometry = this.terrain && this.terrain.geometry;
+    const heights = this.heightmap;
+    if (!geometry || !heights) return;
+    const count = geometry.attributes.position.count;
+    let attr = geometry.attributes.color;
+    if (!attr || !attr.array || attr.array.length !== count * 3) {
+      // Reuse the live buffer once it exists: replacing the attribute on every
+      // colour tick would orphan its GL buffer each frame.
+      attr = new THREE.BufferAttribute(new Float32Array(count * 3), 3);
+      geometry.setAttribute('color', attr);
+    }
+    const colors = attr.array;
+    const minH = this.heightMin;
+    const maxH = this.heightMax;
+    for (let i = 0; i < count; ++i) {
+      const h = (heights[i] - minH) / (maxH - minH + 1e-6);
+      const color = this.getColorForHeight(h);
+      colors[i * 3] = color.r;
+      colors[i * 3 + 1] = color.g;
+      colors[i * 3 + 2] = color.b;
+    }
+    attr.needsUpdate = true;
+  }
+
   async regenerateMesh() {
     // Show progress bar (reuse logic from changeResolution)
     const progress = document.getElementById('fractal3d-progress');
@@ -123,6 +179,7 @@ export class Fractal3DViewer {
       setTimeout(() => { bar.style.width = '90%'; bar.style.transition = 'width 1.5s linear'; }, 50);
     }
     await new Promise(requestAnimationFrame);
+    if (!this.active) return; // exited while this rebuild was suspended
     // Remove old mesh
     if (this.terrain) {
       this.scene.remove(this.terrain);
@@ -130,33 +187,27 @@ export class Fractal3DViewer {
       this.terrain.material.dispose();
       this.terrain = null;
     }
-    // Get fractal params and recalculate mesh
-    const params = this.getFractalParams();
-    let heights = await this.fractalEngine.calculateHeightmap(
-      this.resolution,
-      this.resolution,
-      {...params, exaggeration: 0.03}
-    );
-    heights = smoothHeightmap(heights, this.resolution);
+    // The fractal is evaluated HERE and only here (S5/B8): a colour change must
+    // never reach this method.
+    const heights = await this.evaluateHeightmap();
+    if (!this.active || !this.scene) return; // torn down during the evaluation
+    this.heightmap = heights;
+    let minH = Infinity, maxH = -Infinity;
+    for (let i = 0; i < heights.length; ++i) {
+      if (heights[i] < minH) minH = heights[i];
+      if (heights[i] > maxH) maxH = heights[i];
+    }
+    this.heightMin = minH;
+    this.heightMax = maxH;
     const geometry = new THREE.PlaneGeometry(
       this.width,
       this.height,
       this.resolution - 1,
       this.resolution - 1
     );
-    let minH = Infinity, maxH = -Infinity;
-    for (let i = 0; i < heights.length; ++i) {
-      if (heights[i] < minH) minH = heights[i];
-      if (heights[i] > maxH) maxH = heights[i];
-    }
-    const colors = [];
     for (let i = 0; i < geometry.attributes.position.count; ++i) {
-      const h = (heights[i] - minH) / (maxH - minH + 1e-6);
-      const color = this.getColorForHeight(h);
-      colors.push(color.r, color.g, color.b);
       geometry.attributes.position.setZ(i, heights[i]);
     }
-    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
     geometry.computeVertexNormals();
     const material = new THREE.MeshStandardMaterial({
       vertexColors: true,
@@ -167,6 +218,9 @@ export class Fractal3DViewer {
     this.terrain = new THREE.Mesh(geometry, material);
     this.terrain.rotation.x = -Math.PI / 2;
     this.scene.add(this.terrain);
+    // Colours come from the heightmap-free path, so a rebuild and a colour tick
+    // share ONE implementation of the palette mapping.
+    this.applyColors();
     // Hide progress bar
     if (progress && bar) {
       bar.style.width = '100%';
@@ -177,13 +231,14 @@ export class Fractal3DViewer {
   setColorScheme(scheme) {
     this.colorScheme = scheme;
     this.getColorForHeight = this.makeColorForHeightFn(scheme);
-    // Regenerate mesh with new palette
-    if (this.active) this.regenerateMesh();
+    // B8: rewrite the colour attribute only — never re-evaluate the fractal.
+    if (this.active) this.applyColors();
   }
 
   setColorOffset(offset) {
     this.colorOffset = offset;
-    if (this.active) this.regenerateMesh();
+    // B8: rewrite the colour attribute only — never re-evaluate the fractal.
+    if (this.active) this.applyColors();
   }
 
   updateCamera() {
@@ -320,10 +375,20 @@ export class Fractal3DViewer {
         this.renderer.domElement.parentNode.removeChild(this.renderer.domElement);
       }
     }
+    // Release the three.js renderer (programs, buffers and the GL context)
+    // instead of leaking one on every enter/exit of 3D mode (S5). Guarded
+    // because exit() also runs on a FAILED init, where the renderer may never
+    // have been constructed.
+    if (this.renderer && typeof this.renderer.dispose === 'function') {
+      try { this.renderer.dispose(); } catch (_) { /* already unusable */ }
+    }
     this.scene = null;
     this.camera = null;
     this.renderer = null;
     this.terrain = null;
+    this.heightmap = null;
+    const progress = document.getElementById('fractal3d-progress');
+    if (progress) progress.style.display = 'none';
   }
 
   makeColorForHeightFn(scheme) {

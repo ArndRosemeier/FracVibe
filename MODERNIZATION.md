@@ -28,7 +28,7 @@
 
 ---
 
-## 2. P0 — repairs (B1–B3 done, B4–B8 open)
+## 2. P0 — repairs (B1–B8; all fixed — B1–B3 in Phase 0, B4–B7 in S1–S4, B8 in S5)
 
 **Status.** B1, B2 and B3 are fixed in this working tree (`public/app.js`,
 `public/index.html`, `public/styles.css`) and covered by `tests/smoke.spec.js`
@@ -107,6 +107,21 @@ dedicated pin.
 `resolution²` fractal evaluation (up to 4096²) plus `PlaneGeometry` rebuild *per animation
 frame*. Palette changes must only rewrite the geometry's `color` attribute (or be a shader
 uniform).
+*Fixed (S5):* the mesh work is split. `Fractal3DViewer.evaluateHeightmap()`
+(`public/fractal3d.js:130`) owns the ONE `calculateHeightmap` call and counts it
+(`heightmapCalls++`), and it is reached only from `regenerateMesh()` (`:192`), which runs
+when the fractal parameters or the resolution changed. `applyColors()` (`:146`) rewrites
+the geometry's `color` attribute in place from the cached `heightmap`/`heightMin`/
+`heightMax`; `setColorOffset` (`:238`) and `setColorScheme` (`:231`) now call that instead
+of rebuilding, so a colour tick performs **zero** fractal evaluations and builds no
+`PlaneGeometry`. The result is unchanged by construction: a rebuild ends in the same
+`applyColors()` the colour tick uses, so there is one palette mapping, not two. Pinned by
+`tests/3d-truth.spec.js` — a counted evaluation total that must not advance across real
+colour-cycle ticks (non-vacuous: the ticks and the 3D offset are counted too), and a
+sampled colour-attribute comparison against `FractalKernel.paletteFunction` derived from
+the geometry's own vertex heights, tolerance 1/255. Deliberately NOT taken: a 3D palette
+shader uniform, which the paragraph above allows but which rewrites the `MeshStandardMaterial`
+and its GLSL for no behaviour this slice needs (`docs/DECISIONS.md` row 21).
 
 *Also worth folding into this pass:* if WebGL context creation fails, the `catch` in
 `updateWebGLState()` does not start a CPU calculation → blank canvas in the fallback path.
@@ -120,6 +135,18 @@ releases the context via `WEBGL_lose_context`; it also accounts for live rendere
 suite can assert teardown. A canvas that lost its context is replaced before a later GPU
 toggle, and `window` `error`/`unhandledrejection` listeners surface anything that still
 escapes. Pinned by `tests/webgl-fallback.spec.js`.
+*Fixed (S5), the 3D half of the same fold-in:* `Fractal3DViewer.init()` is now **awaited**
+by `enter3DMode()` (`public/app.js:512`, `await viewer3d.init()` `:520`). Before S5 the
+`app.js:489` call had no `await` and no `catch`, while three.js constructs its
+`WebGLRenderer` synchronously inside `init()` and throws `Error creating WebGL context.`
+when no context can be created — so a GPU-less or driver-blocklisted machine got an
+unhandled rejection and a black screen with both 2D canvases already hidden. The failure
+path now tears the viewer down (`Fractal3DViewer.exit()` also `dispose()`s the renderer and
+hides the progress bar), restores the 2D canvas and the pre-3D UI through
+`restore2DFrom3D()` (`:504`), and reports through the S1 `#appMessage` surface (`:525`);
+the 2D canvases are hidden only after a successful init. Pinned by
+`tests/webgl-fallback.spec.js:228`, which denies every WebGL context through the ONE S1
+helper (now shared at `tests/helpers/webgl.js`).
 
 ---
 
@@ -229,8 +256,9 @@ All are reasonable later; none are needed to fix the current defects.
 ## 6. Reproducing the checks
 
 ```bash
-# smoke suite: 4 tests — B1 (render + modal), B2 (3D canvas on screen), B3 (CPU recalc)
-npm test                      # expects 4 passed
+# full suite: 38 tests — the B1–B3 smoke tests (tests/smoke.spec.js) plus the
+# S1–S5 pins (tests/*.spec.js); per-slice counts are in docs/PLAN.md
+npm test                      # expects 38 passed
 # Uses host Chrome via `channel: 'chrome'` in playwright.config.js, so no browser
 # download is needed; elsewhere run `npx playwright install chromium` and drop the channel.
 

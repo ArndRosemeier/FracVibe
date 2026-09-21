@@ -437,6 +437,10 @@ let colorCycleActive = true;
 let colorCycleOffset = 0;
 let colorCycleLastTime = 0;
 let colorCycleRequestId = null;
+// Colour-cycle frames that actually ran. Exposed through `window.__fv` (S5) so
+// "the heightmap count did not advance across colour ticks" cannot be vacuous —
+// a stopped cycle would also leave the count untouched.
+let colorCycleTicks = 0;
 
 // Progressive rendering state
 let progressiveState = null;
@@ -482,13 +486,52 @@ function getFractalParams() {
   };
 }
 
-function enter3DMode() {
+// --- S5: 3D mode entry is AWAITED --------------------------------------------
+// `Fractal3DViewer.init()` is async and three.js constructs its WebGLRenderer
+// synchronously inside it. Before S5 it was called without `await` or `catch`
+// after both 2D canvases had been hidden, so a GPU-less or driver-blocklisted
+// machine got an unhandled rejection and a black screen with no message. It is
+// awaited now; every failure tears the 3D viewer down, restores the 2D UI and
+// reports through `#appMessage`.
+//
+// `threeDGeneration` invalidates an in-flight init when the user leaves 3D mode
+// (or re-enters) while it is still starting, so a late success or failure cannot
+// hide or restore the wrong UI state.
+let threeDGeneration = 0;
+
+// Put the UI back exactly where a normal 3D exit leaves it. Safe to call when
+// init() failed before it hid anything (the 2D UI is simply re-asserted).
+function restore2DFrom3D() {
+  fractal3D = null;
+  in3DMode = false;
+  infoElem.style.display = '';
+  // Restores (and repaints) whichever 2D renderer was active before 3D mode.
+  updateWebGLState();
+}
+
+async function enter3DMode() {
   if (in3DMode) return;
+  const generation = ++threeDGeneration;
   in3DMode = true;
-  fractal3D = new Fractal3DViewer(document.body, FractalKernel, getFractalParams);
-  fractal3D.init();
+  let viewer3d = null;
+  try {
+    viewer3d = new Fractal3DViewer(document.body, FractalKernel, getFractalParams);
+    fractal3D = viewer3d;
+    await viewer3d.init();
+  } catch (err) {
+    if (generation !== threeDGeneration) return; // a later exit already restored
+    try { if (viewer3d) viewer3d.exit(); } catch (_) { /* teardown must not mask the cause */ }
+    restore2DFrom3D();
+    showError('3D mode unavailable — WebGL could not be initialised: ' + errorText(err));
+    return;
+  }
+  if (generation !== threeDGeneration) {
+    // The user left 3D mode while init() was in flight; do not hide the 2D UI.
+    try { if (viewer3d) viewer3d.exit(); } catch (_) { /* already torn down */ }
+    return;
+  }
   // Hide BOTH 2D canvases: three.js appends its own canvas to <body>, and a
-  // visible in-flow canvas would push that one below the fold.
+  // visible in-flow canvas would push that one below the fold. Only on SUCCESS.
   canvas.style.display = 'none';
   canvasWebGL.style.display = 'none';
   infoElem.style.display = 'none';
@@ -497,6 +540,7 @@ function enter3DMode() {
 function exit3DMode() {
   if (!in3DMode) return;
   in3DMode = false;
+  threeDGeneration++; // invalidate an init() that is still in flight
   if (fractal3D) fractal3D.exit();
   fractal3D = null;
   infoElem.style.display = '';
@@ -933,6 +977,7 @@ viewer.setColorScheme(colorSchemeSelect.value);
 
 function colorCycleLoop(ts) {
   if (!colorCycleActive) return;
+  colorCycleTicks++;
   if (!colorCycleLastTime) colorCycleLastTime = ts;
   const dt = (ts - colorCycleLastTime) / 1000;
   colorCycleLastTime = ts;
@@ -1190,6 +1235,62 @@ window.__fv = Object.freeze({
   minScale: WEBGL_MIN_SCALE,
   liveRenderers: () => (typeof window.__fvLiveWebglRenderers === 'number' ? window.__fvLiveWebglRenderers : 0),
   animationSettled: () => zoomAnimationSettled,
+  // --- S5 3D-truth observables (B8 + the awaited 3D failure path) ---
+  // How many times the 3D viewer has EVALUATED the fractal heightmap. A colour
+  // change (offset or scheme) must leave this number untouched: counted, not
+  // inferred. Before S5 a colour tick called regenerateMesh, i.e. a full
+  // resolution^2 fractal evaluation per animation frame.
+  heightmapCalls: () => (fractal3D ? fractal3D.heightmapCalls : 0),
+  // Colour-cycle frames that actually ran, so "the heightmap count did not
+  // advance" cannot be vacuous (zero ticks would also not advance it).
+  colorCycleTicks: () => colorCycleTicks,
+  in3DMode: () => in3DMode,
+  // The 3D mesh exists and is on screen (init() finished its first rebuild).
+  threeDReady: () => !!(fractal3D && fractal3D.terrain),
+  colorScheme3D: () => (fractal3D ? fractal3D.colorScheme : null),
+  colorOffset3D: () => (fractal3D ? fractal3D.colorOffset : 0),
+  terrainVertexCount: () => (fractal3D && fractal3D.terrain
+    ? fractal3D.terrain.geometry.attributes.position.count
+    : 0),
+  // The height range actually stored on the LIVE geometry (read from the
+  // position attribute, not from a cached field), so the palette pin derives its
+  // expectation from what is on the mesh.
+  terrainHeightRange: () => {
+    if (!fractal3D || !fractal3D.terrain) return null;
+    const pos = fractal3D.terrain.geometry.attributes.position;
+    let min = Infinity, max = -Infinity;
+    for (let i = 0; i < pos.count; ++i) {
+      const z = pos.getZ(i);
+      if (z < min) min = z;
+      if (z > max) max = z;
+    }
+    return { min, max, count: pos.count };
+  },
+  // (z, r, g, b) for the requested vertex indices, so a colour rewrite can be
+  // checked against the geometry that is actually rendered.
+  sample3DTerrain: (indices) => {
+    if (!fractal3D || !fractal3D.terrain) return null;
+    const g = fractal3D.terrain.geometry;
+    const pos = g.attributes.position;
+    const col = g.attributes.color;
+    if (!col) return null;
+    return indices.map((i) => ({
+      z: pos.getZ(i),
+      r: col.getX(i),
+      g: col.getY(i),
+      b: col.getZ(i)
+    }));
+  },
+  // Drive the REAL 3D colour paths with known values (the same way
+  // `forceFallback` and `importPayload` drive theirs); adds no production path.
+  set3DColorOffset: (offset) => {
+    if (!fractal3D) throw new Error('3D mode is not active');
+    fractal3D.setColorOffset(offset);
+  },
+  set3DColorScheme: (scheme) => {
+    if (!fractal3D) throw new Error('3D mode is not active');
+    fractal3D.setColorScheme(scheme);
+  },
   // --- S3 kernel observables (the ONE cap, observed not inferred) ---
   // `maxIterCap` is the kernel constant the slider max, the clamps and the shader
   // loop bound all derive from. `shaderMaxIter` is the value actually templated

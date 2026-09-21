@@ -7,6 +7,9 @@
 // tests/smoke.spec.js: drive the real app in the real browser, never a second
 // fixture set.
 const { test, expect } = require('@playwright/test');
+// The WebGL-denial technique lives in ONE place so the S1 pins and the S5
+// 3D-init pin cannot drift apart.
+const { denyWebGLContexts } = require('./helpers/webgl');
 
 // Pixels belonging to the fractal set render black (see smoke.spec.js).
 async function countSetPixels(page) {
@@ -25,16 +28,8 @@ async function countSetPixels(page) {
 
 // Make every WebGL context request fail, exactly as a GPU-less browser or a
 // driver-blocklisted machine would. '2d' is untouched, so the CPU renderer can
-// still do its job.
-async function denyWebGLContexts(page) {
-  await page.addInitScript(() => {
-    const original = HTMLCanvasElement.prototype.getContext;
-    HTMLCanvasElement.prototype.getContext = function (type, ...rest) {
-      if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') return null;
-      return original.call(this, type, ...rest);
-    };
-  });
-}
+// still do its job. (The implementation is shared with the S5 3D-init pin via
+// tests/helpers/webgl.js.)
 
 test('forced WebGL context-creation failure still renders on the CPU canvas and says so', async ({ page }) => {
   const pageErrors = [];
@@ -223,4 +218,44 @@ test('the last-resort error net surfaces an uncaught error instead of freezing',
   // The renderer must still be alive and painting after the net caught these.
   await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
   expect(pageErrors.length).toBeGreaterThan(0); // the page errors were REAL
+});
+
+// S5: 3D mode entry on a machine with no usable GPU. Before S5 `enter3DMode()`
+// called the async `Fractal3DViewer.init()` with no `await` and no `catch` AFTER
+// hiding both 2D canvases, so `new THREE.WebGLRenderer()` (three.module.js)
+// threw into an unhandled rejection and left a black screen with no message.
+// The SAME WebGL denial the S1 pins use is applied here (one helper, no copy).
+test('3D mode with WebGL unavailable shows a message and restores the 2D canvas', async ({ page }) => {
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(String(err)));
+  await denyWebGLContexts(page);
+  await page.goto('./', { waitUntil: 'domcontentloaded' });
+
+  // The app itself has already fallen back to the CPU canvas (S1).
+  await expect(page.locator('#fractalCanvas')).toBeVisible();
+  await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
+  await expect
+    .poll(async () => page.evaluate(() => window.__fv.animationSettled()), { timeout: 30_000 })
+    .toBe(true);
+
+  await page.keyboard.press('Space');
+
+  // A visible, non-modal message reports the 3D failure (not an alert, not a
+  // silent black screen).
+  const message = page.locator('#appMessage');
+  await expect(message).toBeVisible();
+  await expect(message).toContainText(/3D/i);
+  await expect(message).toContainText(/WebGL/i);
+
+  // The 2D canvas is restored and the UI is back out of 3D mode: no three.js
+  // canvas took over the screen, the info readout is shown again, and a 2D
+  // render completed.
+  await expect(page.locator('#fractalCanvas')).toBeVisible();
+  await expect(page.locator('body > canvas:not([id])')).toHaveCount(0);
+  await expect(page.locator('#info')).toBeVisible();
+  await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
+  await expect.poll(() => page.evaluate(() => window.__fv.in3DMode())).toBe(false);
+
+  // No unhandled rejection / uncaught exception escaped.
+  expect(pageErrors).toEqual([]);
 });
