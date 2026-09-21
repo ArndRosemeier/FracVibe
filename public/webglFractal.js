@@ -673,8 +673,14 @@ ${mandelbrotBody}
     if (shift < 0) shift = 0;
     shift += seedShiftOverride | 0;
     if (shift < 0) shift = 0;
-    // S = 2^-shift is a normal float32 only while shift <= 120; past the measured
-    // reach the shift saturates, which is what WEBGL_ZOOM_CAP encodes.
+    // S = 2^-shift is a normal float32 only while shift <= 120; past that the shift
+    // saturates. This is a RANGE limit (the delta seed stops tracking the view scale
+    // around 1e-49) and it binds LATER than the current solver's MANTISSA limit: the
+    // 24-bit float32 delta accumulates relative error and is measured 7.4 %
+    // misclassified at 1e-42. Since LANE-CONTINUITY there is NO zoom cap, so neither
+    // is a stop — the app keeps rendering and says via the deep-precision notice that
+    // the current single-factor solver is past its measured-correct reach. Widening
+    // the MANTISSA (compensated / multi-component delta) is the next solver slice.
     if (shift > MAX_SHIFT) shift = MAX_SHIFT;
     // Scale by a power of two exactly (`Math.pow(2, n)` is exact for integer n).
     const scaled = scale * Math.pow(2, shift);
@@ -934,14 +940,27 @@ ${mandelbrotBody}
     const cap = FractalKernel.clampMaxIter(maxIter);
     // P1: WHICH LANE. The reference orbit buys accuracy only past where the plain
     // float32 coordinate has already lost its pixels, and it costs a texture fetch
-    // per iteration, so the deep lane starts at the SAME scale the shipped GPU zoom
-    // cap already owns (`ITER_BUDGET_MIN_SCALE`, the one constant the D2 floor and
-    // `app.js`'s WEBGL_MIN_SCALE are pinned equal to). Above that scale the plain
-    // lane is byte-for-byte the pre-P1 shader, so shallow cost and shallow pixels
-    // are unchanged — measured: keeping the deep lane always on doubled the whole
+    // per iteration, so the deep lane starts at the scale the app's deep-lane
+    // boundary owns (`ITER_BUDGET_MIN_SCALE`). Above that scale the plain lane is
+    // byte-for-byte the pre-P1 shader, so shallow cost and shallow pixels are
+    // unchanged — measured: keeping the deep lane always on doubled the whole
     // full-gate wall time (5.9m vs 2.9m), because the startup animation alone draws
-    // ~60 full-window frames. The lane boundary is a depth boundary, not a
-    // precision transition inside one zoom: nothing in the P1 pins sweeps across it.
+    // ~60 full-window frames.
+    //
+    // LANE-CONTINUITY (2026-09-22) MEASURED this program switch on its own, with the
+    // effective budget held FIXED at 4096 and 8192 so D2's budget floor could not
+    // contribute: across the boundary the frame moves by 0.005-0.036 mean-red units,
+    // which is the same order as the sweep's own non-boundary step (0.036). The
+    // visible 31.6-unit jump that made this boundary a defect was the BUDGET FLOOR
+    // TURNING ON at the same scale (512 -> 2058 in one step), not the lane: the two
+    // lanes agree here because at 1e-4 the plain float32 coordinate is still
+    // sub-pixel accurate. So the lane choice stays a program choice and is
+    // measurably invisible; the budget rule was made continuous instead (see
+    // `iterBudgetForScale`). A pin (`tests/lane-continuity.spec.js`) holds BOTH
+    // halves: the shipped sweep has no outlier step, and the lane switch's own
+    // colour delta is below the sweep's noise. Blending the two programs across a
+    // band was rejected on this measurement — it would double the draw cost in the
+    // band for a difference smaller than the frame's own step-to-step change.
     const deepLane = this.hasFloatTexture
       && view.scale < FractalKernel.ITER_BUDGET_MIN_SCALE
       && (diag === 1 || fractalType === FractalKernel.indexForType('mandelbrot'));

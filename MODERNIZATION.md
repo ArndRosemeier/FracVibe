@@ -230,6 +230,12 @@ patch" smell and is what produced B1. Consolidate view state + clamping into one
 `onWheel` and the startup animation all route through it, `renderWebGL` no longer clamps, and
 both monkey-patches plus the dead wheel guard are deleted. Pinned (all three paths must
 produce the same scale) by `tests/zoom-clamp.spec.js`.
+*Amended (LANE-CONTINUITY, 2026-09-22, `docs/DECISIONS.md` rows 64–65):* the **cap is now
+DISABLED** — the owner's directive is "no hard stop", so the app ships `setZoomLimit(null,
+null)` and depth is bounded by time. The machinery above still exists and still owns the ONE
+clamp; `tests/zoom-clamp.spec.js` now exercises it through the diagnostic
+`__fv.setZoomLimitForTest` AND asserts the shipped state is unlimited, so this paragraph
+describes the machinery rather than a shipped cap.
 
 **Dead / orphan files.**
 - `recursiveFractalVibe.js`, `recursiveFractalLetter.js`, `splashMandelbrotCurve.js` — never

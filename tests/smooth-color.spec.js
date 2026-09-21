@@ -39,15 +39,13 @@ const BAND_CAP = 50;
 // The scale sweep: 0.05 down to the cap's own minimum (1/10000), log-spaced.
 const SWEEP_LO = 0.05;
 const SWEEP_STEPS = 14;
-// The deepest scale the hop sweep uses, and WHY it is not the app's cap.
-// GPU-ARBITRARY lifted the app's zoom cap to 1e-6, so the perturbation (deep) lane's
-// boundary at 1e-4 is now INSIDE the reachable range. That boundary is a program
-// SWITCH and a sweep that crosses it measures the switch rather than the colour
-// mapping: probed at scale 6.7e-5 the step-to-step hop fraction jumps to 0.469
-// (13404 of 13404 sub-iteration pixels) purely from the lane change. This pin's
-// subject is the COLOUR mapping, so its sweep stops at the boundary; a companion pin
-// (D1 pin 7) reports the lane switch's own magnitude instead of pretending it does
-// not exist.
+// The deepest scale the hop sweep uses, and WHY it is not the app's cap (there is no
+// cap any more — LANE-CONTINUITY removed it). GPU-ARBITRARY had lifted the cap so the
+// perturbation (deep) lane's boundary at 1e-4 became INSIDE the reachable range. That
+// boundary is a program SWITCH with its own budget rule, and this pin's subject is the
+// COLOUR mapping, so its sweep stops at the boundary; the boundary itself is pinned by
+// tests/lane-continuity.spec.js (which measures the colour delta ACROSS it, both with
+// the shipped budget and with the budget held fixed).
 const SWEEP_HI_SCALE = 1.2e-4;
 
 async function waitIdle(page) {
@@ -247,15 +245,15 @@ test('D1 pin 3: no hop while zooming, at any step including the cap boundary', a
   page.on('pageerror', (err) => pageErrors.push(String(err)));
   await setup(page);
 
-  // GPU-ARBITRARY moved the app's zoom cap to 1e-20 (the measured cost wall), and
-  // this pin runs the CPU lane: at 1e-20 the D2 budget is saturated and almost
-  // every pixel is INSIDE the set, so the sub-iteration population it must measure
-  // disappears. The sweep is therefore anchored on a stated DEEPEST scale where the
-  // CPU lane still resolves sub-iteration moves, and the cap boundary is checked
-  // separately below. `SWEEP_HI_SCALE` is a number, not the app's cap, so a later
-  // cap change cannot silently make this pin vacuous again.
-  const minScale = await page.evaluate(() => window.__fv.minScale);
-  const sweepHi = Math.max(minScale, SWEEP_HI_SCALE);
+  // GPU-ARBITRARY lifted the app's zoom cap, and LANE-CONTINUITY removed it
+  // entirely, so the perturbation (deep) lane's boundary at 1e-4 is inside the
+  // reachable range. That boundary is a program SWITCH and this pin's subject is the
+  // COLOUR mapping, so its sweep stops above it at a STATED scale. The boundary's own
+  // colour delta — and the budget rule's continuity across it — is pinned by
+  // tests/lane-continuity.spec.js, not pretended away here. `SWEEP_HI_SCALE` is a
+  // number, not the app's cap (there is none), so a later cap change cannot make this
+  // pin vacuous.
+  const sweepHi = SWEEP_HI_SCALE;
   const scales = [];
   for (let i = 0; i <= SWEEP_STEPS; i++) scales.push(SWEEP_LO * Math.pow(sweepHi / SWEEP_LO, i / SWEEP_STEPS));
   // The last step IS the deepest scale this sweep can measure.

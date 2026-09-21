@@ -435,23 +435,28 @@ test('GPU-ARBITRARY pin 3: the deep lane renders far past the old float32 range 
   expect(wall.legacyDistinct, 'the pre-fix seed collapses at the old 2e-38 wall').toBe(1);
   expect(wall.fixedDistinct, 'the new mechanism renders structure at the old wall').toBeGreaterThan(2);
 
-  // The cap cannot simply BE the old precision wall: the deep lane is exercised at
-  // a scale two orders past it (1e-40) and the app's own cap must admit that scale
-  // when the clamp is lifted through the real deep-view path.
+  // The cap cannot simply BE the old precision wall — and since LANE-CONTINUITY
+  // there is no cap at all (owner directive, DECISIONS 62: "no hard stop"). The
+  // deep lane is exercised at a scale two orders past the old wall (1e-40) and the
+  // app's own zoom state must ADMIT that scale through the real deep-view path.
   const reach = await page.evaluate(() => ({
     capScale: window.__fv.minScale,
     cap: window.__fv.zoomCap,
+    measuredReach: window.__fv.deepPrecisionMinScale,
   }));
-  // The cap is 100x past the old one and set from the measured COST curve, not from
-  // precision: 1e4 -> 1e6, so the cap's own scale is 1e-6 (a full image there
-  // measures ~30 ms at 640x480 on this host, against ~14 ms at the old cap and
-  // ~640 ms at 1e-40). It is NOT the precision wall: the mechanism is verified to
-  // 1e-40 through the real deep-view path, 34 decades past the old cap.
-  expect(reach.cap, 'the cap must be past the old 1e4').toBe(1e6);
-  expect(reach.capScale, 'the cap scale must be below the old 1e-4').toBe(1e-6);
-  // The old RANGE wall (2e-38) is not where anything stops: it is neither the cap
-  // nor the deep lane's boundary, both of which are now far shallower.
-  expect(reach.capScale, 'the old wall must no longer be the cap').toBeGreaterThan(1e-38);
+  // NO CAP. `null` is the shipped, deliberate value: depth is bounded by TIME, which
+  // the user can feel, and the measured-correct reach is reported SEPARATELY rather
+  // than enforced as a stop.
+  expect(reach.cap, 'there must be no zoom cap').toBe(null);
+  expect(reach.capScale, 'the zoom state must be unlimited').toBe(null);
+  // The accuracy limit is a different thing from the (removed) cost cap, and it is
+  // stated: 1e-40 is measured 0.00000 % misclassified (pin 1) and 1e-42 is 7.4 %.
+  expect(reach.measuredReach, 'the measured-correct reach is reported, not enforced').toBe(1e-40);
+  // The old RANGE wall (2e-38) is not where anything stops: it is not a cap (there
+  // is none) and not the deep lane's boundary (1e-4), and the mechanism renders
+  // correctly through it.
+  expect(reach.measuredReach, 'the old wall must be well inside the measured-correct reach')
+    .toBeLessThanOrEqual(2e-38);
 
   expect(pageErrors).toEqual([]);
 });

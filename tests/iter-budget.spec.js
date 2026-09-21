@@ -10,17 +10,19 @@
 // no deep-zoom precision work can even be observed (docs/PLAN-DEEPZOOM.md D2).
 //
 // The rule under test (public/fractalKernel.js): the slider's value is a FLOOR and
-// `effective = max(slider, floor(zoom))`. The floor is OFF at and above the app's
-// shipped GPU zoom cap and grows 512 iterations per decade of zoom below it:
+// `effective = max(slider, floor(zoom))`. The floor is ZERO at and above the deep
+// lane's boundary and grows 512 iterations per decade of zoom below it, but
+// LANE-CONTINUITY made the departure CONTINUOUS (it ramps in over the decade below
+// the boundary) so no depth has a budget jump:
 //   zoom 1e5 -> 2560   1e6 -> 3072   1e8 -> 4096   1e15 -> 7680
-// and the ONE cap (MAX_ITER) bounds it.
+// and the ONE cap (MAX_ITER) bounds it. There is NO app zoom cap any more.
 //
 // Everything is observed through the frozen `window.__fv` surface and driven through
-// the real UI / real worker. `setDeepView` is the ONE observation hook: it lifts ONLY
-// the GPU zoom clamp (which is out of this slice's scope — P4 lifts it) and restores
-// it before returning; the view, the budget rule, the worker, the kernel and the
-// colour path are the production ones. The last test-measured budget and every table
-// count come from the app's own counters, not from pixels or inference.
+// the real UI / real worker. `setDeepView` is the ONE observation hook: with the cap
+// gone it is `setView` plus exact-centre handling; the view, the budget rule, the
+// worker, the kernel and the colour path are the production ones. The last
+// test-measured budget and every table count come from the app's own counters, not
+// from pixels or inference.
 const { test, expect } = require('@playwright/test');
 
 // A small viewport keeps a real 4096-iteration CPU frame cheap; the pins are about
@@ -223,6 +225,8 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
       },
       rows,
       minScale: fv.minScale,
+      zoomCap: fv.zoomCap,
+      deepPrecisionMinScale: fv.deepPrecisionMinScale,
       iterBudgetMinScale: fv.iterBudgetMinScale(),
       // The scale the perturbation (deep) lane opens at, read from the renderer's
       // OWN decision at a real draw (below), not from a restated constant.
@@ -253,12 +257,12 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
   // Past the float64 orbit's reach the ONE cap, not the rule, decides.
   expect(measured.anchors.atDeep, 'the rule can never exceed the ONE cap').toBe(measured.cap);
 
-  // GPU-ARBITRARY moved the app's zoom cap to 1e-20 (the measured cost wall), so
-  // the rule's knee is no longer the app's cap and the old equality is deliberately
-  // GONE: `ITER_BUDGET_MIN_SCALE` stays 1e-4 because that is the scale the DEEP
-  // LANE opens at, and the two must still agree. What the pin now holds is that the
-  // cap is strictly DEEPER than the knee (so the rule really can raise the budget
-  // inside the reachable range) and that the sampled anchors below are unaffected.
+  // LANE-CONTINUITY removed the app's zoom cap (owner directive, DECISIONS 62), so
+  // the rule's knee is no longer equal to a cap and the old equality is GONE.
+  // `ITER_BUDGET_MIN_SCALE` stays 1e-4 because that is the scale the DEEP LANE opens
+  // at, and the two must still agree. What the pin now holds is that the knee is a
+  // stated LANE constant, that the shipped zoom state is UNLIMITED, and that the
+  // accuracy reach is reported separately from the (now absent) stop.
   expect(measured.iterBudgetMinScale, 'the floor knee is the deep lane threshold, stated as a number')
     .toBe(measured.deepLaneMinScale);
   // The knee is a BEHAVIOUR, not a restated constant: at the knee the deep lane is
@@ -277,8 +281,11 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
   });
   expect(lane.atKnee, 'at the knee the perturbation lane is NOT used').toBe(false);
   expect(lane.belowKnee, 'below the knee the perturbation lane IS used').toBe(true);
-  expect(measured.minScale, 'the cap must be DEEPER than the floor knee, or the rule is dead')
-    .toBeLessThanOrEqual(measured.iterBudgetMinScale);
+  // THERE IS NO CAP. `null` is the shipped, deliberate value (the owner's "no hard
+  // stop"), and the accuracy reach is a SEPARATE, non-blocking number.
+  expect(measured.minScale, 'the shipped zoom state must be UNLIMITED').toBe(null);
+  expect(measured.zoomCap, 'there must be no zoom cap').toBe(null);
+  expect(measured.deepPrecisionMinScale, 'the measured-correct reach is reported, not enforced').toBe(1e-40);
 
   // S3 pin 2 stays green: the slider's bound IS the kernel cap IS the templated
   // shader loop bound (four sites).
@@ -288,7 +295,8 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
   expect(measured.shaderLoopBounds).toEqual(['MAX_ITER', 'MAX_ITER', 'MAX_ITER', 'MAX_ITER']);
 
   // The real path agrees with the rule at a deep view AND keeps the slider's value
-  // when the rule is off — and the observation hook restores the zoom clamp.
+  // when the rule is off — and, with the cap gone, a scale far past the old cap is
+  // stored UNCHANGED (the whole point of the owner's "no hard stop").
   const driven = await page.evaluate(({ centre, deep, fixed }) => {
     const slider = /** @type {HTMLInputElement} */ (document.getElementById('maxIter'));
     // The lane check above left the view at 5e-5, which is inside the floor's
@@ -305,17 +313,17 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
       rule: window.__fv.iterBudgetForScale(deep),
       ruleNow: window.__fv.iterBudget(),
     };
-    // The clamp the hook lifted must be back in force.
+    // No cap: this scale is stored verbatim.
     window.__fv.setScale(1e-30);
-    const clamped = window.__fv.getView().scale;
-    return { shallow, deepState, clamped };
+    const stored = window.__fv.getView().scale;
+    return { shallow, deepState, stored };
   }, { centre: PROBE_CENTRE, deep: DEEP_SCALE, fixed: FIXED_BUDGET });
   console.log(`[D2 pin2] driven ${JSON.stringify(driven)}`);
   expect(driven.shallow.effective, 'where the floor is off the slider value is the budget').toBe(FIXED_BUDGET);
   expect(driven.deepState.effective, "the real view uses max(slider, floor)").toBe(SCALED_BUDGET);
   expect(driven.deepState.rule).toBe(SCALED_BUDGET);
   expect(driven.deepState.ruleNow).toBe(SCALED_BUDGET);
-  expect(driven.clamped, 'the deep-view hook restores the zoom clamp').toBe(measured.minScale);
+  expect(driven.stored, 'a depth past the old cap must be stored unchanged (no hard stop)').toBe(1e-30);
 
   expect(pageErrors).toEqual([]);
 });

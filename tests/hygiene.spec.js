@@ -163,55 +163,60 @@ test('S6 pin: no alert/confirm/prompt is called; both non-modal flows stay usabl
   expect(afterCancel.length).toBe(1);
   expect(afterCancel.map((l) => l.name)).toEqual(['S6 named location']);
 
-  // (b) the GPU zoom-cap path. `setScale` is the same clamp entry point the wheel
-  // uses. GPU-ARBITRARY changed what happens here: the owner's invariant is that a
-  // present GPU renders every depth, so there is NO CPU-switch offer any more. The
-  // cap still applies, the app still REPORTS it (non-modally), and the renderer
-  // checkbox is untouched by it.
-  const capped = await page.evaluate(() => {
-    window.__fv.setScale(1e-8);
+  // (b) the deep-precision path. `setScale` is the same entry point the wheel uses.
+  // GPU-ARBITRARY removed the CPU-switch offer (the owner's invariant: a present GPU
+  // renders every depth); LANE-CONTINUITY removed the CAP itself (owner directive row
+  // 62: "no hard stop"), so the app now stores the depth unchanged and reports the
+  // measured-correct reach non-modally. The renderer checkbox is untouched.
+  const deep = await page.evaluate(() => {
+    window.__fv.setScale(1e-45);
     return {
       scale: window.__fv.getView().scale,
       minScale: window.__fv.minScale,
+      deepPrecisionMinScale: window.__fv.deepPrecisionMinScale,
       webgl: document.getElementById('webglRender').checked,
       message: document.getElementById('appMessage').textContent,
     };
   });
-  expect(capped.scale).toBe(capped.minScale);
+  // NO cap: the deep scale is stored verbatim.
+  expect(deep.scale, 'the depth must be stored unchanged (no hard stop)').toBe(1e-45);
+  expect(deep.minScale).toBe(null);
+  expect(deep.deepPrecisionMinScale).toBe(1e-40);
   // The offer element is GONE from the page, so no mode switch is reachable.
   await expect(page.locator('#zoomCapOffer')).toHaveCount(0);
   await expect(page.locator('#zoomCapSwitchToCpu')).toHaveCount(0);
   expect(
     await page.evaluate(() => window.__fv.zoomCapOffered()),
-    'nothing offers a CPU switch at the cap',
+    'nothing offers a CPU switch at depth',
   ).toBe(false);
   expect(
     await page.evaluate(() => window.__fv.zoomCapPrompted()),
-    'nothing ASKS the user at the cap either',
+    'nothing ASKS the user at depth either',
   ).toBe(false);
-  // It still reports — information, not a mode switch.
-  expect(capped.message).toContain('Zoom limit reached for GPU mode');
-  expect(capped.message).toContain('stays on the GPU');
-  // The manual renderer checkbox is untouched by the cap: this is the invariant.
-  expect(capped.webgl, 'a capped GPU view must still be rendering on the GPU').toBe(true);
-  // A further capped tick must not stack notices, and must never prompt.
+  // It still reports — information, not a stop and not a mode switch.
+  expect(deep.message).toContain('measured-correct precision');
+  expect(deep.message).toContain('continues on the GPU');
+  // The manual renderer checkbox is untouched: this is the invariant.
+  expect(deep.webgl, 'a deep GPU view must still be rendering on the GPU').toBe(true);
+  // A further deep tick must not stack notices, and must never prompt.
   const again = await page.evaluate(() => {
     const seen = [];
-    window.addEventListener('fv-zoom-limit', (e) => seen.push(e.detail));
-    window.__fv.setScale(1e-8);
+    window.addEventListener('fv-deep-precision', (e) => seen.push(e.detail));
+    window.__fv.setScale(1e-45);
     return seen;
   });
-  expect(again.map((d) => d.prompted)).toEqual([false]);
+  expect(again.length).toBe(1);
+  expect(again[0].scale).toBe(1e-45);
 
   const dialogs = await page.evaluate(() => window.__fvDialogs);
   expect(dialogs, 'alert/confirm/prompt calls after BOTH paths').toEqual([]);
 });
 
-// GPU-ARBITRARY: the zoom-cap notice is INFORMATION, repeated at most once every
-// 2 s during a wheel storm, and it never touches the renderer. This replaces S6's
-// "dismiss the offer" pin, whose whole subject — the offer — no longer exists.
-test('GPU-ARBITRARY pin: the zoom-cap notice is non-modal and never switches renderer', async ({ page }) => {
-  // The cap is now genuinely deep, so each capped wheel tick renders a real image.
+// LANE-CONTINUITY: the deep-precision notice is INFORMATION, throttled so a wheel
+// storm cannot stack messages, and it never touches the renderer or the view. This
+// replaces GPU-ARBITRARY's cap notice (whose subject — the cap — no longer exists)
+// and S6's "dismiss the offer" pin (whose subject — the offer — does not either).
+test('LANE-CONTINUITY pin: the deep-precision notice is non-modal, never limits and never switches renderer', async ({ page }) => {
   test.setTimeout(180_000);
   await page.addInitScript(() => {
     window.__fvDialogs = [];
@@ -229,7 +234,7 @@ test('GPU-ARBITRARY pin: the zoom-cap notice is non-modal and never switches ren
   await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
 
   const first = await page.evaluate(() => {
-    window.__fv.setScale(1e-8);
+    window.__fv.setScale(1e-45);
     return {
       scale: window.__fv.getView().scale,
       minScale: window.__fv.minScale,
@@ -237,22 +242,19 @@ test('GPU-ARBITRARY pin: the zoom-cap notice is non-modal and never switches ren
       shown: document.getElementById('appMessage').style.display,
     };
   });
-  expect(first.scale).toBe(first.minScale);        // the cap still applies
-  expect(first.message).toContain('Zoom limit reached for GPU mode');
+  expect(first.scale, 'the notice does NOT limit the depth').toBe(1e-45);
+  expect(first.minScale, 'there is no cap').toBe(null);
+  expect(first.message).toContain('measured-correct precision');
   expect(first.shown, 'the notice is a visible, non-modal status surface').not.toBe('none');
 
   const after = await page.evaluate(() => {
-    // A wheel storm at the limit: the notice is throttled, not stacked, and the
-    // GPU lane stays the active renderer throughout.
+    // Three further deep ticks: the notice is throttled, not stacked, and the GPU
+    // lane stays the active renderer throughout.
     let events = 0;
-    window.addEventListener('fv-zoom-limit', () => { events++; });
-    // Three further capped ticks: each one is a real capped render at the deep cap,
-    // so the count is small deliberately. The assertion is that EVERY tick reports
-    // and the throttle keeps the message from stacking.
-    for (let i = 0; i < 3; i++) window.__fv.setScale(1e-8);
+    window.addEventListener('fv-deep-precision', () => { events++; });
+    for (let i = 0; i < 3; i++) window.__fv.setScale(1e-45);
     return {
       events,
-      events2: 0,
       webgl: document.getElementById('webglRender').checked,
       minScale: window.__fv.minScale,
       offered: window.__fv.zoomCapOffered(),
@@ -262,8 +264,8 @@ test('GPU-ARBITRARY pin: the zoom-cap notice is non-modal and never switches ren
       scale: window.__fv.getView().scale,
     };
   });
-  expect(after.events, 'every capped tick still REPORTS').toBe(3);
-  expect(after.scale).toBe(after.minScale);
+  expect(after.events, 'every deep tick still REPORTS').toBe(3);
+  expect(after.scale).toBe(1e-45);
   expect(after.webgl, 'the renderer never switches itself').toBe(true);
   expect(after.offered).toBe(false);
   expect(after.prompted).toBe(false);

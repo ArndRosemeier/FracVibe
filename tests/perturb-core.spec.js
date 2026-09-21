@@ -23,11 +23,11 @@
 // measured against.
 //
 // Everything is observed through the frozen `window.__fv` surface and driven through
-// the real renderer; `setDeepView` is the ONE hook, and it lifts ONLY the shipped GPU
-// zoom clamp (P5's job, out of this slice). The deep lane itself is selected by that
-// same scale constant (`ITER_BUDGET_MIN_SCALE`, == `__fv.minScale`), which S3 pin 2
-// and D2 pin 2 already pin — so the lane boundary is a depth boundary, not a
-// precision transition inside one zoom, and no pin here sweeps across it.
+// the real renderer. Since LANE-CONTINUITY there is NO GPU zoom cap (owner directive,
+// DECISIONS 62), so `setDeepView` is `setView` plus exact-centre handling. The deep
+// lane itself is selected by the scale constant `ITER_BUDGET_MIN_SCALE`
+// (`__fv.iterBudgetMinScale()`), which D2 pin 2 pins; the lane boundary's own colour
+// delta is pinned by tests/lane-continuity.spec.js, not here.
 const { test, expect } = require('@playwright/test');
 
 test.use({ viewport: { width: 200, height: 150 } });
@@ -277,12 +277,12 @@ test('P1 pin 3: the deep lane is depth-selected, and the Pauldelbrot detector is
     return {
       lane: window.__fv.usePerturbation(),
       glitch: window.__fv.glitchFrame(),
-      minScale: window.__fv.minScale,
       scale: window.__fv.getView().scale,
     };
   });
   console.log(`[P1 pin3] shallow scale=${shallow.scale} lane=${shallow.lane} glitchedFrac=${shallow.glitch.glitchedFrac}`);
-  expect(shallow.scale).toBeGreaterThan(shallow.minScale);
+  // No cap now: the shallow scale is stored verbatim.
+  expect(shallow.scale).toBe(0.05);
   expect(shallow.lane, 'the shallow lane must be the plain one').toBe(false);
   expect(shallow.glitch.glitchedFrac, 'the plain lane has no reference, so nothing can glitch').toBe(0);
 

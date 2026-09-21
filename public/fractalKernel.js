@@ -148,10 +148,10 @@
   //
   // THE RULE. The budget is `max(the user's slider value, floor(zoom))`: the
   // slider's value is a FLOOR, and the floor may raise the effective budget above
-  // it. The floor is OFF at and above the app's shipped GPU zoom cap — the probe
-  // measured no saturation there (1e4/512 = 0.7% inside) and D1's pins deliberately
-  // hold a cap of 50 at zooms up to 1e4 to make one iteration a visible colour band,
-  // so a floor there would silently override an explicit user budget and destroy the
+  // it. The floor is ZERO at and above `ITER_BUDGET_MIN_SCALE` — the probe measured
+  // no saturation there (1e4/512 = 0.7% inside) and D1's pins deliberately hold a
+  // cap of 50 at zooms up to 1e4 to make one iteration a visible colour band, so a
+  // floor there would silently override an explicit user budget and destroy the
   // band those pins measure. Below that scale it grows 512 iterations per DECADE of
   // zoom. Why that shape: the escape count of an exterior point goes as log2(1/d)
   // for the quadratic map, so the budget must be linear in the LOGARITHM of the
@@ -162,6 +162,21 @@
   //     zoom 1e9 -> 4608     zoom 1e12 -> 6144    zoom 1e15 -> 7680
   // 4096 at 1e8 is EXACTLY the budget the probe used to turn that 100%-black frame
   // into a real one, and 3086 < 4096, so the centre escapes.
+  //
+  // LANE-CONTINUITY (2026-09-22). This rule used to be `off` at and above
+  // `ITER_BUDGET_MIN_SCALE` and to JUMP straight to `512*log10(1/scale)` below it,
+  // so the effective budget stepped 512 -> 2058 in ONE wheel step at scale 1e-4.
+  // That step is the measured cause of the 31.6-unit mean-red colour jump across
+  // the deep lane's boundary (docs/STATE.md QUEUE row DEEP-LANE-SWITCH): with the
+  // budget held FIXED the same lane switch moves the frame by 0.005-0.036 units,
+  // i.e. the discontinuity was the BUDGET FLOOR TURNING ON, not the lane.
+  //
+  // The floor is now introduced CONTINUOUSLY. It departs from zero AT the knee
+  // (`ramp` 0 there) and reaches the long-standing 512-per-decade rule one decade
+  // below it (`ramp` 1 at 1e-5), so no depth has a budget discontinuity. The deep
+  // anchors are deliberately UNCHANGED — 1e-5 -> 2560, 1e-6 -> 3072, 1e-8 -> 4096,
+  // 1e-15 -> 7680 — which is why D2's own pins still hold and why only the
+  // (1e-4, 1e-5) decade is affected.
   const ITER_BUDGET_PER_DECADE = 512;
   // --- P1: the perturbation core's two named constants ------------------------
   // Pauldelbrot's glitch test is |Z+z|^2 < G |Z|^2. The sources put G anywhere in
@@ -199,21 +214,33 @@
   // range-preserving here; its contribution is NOT measurable within P1's reach
   // (docs/DECISIONS.md row 34 records the measurement that says so).
   const PERTURB_RESCALE_INTERVAL = 256;
-  // The scale of the app's GPU zoom cap (`WEBGL_ZOOM_CAP = 10000` in app.js ->
-  // `WEBGL_MIN_SCALE = 1 / WEBGL_ZOOM_CAP`). The floor starts strictly BELOW this
-  // scale, so a view clamped at the cap gets no floor at all. This is the one
-  // number this rule shares with app.js; it is not a silent duplicate: a pin holds
-  // `iterBudgetMinScale` exactly equal to `window.__fv.minScale`, so the slice that
-  // lifts the zoom cap (P4) is forced to revisit the rule.
+  // The scale of the app's deep-lane boundary (`iterBudgetMinScale`). This file
+  // shares the number with `webglFractal.js` (the deep lane opens strictly BELOW
+  // it) and with the app (`__fv.iterBudgetMinScale`), and a pin holds them equal.
+  // It is ALSO the budget rule's KNEE: at and above it the floor is 0; below it the
+  // floor ramps in over one decade. LANE-CONTINUITY made that departure continuous
+  // (see the rule above), so the knee is a point where the floor LEAVES zero, not a
+  // point where it flips on.
   const ITER_BUDGET_MIN_SCALE = 1e-4;
+  // The knee in decades of zoom (4 for 1e-4), and the width of the continuous ramp
+  // below it. Expressed from the scale constant so the two can never drift.
+  const ITER_BUDGET_KNEE_DECADES = Math.log10(1 / ITER_BUDGET_MIN_SCALE);
+  const ITER_BUDGET_RAMP_DECADES = 1;
 
   // The FLOOR the zoom asks for, clamped to [MIN_ITER, MAX_ITER]. `MIN_ITER` means
   // "no floor": the user's slider value is the whole budget. Monotone non-decreasing
-  // as the scale falls (the zoom rises), with one step at the shipped zoom cap.
+  // as the scale falls (the zoom rises), and CONTINUOUS in the view scale: at the
+  // knee the floor is 0 and it reaches the 512-per-decade rule one decade below it,
+  // so a wheel step across the knee changes the effective budget by at most a few
+  // iterations instead of a factor of four.
   function iterBudgetForScale(scale) {
     if (typeof scale !== 'number' || !isFinite(scale) || scale <= 0) return MIN_ITER;
-    if (!(scale < ITER_BUDGET_MIN_SCALE)) return MIN_ITER;
-    return clampMaxIter(Math.ceil(ITER_BUDGET_PER_DECADE * Math.log10(1 / scale)));
+    const decades = Math.log10(1 / scale);
+    // 0 at and above the knee; 1 one ramp-width below it.
+    const ramp = Math.max(0, Math.min(1,
+      (decades - ITER_BUDGET_KNEE_DECADES) / ITER_BUDGET_RAMP_DECADES));
+    if (!(ramp > 0)) return MIN_ITER;
+    return clampMaxIter(Math.ceil(ITER_BUDGET_PER_DECADE * decades * ramp));
   }
 
   // The budget a job actually runs at. The user's slider value is a FLOOR: the

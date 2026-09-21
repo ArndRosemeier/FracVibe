@@ -417,60 +417,63 @@ function renderSavedLocations() {
 // Start with a very zoomed-out view (tiny Mandelbrot)
 viewer.view.scale = 300;
 
-// --- WebGL zoom cap logic (S1): the clamp itself lives in FractalViewer
-// (setZoomLimit/clampScale) so wheel, setView and the startup animation all
-// produce the SAME value. This module only DECIDES the cap and what to say when
-// it is reached. There is no monkey-patching of viewer methods any more.
-// GPU-ARBITRARY: the cap is no longer the PRECISION wall — it is the measured
-// cost wall. It was 1e4 because float32 could not seed a delta deeper than ~1e-38;
-// the exponent mechanism removes that, so the same measured frame cost now lands
-// much deeper. MEASURED ms per full image at 640x480 on this host (ANGLE +
-// SwiftShader SOFTWARE rasteriser, so these are software numbers, not hardware
-// ones): 1e-4 -> 14 ms, 1e-8 -> 106 ms, 1e-12 -> 150 ms, 1e-16 -> 211 ms,
-// 1e-20 -> 285 ms, 1e-40 -> 640 ms. `1e6` (scale 1e-6) is where a full image is
-// still well under a tenth of a second for a user pressing the wheel, and the
-// D2 budget floor inside it stays at 512 (its knee, `ITER_BUDGET_MIN_SCALE`, is
-// 1e-4 and is now strictly shallower than the cap — it is the scale the deep lane
-// opens at, not the cap). The DELTA-RANGE mechanism itself is verified to 1e-40
-// (tests/gpu-arbitrary.spec.js pin 1, reached through the real deep-view path), so
-// the cap is a cost bound and NOT a representability bound: the math does not stop
-// here.
+// --- NO ZOOM CAP (owner directive, docs/DECISIONS.md row 62) -------------------
+// There USED to be a cap here: `WEBGL_ZOOM_CAP = 1e4` chosen from float32
+// PRECISION, then `1e6` chosen from measured COST. Both are exactly what the owner
+// rejected — "i accept that this gets slower the deeper it gets. But no hard stop"
+// — so the cap is GONE: the ONE clamp in FractalViewer is disabled, and depth is
+// bounded by TIME (which the user can feel and which the `#renderTime` readout
+// shows), never by a number.
 //
-// The owner's invariant is explicit and is NOT a heuristic: "If a GPU is present,
-// complete depth needs to be calculated there, period." There is no depth- or
-// time-based fallback and no crossover. Slowness at extreme depth is accepted and
-// made VISIBLE (the per-image render-time readout) rather than traded for a mode
-// switch. The CPU lane stays reachable ONLY as the genuine no-GPU path (WebGL
-// absent/failed) and through the manual renderer checkbox the owner kept.
-const WEBGL_ZOOM_CAP = 1e6;
-const WEBGL_MIN_SCALE = 1 / WEBGL_ZOOM_CAP;
-let zoomCapNoticeAt = -Infinity;
+// WHAT ACTUALLY LIMITS DEPTH, once there is no cap. The limits are DIFFERENT
+// things, and they are stated because a cap would have hidden them behind one
+// number:
+//
+//   * THE CURRENT SOLVER'S MANTISSA. The shipped single-factor float32 delta
+//     representation is measured CORRECT to 1e-40 (0.00000 % misclassified against
+//     an independent per-pixel BigInt reference, `tests/gpu-arbitrary.spec.js`
+//     pin 1) and its error grows past it (7.4 % misclassified at 1e-42). That is
+//     the limit of the arithmetic WE BUILT — the 24-bit float32 delta mantissa
+//     accumulating relative error — NOT a numerical floor: the exponent split fixed
+//     RANGE (the delta is no longer subnormal), and the remedy for what is left is
+//     more MANTISSA (compensated / multi-component delta, k components ~ k*24 bits),
+//     which is the next solver slice. Slower, never stopped.
+//   * TIME. Cost grows with depth (measured on this host's SOFTWARE rasteriser,
+//     640x480: ~14 ms/image at 1e-4, ~106 ms at 1e-8, ~640 ms at 1e-40 — the cost
+//     curve is in docs/DECISIONS.md). There is no timeout, no cap and no fallback:
+//     the wheel keeps zooming and the cost is shown.
+//
+// DO NOT claim arbitrary depth past the measured reach, and do NOT describe 1e-42 as
+// a property of the mathematics. The orbit's precision does grow continuously with
+// zoom (P2's BigInt rule) and is NOT the wall.
+const MEASURED_CORRECT_MIN_SCALE = 1e-40;
+let deepPrecisionNoticeAt = -Infinity;
 let askedCpuSwitchAtZoomCap = false;   // kept for the observables the suite reads
-let deniedCpuSwitchAtZoomCap = false;
 let cpuSwitchOfferVisible = false;
 
-function handleZoomLimitReached() {
+// INFORMATION, never a limit and never a mode switch. Fires when the view goes
+// past the measured-correct reach; throttled so a wheel storm cannot stack notices.
+// The renderer, the lane and the view are untouched by it — the owner's invariant
+// is that a present GPU renders every depth ("If a GPU is present, complete depth
+// needs to be calculated there, period").
+function handleDeepPrecisionNotice() {
+  if (!(viewer.view.scale < MEASURED_CORRECT_MIN_SCALE)) return;
   const now = (typeof performance !== 'undefined' && performance.now)
     ? performance.now() : Date.now();
-  // At most one notice every 2 s: a wheel storm at the limit must not stack
-  // messages, and the notice is INFORMATION, never a mode switch.
-  if (now - zoomCapNoticeAt > 2000) {
-    zoomCapNoticeAt = now;
-    showMessage('Zoom limit reached for GPU mode (~' + WEBGL_ZOOM_CAP.toLocaleString()
-      + 'x). Rendering stays on the GPU; the limit is performance, not precision.');
+  if (now - deepPrecisionNoticeAt > 2000) {
+    deepPrecisionNoticeAt = now;
+    showMessage('Past the measured-correct precision (~1e40): rendering continues on '
+      + 'the GPU, but the image may be inaccurate. Depth is limited by time, not by a cap.');
   }
-  // Report the event to the observer. `prompted` stays in the payload for the
-  // existing `fv-zoom-limit` contract, but the app never ASKS any more: no offer
-  // is shown and no CPU switch is reachable from here.
   try {
-    window.dispatchEvent(new CustomEvent('fv-zoom-limit', {
-      detail: { scale: viewer.view.scale, prompted: false },
+    window.dispatchEvent(new CustomEvent('fv-deep-precision', {
+      detail: { scale: viewer.view.scale },
     }));
   } catch (_) { /* observation only */ }
 }
 
 
-viewer.setZoomLimit(WEBGL_MIN_SCALE, handleZoomLimitReached);
+viewer.setZoomLimit(null, null);
 
 viewer.setView(viewer.view);
 updateInfo(viewer.view);
@@ -637,6 +640,10 @@ function updateInfo(view) {
   // about which of the two is in force; without it the slider would silently show
   // a number the renderer is not using.
   updateMaxIterReadout();
+  // LANE-CONTINUITY: there is no zoom cap any more, so this is where the ONE
+  // remaining depth notice is emitted. It changes nothing about the render; it
+  // exists so the app "says so rather than drawing a wrong image" (DECISIONS 49).
+  handleDeepPrecisionNotice();
 }
 
 function updateMaxIterReadout() {
@@ -1449,8 +1456,19 @@ window.__fv = Object.freeze({
   renderWebGL: () => renderWebGL(),
   forceFallback: () => handleWebGLFailure('WebGL failure forced for observation.'),
   simulateContextLoss: () => handleWebGLLoss('Context loss simulated.'),
-  zoomCap: WEBGL_ZOOM_CAP,
-  minScale: WEBGL_MIN_SCALE,
+  // LANE-CONTINUITY (owner directive row 62): there is NO zoom cap. `zoomCap` and
+  // `minScale` are null — "unlimited" — and that is the shipped, deliberate value:
+  // depth is bounded by TIME, and the accuracy of the representation is reported
+  // separately (`deepPrecisionMinScale`). The clamp machinery in FractalViewer is
+  // retained but disabled, so `null` here is the ONE place the app declares it.
+  zoomCap: null,
+  minScale: null,
+  // The scale past which the CURRENT single-factor solver is no longer measured
+  // correct (1e-40: GPU-ARBITRARY pin 1 measured 0.00000 % misclassified there;
+  // 7.4 % at 1e-42 is that solver's 24-bit delta MANTISSA limit, not a numerical
+  // floor). This is INFORMATION, not a stop: crossing it emits `fv-deep-precision`
+  // and renders on.
+  deepPrecisionMinScale: MEASURED_CORRECT_MIN_SCALE,
   // GPU-ARBITRARY: the S6 zoom-cap CPU-switch OFFER no longer exists. These two
   // observables are kept in the frozen surface (a pin and the app's own status
   // reporting read them) but are now OBSERVABLY INERT: nothing in the app can show
@@ -1600,8 +1618,8 @@ window.__fv = Object.freeze({
   // The floor the CURRENT view asks for (MIN_ITER means "no floor").
   iterBudget: () => FractalKernel.iterBudgetForScale(viewer.view.scale),
   iterBudgetPerDecade: FractalKernel.ITER_BUDGET_PER_DECADE,
-  // The scale of the shipped GPU zoom cap, below which the floor starts. A pin
-  // holds this equal to `minScale` so the rule cannot silently drift from the cap.
+  // The scale of the deep lane's boundary and the budget rule's knee (1e-4). It is
+  // a LANE constant now, not a cap: there is no cap to hold it equal to.
   iterBudgetMinScale: () => FractalKernel.ITER_BUDGET_MIN_SCALE,
   // D2 colour-table cost, counted: builds of the table and of the reused ImageData,
   // and the entry count of the table the last build produced (sized by the cap the
@@ -1612,27 +1630,29 @@ window.__fv = Object.freeze({
   // The kernel's ONE table stride, so the cost pin derives the expected entry count
   // instead of restating it.
   colorLutStride: FractalKernel.COLORS_LUT_STRIDE,
-  // Drive the REAL view/render/budget path at a scale the shipped GPU zoom cap does
-  // not admit, bypassing ONLY that clamp — which is not part of this slice (P4 lifts
-  // it). The view object, the budget rule, the worker job, the kernel and the colour
-  // path are the production ones; this adds no production path, and the clamp is
-  // restored before the call returns.
+  // Drive the REAL view/render/budget path at any scale. LANE-CONTINUITY removed
+  // the zoom cap, so this no longer bypasses anything: it is `setView` plus the
+  // exact-decimal-centre field handling, and the clamp stays disabled (its shipped
+  // state). The view object, the budget rule, the worker job, the kernel and the
+  // colour path are the production ones.
   setDeepView: (view) => {
-    viewer.setZoomLimit(null, null);
-    try {
-      // An exact decimal centre (`centerXExact`/`centerYExact`) is what names a
-      // point past a float64 centre's own ULP; the numeric `centerX`/`centerY`
-      // stay the float64 view the rest of the app uses. Exact fields are cleared
-      // when the caller does not supply them, so a stale one cannot leak into a
-      // later view that was meant to be the float64 lane.
-      const next = { ...viewer.view, ...view };
-      if (typeof view.centerXExact !== 'string') delete next.centerXExact;
-      if (typeof view.centerYExact !== 'string') delete next.centerYExact;
-      viewer.setView(next);
-    } finally {
-      viewer.setZoomLimit(WEBGL_MIN_SCALE, handleZoomLimitReached);
-    }
+    // An exact decimal centre (`centerXExact`/`centerYExact`) is what names a
+    // point past a float64 centre's own ULP; the numeric `centerX`/`centerY` stay
+    // the float64 view the rest of the app uses. Exact fields are cleared when the
+    // caller does not supply them, so a stale one cannot leak into a later view
+    // that was meant to be the float64 lane.
+    const next = { ...viewer.view, ...view };
+    if (typeof view.centerXExact !== 'string') delete next.centerXExact;
+    if (typeof view.centerYExact !== 'string') delete next.centerYExact;
+    viewer.setView(next);
   },
+  // DIAGNOSTIC ONLY (the shipped state is NO limit: `setZoomLimit(null, null)`).
+  // This drives the ONE clamp in FractalViewer so the S1 pin can still exercise the
+  // machinery the app no longer uses — the property S1 exists to protect (every
+  // path that reaches the clamp gets the SAME answer) is worth keeping pinned even
+  // while the app ships it disabled. Production never calls it, and the pin restores
+  // the shipped unlimited state by passing null.
+  setZoomLimitForTest: (minScale) => viewer.setZoomLimit(minScale, null),
   shaderMaxIter: () => (webglRenderer ? webglRenderer.shaderMaxIter : null),
   shaderLoopBounds: () => (webglRenderer && webglRenderer.shaderLoopBounds
     ? webglRenderer.shaderLoopBounds.slice()
