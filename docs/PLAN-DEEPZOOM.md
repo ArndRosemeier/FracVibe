@@ -127,10 +127,33 @@ only route past ~1e10 and accepting that it is unmeasured here and that its reba
 pop mechanism. The compensated route is therefore **not built** — but the probe's compensation
 measurements are retained, because P1's delta arithmetic needs exactly that kind of compensation.
 
-**Honest scope of what this buys.** With a **float64 reference orbit** the practical reach is
-roughly **1e15** — the orbit needs about as many digits as the zoom — i.e. about 1e11× beyond
-today's 1e4 cap. Past ~1e15 the *orbit itself* needs big-float precision, which is P6 and is
-deferred. "Unlimited" lives at P6, not at P1.
+**Honest scope — ORIGINALLY stated as "a float64 orbit reaches roughly 1e15", and that claim is
+now FALSIFIED BY MEASUREMENT.** It was reasoning (the orbit needs about as many digits as the
+zoom), not evidence. The perturbation probe (`docs/PROBE-2026-09-21-perturbation.md`) measured a
+straightforward implementation on a genuinely deep centre and found:
+
+- **clean at 1e8** (misclassification 0.0026 % float32 orbit, 0.0013 % hi/lo orbit; ≤4 px speckle);
+- **degraded at 1e12** (0.34 % / 0.97 %, blobs to 215 px);
+- **structurally wrong at 1e15** (26.4 % / 55.2 % misclassified; the hi/lo arm collapses to one
+  blob covering 53 % of the frame);
+- **the limiter is the float32 DELTA arithmetic, not the orbit** — holding the same 24-bit orbit and
+  doing the arithmetic in float64 drops the 1e15 error from a mean of 1235 iterations to 64;
+- **a hi/lo orbit is INERT without a compensated delta** (arms A and D are bit-identical, because
+  `float(hi + lo)` returns `hi`), and **the specific hi/lo + Dekker-`ds_mul` compensation tested made
+  1e12–1e15 WORSE, not better**;
+- orbit transport itself is **exact and cheap** here (one float texel per iteration, NEAREST,
+  `MAX_TEXTURE_SIZE = 8192`, NPOT fine) — no transport obstacle exists;
+- **glitches without rebasing** are 0.08 % at 1e8, 1.37 % at 1e12 and **74.6 % at 1e15**, so P2 is
+  not optional past ~1e12;
+- the D2 iteration rule is **slightly under-provisioned at 1e8** (the frame needs 4669 against a
+  4096 budget) and **cannot be adequate at 1e12** (needs 9011 > the 8192 cap) — so the cap, not only
+  precision, becomes a limit.
+
+**Therefore the measured reach of a first perturbation implementation is ~1e8–1e10 — COMPARABLE TO
+the compensated-float32 route that was rejected as "not deep enough".** The depth advantage Route 2
+was chosen for does not exist yet: it must be *earned* by (a) a delta formulation that actually
+compensates — the measured limiter, and now an identified target — and (b) rebasing (P2).
+"Unlimited" remains P6. This re-opens the choice; see §8.
 
 **Good news on the owner's specific worry.** While the orbit stays float64 there is **no precision
 hop inside the deep path at all** — the orbit is recomputed each view at a fixed precision. So the
@@ -148,3 +171,23 @@ float32 route is deliberately **not** built (owner decision, §6) though its mea
 The deliberately deferred items from the previous campaign (`MODERNIZATION.md` §3–§5) stay deferred
 unless a slice here proves one is required — in which case it goes to the owner as a fork, not in
 silently.
+
+## 8 · THE FORK RE-OPENED (perturbation probe, 2026-09-21)
+The measurement above changes the value proposition the owner accepted. The honest options:
+
+- **Route 1 — compensated float32** (measured: holds to **≥1e10**) at ~10–12× fragment cost. No
+  reference orbit, no glitch detection, no rebasing; the only hop is the plain→compensated switch,
+  which D1's continuous colour plus a threshold chosen where the error is already sub-pixel makes
+  invisible. It reaches about what perturbation reaches today, for far less machinery.
+- **Route 2 — perturbation (chosen).** Measured **~1e8–1e10** for a straightforward implementation.
+  Its advantage must be *earned*: the limiter is the float32 delta arithmetic (identified, with a
+  concrete target), and past ~1e12 **rebasing is mandatory** because 1.37 % of pixels glitch at 1e12
+  and 74.6 % at 1e15. Its ceiling is genuinely higher than Route 1's — but only after that work lands.
+- **Route 2-lite — build P1 as the CORE only**, accept ~1e8–1e10, and stop there while keeping the
+  orbit machinery in place for later. Cheapest path to "deeper than 1e4, on the GPU, smooth".
+
+**Recommendation: Route 2-lite** — proceed with P1 as the core, with the expectation reset to
+**~1e8–1e10** and a pin at a zoom where correctness is MEASURED rather than assumed, because the
+orbit transport is proven exact, the limiter is identified, and this same code is the foundation for
+whatever depth comes later. Rejected: "keep chasing 1e15 first", which requires a delta formulation
+nobody has yet demonstrated here *plus* glitch rebasing, before shipping any user-visible improvement.
