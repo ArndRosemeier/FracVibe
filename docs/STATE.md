@@ -5,16 +5,16 @@
 > checkable (sha, branch, worktree, session id, path). Read this first, then
 > `MODERNIZATION.md` (plan of record) and `docs/DECISIONS.md` (why).
 
-reconciled: origin/main=dea8a55 · local main=c6c87e2 (0 behind, 4 ahead) · 2026-09-21T08:27Z · by=session-f6d26a74-68de-4926-b4d3-16efb7ff2421 · host=load 0.34, MemAvailable 18.2GB, no orphan suite processes, :3000 free · registry=2 sessions under ~/.dsh/sessions/--home-administrator-projects-FracVibe--
+reconciled: origin/main=5d86f40 · local main=5d86f40 (0 behind, 0 ahead — IN SYNC) · 2026-09-21T08:35Z · by=session-f6d26a74-68de-4926-b4d3-16efb7ff2421 · host=load 0.13, MemAvailable 18.5GB, no orphan suite processes, :3000 free · registry=2 sessions under ~/.dsh/sessions/--home-administrator-projects-FracVibe--
 
 ## OWNER
 OWNER | 2026-09-21 | decision=**push approved** — owner chose "Push all 5 commits to origin/main" | effect=Phase 0 + machinery land on `origin/main`; the deployed blank-canvas site is fixed
 OWNER | 2026-09-21 | verbatim: *"I want this to be resilient and correct, you can take your time to achieve that state. You be the judge how to achieve this best."* | effect=standing mandate; the METHOD is the dispatcher's judgement and is written down in `docs/PLAN.md` | ledger row 6
 
-## ⚠ BLOCKED — the owner-approved push cannot be performed from this host
-BLOCKER | push-to-origin | the tip is gated and the owner approved it, but `git push origin main` → `fatal: could not read Username for 'https://github.com': No such device or address` (exit 128). Nothing is wrong with the repo. This host has **no** way to authenticate: no credential helper (local/global/system), no `GITHUB_TOKEN`/`GH_TOKEN` in the environment, no `~/.git-credentials`, no `~/.netrc`, `gh` is not installed, `~/.ssh` holds only `authorized_keys` (inbound) and no private key, and `ssh-add -l` reports "The agent has no identities" while `ssh -T git@github.com` → `Permission denied (publickey)`. **I did not look inside `~/.openclaw` for credentials** — it belongs to another platform and the standing rule is to stop and ask. Resolution needs the owner: credentials, a deploy key, or a push the owner performs. Until then `origin/main` stays at `dea8a55` and the deployed site stays broken.
-DECISION | the campaign does NOT wait on the push. Writers base on **LOCAL `main`** — the true tip, which already carries the machinery — not on the stale `origin/main`. Recorded because the base sha in every brief will look wrong to a successor who only reads `origin/main`.
-NEXT | when the push does become possible, push `main` (it is ahead of `origin/main` by a fast-forward) and re-verify with `git ls-remote origin refs/heads/main`.
+## ✅ RESOLVED — the push landed (the live priority is now the campaign below)
+LANDED | row=push | sha=5d86f40 | remote=`dea8a55..5d86f40  HEAD -> main` (exit 0) | verify=**PROVEN, not assumed**: local HEAD == `origin/main` == `5d86f40cdff28b89e3b60cbc0976c6f69789f5e4`, `git rev-list --left-right --count origin/main...main` → `0 0`, and server-side `git ls-remote origin refs/heads/main` → the same sha | gate=BEFORE the push, FULL tier at that exact sha: exit 0 GREEN, 4 passed / 6.1s, raw log /tmp/fracvibe-gate/gate-full-5d86f40-20260921T083517Z.log | effect=`origin/main` is no longer the blank-canvas build
+WAS-BLOCKED | at 2026-09-21T08:31Z the push failed: `fatal: could not read Username for 'https://github.com'` (exit 128). The host then had no credential helper, no token env, no `~/.git-credentials`, no `~/.netrc`, no `gh`, no SSH key and an empty agent. **I did not look inside `~/.openclaw`** — a different platform, and the standing rule is to stop and ask. The owner then wired a global store (`~/.git-credentials` mode 600 plus `credential.helper=store` in `~/.gitconfig`); my re-check returned `auth OK` and the push succeeded. The block was always **credentials, never the repo**.
+ESTABLISHED | the campaign no longer needs a local-only base: `origin/main` now carries the machinery, so **new writers base on `origin/main`**, as `AGENTS.md` requires. The in-flight S1 writer keeps base `c27e18c`, an ancestor of `5d86f40` and therefore on the published line.
 
 ## SESSION
 SESSION | id=session-f6d26a74-68de-4926-b4d3-16efb7ff2421 | role=chief of staff (owner-designated) | state=active · idled after the first reconcile pass · goal frozen and paused by design
@@ -32,7 +32,7 @@ NOTE | the predecessor's own evidence survives as /tmp/fv-a.log and /tmp/fv-b.lo
 
 ## QUEUE
 QUEUE | row=* | The sequenced campaign is `docs/PLAN.md` (slices S1–S6, with footprints, pins, order and the serialization rule). The rows below are the raw defect inventory it draws from — do not dispatch a row directly; dispatch its slice.
-QUEUE | row=1 | push Phase 0 + machinery to origin/main | status=OWNER-APPROVED 2026-09-21, **BLOCKED on credentials** (see BLOCKER above) — not on the repo, and not on any missing work
+QUEUE-CLOSED | row=1 | push Phase 0 + machinery to origin/main | CLOSED 2026-09-21T08:35Z at sha 5d86f40, verified equal SHAs and `ls-remote` | the earlier "BLOCKED on credentials" status was a host-credentials problem, never a repo or work problem
 QUEUE | row=B4 | WebGL canvas is never resized; both canvases size their buffer from CSS px, so everything is blurry on HiDPI | src=MODERNIZATION.md §2 B4
 QUEUE | row=B5 | iteration cap mismatch: slider allows 2000, the fragment shader loops to 1024 → silently mis-coloured pixels above 1024 | src=MODERNIZATION.md §2 B5
 QUEUE | row=B6 | worker abort is a no-op (the flag can only be set between jobs) | src=MODERNIZATION.md §2 B6
@@ -52,6 +52,9 @@ TRAP | PARITY: the tier must come from what CHANGED, not from what is uncommitte
 TRAP | `netlify.toml` pins `NODE_VERSION = "18"` (EOL 2025-04-30). `command = ""` means nothing builds today, so it is latent, not live — it bites the moment a build step is added.
 TRAP | Git history carries `node_modules` across ~14 commits (~1.2MB `.git`). Purging needs `git filter-repo` **and a force-push**; it is not needed for correctness. Never do it as a side effect of another landing.
 TRAP | Every commit is authored by the placeholder `User <user@example.com>`; no `user.name`/`user.email` is set in this repo.
+TRAP | The GitHub credential is an `x-access-token` in `~/.git-credentials` (mode 600), read by `credential.helper=store` in `~/.gitconfig`. It **expires**: a push that works today can fail tomorrow with 403 / an auth failure. The fix is to ask the owner for a fresh token in the SAME format — never to hunt for one, never to print/echo/commit it, and never to touch `~/.openclaw`. `git ls-remote --heads origin` is the cheap pre-flight proof; see the `github-push` skill.
+TRAP | `git add -A` is not allowed while another actor may be mid-flight: assert what is staged with `git status --short` and add EXPLICIT paths. This session used `git add -A` twice while it was the only writer — safe both times, recorded here as a correction rather than a defence.
+TRAP | There is no `.github/workflows`, so a push here triggers **no CI**. The deploy path is Netlify's own Git integration, and `https://fracvibe.netlify.app/` answers HTTP 404, so the live URL is UNVERIFIED from this host. Report that `origin/main` was fixed; do not claim the live site was.
 
 ## GUARD
 GUARD | one-gate | `bash scripts/gate.sh` is the only gate. The full tier takes an atomic `mkdir` lock at `$GIT_COMMON/fracvibe-gate.lock`, shared by every worktree; the compile tier reads nothing shared, so it takes no lock and runs alongside a peer's suite. Exit codes in-file and in AGENTS.md: 0 green · 1 red · 2 compile-only (suite did not run) · 9 refused (VOID) · 10 killed (VOID) · 64 usage.
