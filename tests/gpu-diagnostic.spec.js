@@ -145,7 +145,9 @@ test.describe('GPU diagnostic (hardware-certification instrument)', () => {
 
     const report = await page.evaluate(() => window.__gpuDiagnostic.lastReport());
     expect(report, 'the battery must publish a report object').not.toBeNull();
-    expect(consoleTexts.length, 'exactly one console block').toBe(1);
+    // CDP delivers console events asynchronously, so wait for the block rather
+    // than racing it against the status flip.
+    await expect.poll(() => consoleTexts.length, { timeout: 10_000 }).toBe(1);
     assertStructure(report, consoleTexts[0]);
 
     expect(pageErrors, 'no uncaught page error').toEqual([]);
@@ -174,7 +176,9 @@ test.describe('GPU diagnostic (hardware-certification instrument)', () => {
       window.__gpuDiagnostic.onTestClick();
     });
     await expect(status).toHaveAttribute('data-state', 'done', { timeout: 150_000 });
-    expect(consoleTexts.length, 'the refused re-entry must not print a second block').toBe(1);
+    // Wait for the ONE block the first invocation prints; a refused re-entry must
+    // never print a second, so this also fails if the guard did not hold.
+    await expect.poll(() => consoleTexts.length, { timeout: 10_000 }).toBe(1);
     await expect(page.locator('#gpuDiagBtn'), 'the button is enabled again').toBeEnabled();
 
     const first = await page.evaluate(() => window.__gpuDiagnostic.lastReport());
