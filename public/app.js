@@ -6,7 +6,7 @@ import { Fractal3DViewer } from './fractal3d.js';
 // side-effect import + global read.
 import './fractalKernel.js';
 import { WebGLFractalRenderer } from './webglFractal.js';
-import { FractalMemoryRepository } from './memoryRepository.js';
+import { FractalMemoryRepository, LOCATION_LIMITS, validateRecords } from './memoryRepository.js';
 
 // The single source of truth for the iteration cap, the fractal-type table and
 // the palette table (public/fractalKernel.js).
@@ -58,9 +58,19 @@ populateSelect(colorSchemeSelect, FractalKernel.COLOR_SCHEMES);
 // shader to the same number, so the UI cannot offer more than they honour.
 maxIterSlider.max = String(FractalKernel.MAX_ITER);
 
+// S4: ids are STRINGS. The schema accepts a bounded non-empty string, so the
+// generator must produce one; the epoch keeps ids distinct across reloads and the
+// counter keeps them distinct inside one page (the old `Date.now() + Math.random()`
+// produced a NUMBER, which the imported shape does not accept).
+let locationIdCounter = 0;
+function newLocationId() {
+  locationIdCounter += 1;
+  return `loc-${Date.now().toString(36)}-${locationIdCounter.toString(36)}`;
+}
+
 function getCurrentLocationState() {
   return {
-    id: Date.now() + Math.random(),
+    id: newLocationId(),
     name: '',
     centerX: viewer.view.centerX,
     centerY: viewer.view.centerY,
@@ -94,6 +104,8 @@ saveLocationBtn.addEventListener('click', () => {
 });
 
 loadLocationBtn.addEventListener('click', () => {
+  // A fresh page load of counts for the loads the user is about to trigger.
+  resetLoadCounts();
   renderSavedLocations();
   // The modal is a flex container (centring relies on display:flex).
   loadLocationModal.style.display = 'flex';
@@ -120,42 +132,160 @@ exportLocationsBtn.addEventListener('click', () => {
   }, 100);
 });
 
+// --- S4: location import, one path -----------------------------------------
+// `importReport` is the observable the suite reads: how many records the last
+// file contributed and how many the schema refused. Counted, never inferred.
+let importReport = { accepted: 0, rejected: 0, fatal: null, problems: [] };
+
+// The ONE place an imported file becomes stored locations. `readLocationsFile`
+// (the real FileReader handler) and the `window.__fv.importPayload` observation
+// hook both call THIS, so a test can never exercise a path the app does not use.
+function importLocationsPayload(text) {
+  // Bound the input BEFORE parsing: an oversized file is refused without ever
+  // being handed to JSON.parse, so a hostile file cannot wedge the UI in the
+  // parser (S4, "bound the import").
+  const bytes = typeof text === 'string' ? text.length : 0;
+  if (bytes > LOCATION_LIMITS.MAX_FILE_BYTES) {
+    importReport = { accepted: 0, rejected: 0, fatal: null, problems: [] };
+    showError('Import failed: the file is ' + bytes + ' characters; the maximum is ' + LOCATION_LIMITS.MAX_FILE_BYTES + '. Nothing was imported.');
+    return importReport;
+  }
+
+  // Malformed JSON is a user-facing failure like every other: it is reported
+  // through `#appMessage` and nothing escapes (S1). It used to be an `alert`,
+  // and it must never be an uncaught exception.
+  let payload;
+  try {
+    payload = JSON.parse(text);
+  } catch (err) {
+    importReport = { accepted: 0, rejected: 0, fatal: null, problems: [] };
+    showError('Import failed: the file is not valid JSON (' + errorText(err) + '). Nothing was imported.');
+    return importReport;
+  }
+  return importLocationsObject(payload);
+}
+
+// The second half of the import: a PARSED document is validated, the valid part
+// is stored, and exactly one render happens. Split out so the payload-shape
+// rules can be exercised with a value JSON cannot represent (NaN/Infinity).
+function importLocationsObject(payload) {
+  importReport = { accepted: 0, rejected: 0, fatal: null, problems: [] };
+
+  const result = validateRecords(payload);
+  if (result.fatal) {
+    importReport.fatal = result.fatal;
+    showError('Import failed: ' + result.fatal + '. Nothing was imported.');
+    return importReport;
+  }
+
+  // Partial acceptance (docs/DECISIONS.md row 18): the schema-valid records are
+  // stored and the invalid ones are refused with a visible reason. One bad
+  // record does not cost the user every location in the file.
+  result.accepted.forEach((loc) => memoryRepo.upsert(loc));
+  importReport.accepted = result.accepted.length;
+  importReport.rejected = result.rejected.length;
+  importReport.problems = result.rejected.map(r => `record ${r.index}: ${r.reasons.join('; ')}`);
+  renderSavedLocations();
+
+  const firstProblem = importReport.problems[0];
+  const problemNote = firstProblem ? ' First problem — ' + firstProblem + '.' : '';
+  if (result.rejected.length) {
+    showError('Imported ' + result.accepted.length + ' location(s); ' + result.rejected.length + ' record(s) were rejected by the import schema.' + problemNote);
+  } else {
+    showMessage('Imported ' + result.accepted.length + ' location(s).');
+  }
+  return importReport;
+}
+
+function readLocationsFile(file) {
+  if (!file) return;
+  if (file.size > LOCATION_LIMITS.MAX_FILE_BYTES) {
+    showError('Import failed: "' + file.name + '" is ' + file.size + ' bytes; the maximum is ' + LOCATION_LIMITS.MAX_FILE_BYTES + '. Nothing was imported.');
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = (evt) => {
+    // `text` may be a non-string only if the read itself failed; `importLocationsPayload`
+    // treats that as an empty (and therefore invalid) payload rather than throwing.
+    importLocationsPayload(typeof evt.target.result === 'string' ? evt.target.result : '');
+  };
+  reader.onerror = () => {
+    showError('Import failed: the file could not be read. Nothing was imported.');
+  };
+  reader.readAsText(file);
+}
+
 importLocationsBtn.addEventListener('click', () => {
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = '.json,application/json';
   input.style.display = 'none';
-  input.addEventListener('change', (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      try {
-        const imported = JSON.parse(evt.target.result);
-        if (Array.isArray(imported)) {
-          imported.forEach(loc => {
-            // Remove existing with same id, then add
-            memoryRepo.remove(loc.id);
-            memoryRepo.save(loc);
-          });
-          renderSavedLocations();
-          alert('Locations imported successfully.');
-        } else {
-          alert('Invalid file format.');
-        }
-      } catch (err) {
-        alert('Error importing locations: ' + err.message);
-      }
-    };
-    reader.readAsText(file);
-  });
+  input.addEventListener('change', (e) => readLocationsFile(e.target.files && e.target.files[0]));
   document.body.appendChild(input);
   input.click();
   setTimeout(() => document.body.removeChild(input), 5000);
 });
 
+// --- S4: the load path, counted ---------------------------------------------
+// `viewApplications` counts `viewer.setView` calls made BY THE LOAD PATH, and
+// `renderRequests` counts render dispatches made by it. They are reset when a
+// load starts and read by the suite through `window.__fv.lastLoad`, so the
+// claim "applies once, renders once" is measured rather than asserted.
+let loadCounts = { viewApplications: 0, renderRequests: 0 };
+
+function resetLoadCounts() {
+  loadCounts = { viewApplications: 0, renderRequests: 0 };
+}
+
+// Apply ONE stored record: the fractal type, the view, the iteration count and
+// the renderer, each exactly once, then start exactly one render in the mode
+// that is now active.
+function applyLoadedRecord(loc) {
+  resetLoadCounts();
+  typeSelect.value = loc.fractalType;
+  webglCheckbox.checked = (loc.renderer === 'GPU');
+  viewer.setFractal(loc.fractalType);
+  // The ONE apply. FractalViewer.setView renders synchronously; that render
+  // shows the old data at the new viewport, and the calculation below replaces
+  // it with the correct pixels.
+  viewer.setView({ centerX: loc.centerX, centerY: loc.centerY, scale: loc.scale });
+  loadCounts.viewApplications += 1;
+  // A saved/imported record can carry any iteration count. The slider clamps it
+  // to what the UI can display and the kernel clamps what is actually stored, so
+  // the readout never promises more than the renderers honour (S3/B5).
+  maxIterSlider.value = String(loc.maxIter);
+  viewer.setMaxIter(parseInt(maxIterSlider.value, 10));
+  maxIterValue.textContent = String(viewer.maxIter);
+  // Switch (or keep) the renderer for the record, then render exactly once.
+  updateWebGLState();
+  if (webglCheckbox.checked) renderWebGL();
+  else startFractalCalculationWithTiming();
+  loadCounts.renderRequests += 1;
+  return loadCounts;
+}
+
+// A timestamp is a number (the schema guarantees it for imports), but an
+// out-of-range one yields an invalid Date whose toLocaleString() is the literal
+// "Invalid Date". Falling back keeps the row honest instead of printing junk.
+function formatLocationTimestamp(timestamp) {
+  const date = new Date(timestamp);
+  return isNaN(date.getTime()) ? 'unknown time' : date.toLocaleString();
+}
+
+function appendLocationInfo(parent, text, style, bold) {
+  const span = document.createElement('span');
+  if (bold) span.style.fontWeight = 'bold';
+  if (style) span.style.cssText = style;
+  // textContent, NEVER innerHTML: an imported string is data, never markup.
+  span.textContent = text;
+  parent.appendChild(span);
+}
+
 function renderSavedLocations() {
-  savedLocationsList.innerHTML = '';
+  // Clearing children is DOM manipulation, not content: no string is ever
+  // parsed as markup here. (S4: the sink this replaces interpolated FIVE
+  // attacker-controlled fields into one innerHTML template at the old line 180.)
+  savedLocationsList.textContent = '';
   const sortBy = locationSortSelect ? locationSortSelect.value : 'timestamp';
   const locations = memoryRepo.getAll(sortBy);
   if (!locations.length) {
@@ -173,11 +303,22 @@ function renderSavedLocations() {
     row.style.padding = '0.4em 0.5em';
     row.style.borderBottom = '1px solid #333';
     row.style.gap = '1em';
-    // Info
+    // Info — every field is written with textContent. `name`, the formatted
+    // timestamp, `fractalType`, `maxIter` and `renderer` are all
+    // attacker-controlled when they came from an imported file, so none of them
+    // may reach HTML parsing (S4/B7).
     const info = document.createElement('div');
     info.style.flex = '1 1 0';
     info.style.overflow = 'hidden';
-    info.innerHTML = `<span style="font-weight:bold;">${loc.name}</span><br><span style="font-size:0.9em;color:#ffc966;">${new Date(loc.timestamp).toLocaleString()}</span><br><span style="font-size:0.9em;color:#aaa;">Type: ${loc.fractalType}, Iter: ${loc.maxIter}, ${loc.renderer}</span>`;
+    appendLocationInfo(info, loc.name, '', true);
+    info.appendChild(document.createElement('br'));
+    appendLocationInfo(info, formatLocationTimestamp(loc.timestamp), 'font-size:0.9em;color:#ffc966;');
+    info.appendChild(document.createElement('br'));
+    appendLocationInfo(
+      info,
+      `Type: ${loc.fractalType}, Iter: ${loc.maxIter}, ${loc.renderer}`,
+      'font-size:0.9em;color:#aaa;'
+    );
     row.appendChild(info);
     // Actions
     const actions = document.createElement('div');
@@ -192,36 +333,14 @@ function renderSavedLocations() {
     loadBtn.style.borderRadius = '5px';
     loadBtn.style.padding = '0.2em 1.1em';
     loadBtn.style.cursor = 'pointer';
-    loadBtn.addEventListener('click', () => {
-      typeSelect.value = loc.fractalType;
-      webglCheckbox.checked = (loc.renderer === 'GPU');
-      viewer.setFractal(loc.fractalType);
-      viewer.setView({ centerX: loc.centerX, centerY: loc.centerY, scale: loc.scale });
-      // A saved/imported record can carry any iteration count. The slider clamps
-      // it to what the UI can display and the kernel clamps what is actually
-      // stored, so the readout never promises more than the renderers honour
-      // (S3/B5).
-      maxIterSlider.value = String(loc.maxIter);
-      viewer.setMaxIter(parseInt(maxIterSlider.value, 10));
-      maxIterValue.textContent = String(viewer.maxIter);
-      if (webglCheckbox.checked) {
-        updateWebGLState();
-        // After changing mode, re-apply the loaded view
-        viewer.setView({ centerX: loc.centerX, centerY: loc.centerY, scale: loc.scale });
-        renderWebGL();
-      } else {
-        updateWebGLState(); // in case switching from GPU to CPU
-        viewer.setView({ centerX: loc.centerX, centerY: loc.centerY, scale: loc.scale });
-        startFractalCalculationWithTiming();
-      }
-      // Always trigger a rerender in the current mode
-      if (webglCheckbox.checked) {
-        renderWebGL();
-      } else {
-        startFractalCalculationWithTiming();
-      }
-      // loadLocationModal.style.display = 'none';
-    });
+    // S4: loading a record applies the view ONCE and renders ONCE.
+    //
+    // Before S4 this handler called `setView` three times (two of them identical,
+    // both re-rendering synchronously through FractalViewer.setView) and called
+    // `renderWebGL`/`startFractalCalculationWithTiming` twice per branch, so one
+    // click re-rendered the same frame up to three times. Both counts are
+    // observable (`window.__fv.lastLoad`), so "once" is counted, not asserted.
+    loadBtn.addEventListener('click', () => applyLoadedRecord(loc));
     actions.appendChild(loadBtn);
     const delBtn = document.createElement('button');
     delBtn.textContent = 'Delete';
@@ -1122,6 +1241,43 @@ window.__fv = Object.freeze({
     const w = worker;
     if (!w || typeof w.onerror !== 'function') throw new Error('no live worker');
     w.onerror({ message: String(message), preventDefault() {} });
+  },
+  // --- S4 input-truth observables ---
+  // Import a payload through the REAL import path (`importLocationsPayload`,
+  // the same function the FileReader handler calls): schema validation, the
+  // size bound, `#appMessage` reporting and the single re-render. The suite
+  // uses this instead of driving the OS file picker; it adds no production path.
+  importPayload: (text) => importLocationsPayload(text),
+  // The same import with an already-parsed document. The suite needs this for
+  // the payload shapes JSON cannot express (NaN, Infinity); the validation and
+  // storage below are the identical code the text path runs.
+  importDocument: (payload) => importLocationsObject(payload),
+  // What the last imported file contributed and what was refused. Counted.
+  importReport: () => ({ ...importReport, problems: importReport.problems.slice() }),
+  // The declared bounds, so a test asserts against the app's own numbers
+  // instead of restating them.
+  importLimits: () => ({ ...LOCATION_LIMITS }),
+  // How many times the last load applied the view and asked for a render.
+  lastLoad: () => ({ ...loadCounts }),
+  // Load a stored record through the REAL listener path (the same function the
+  // Load button calls), so the counted path is the production one.
+  loadLocation: (id) => {
+    const loc = memoryRepo.get(id);
+    if (!loc) throw new Error('no stored location with that id');
+    return applyLoadedRecord(loc);
+  },
+  // The ids the store currently holds, in display order.
+  storedLocationIds: () => memoryRepo.getAll('timestamp').map(loc => loc.id),
+  // Store a record WITHOUT the schema, then render the list. This is not a
+  // bypass of the import boundary — it exists so the RENDERING pin can be driven
+  // with a hostile `renderer`/`fractalType` that the schema would otherwise
+  // reject before it ever reached the sink. Rendering must treat every field as
+  // text no matter how the record got into the store (e.g. a future persisted
+  // or third-party record), and this is the only way to prove that.
+  saveUnvalidated: (record) => {
+    memoryRepo.save(record);
+    renderSavedLocations();
+    return memoryRepo.getAll('timestamp').map(loc => loc.id);
   },
 });
 
