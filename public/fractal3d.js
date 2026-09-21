@@ -80,6 +80,7 @@ export class Fractal3DViewer {
     // Renderer
     this.renderer = new THREE.WebGLRenderer({antialias: true});
     this.renderer.setClearColor(0x222233);
+    this.renderer.setPixelRatio(window.devicePixelRatio || 1);
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.container.appendChild(this.renderer.domElement);
     window.addEventListener('resize', this.onResize);
@@ -266,7 +267,10 @@ export class Fractal3DViewer {
   }
 
   onResize() {
-    if (!this.active) return;
+    if (!this.active || !this.renderer) return;
+    // three.js keeps the drawing buffer at CSS size x pixelRatio; deviceScaleFactor
+    // must be applied on every resize, not only at construction (S1/B4).
+    this.renderer.setPixelRatio(window.devicePixelRatio || 1);
     this.camera.aspect = window.innerWidth / window.innerHeight;
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(window.innerWidth, window.innerHeight);

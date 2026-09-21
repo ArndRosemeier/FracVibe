@@ -58,6 +58,9 @@
     </div>
   </div>
   <div id="saveLocationConfirmation" style="display:none;position:fixed;top:32px;left:50%;transform:translateX(-50%);background:#222;color:#ffe066;padding:0.7em 2em;border-radius:8px;font-size:1.2em;z-index:3000;box-shadow:0 2px 16px #0008;opacity:0;transition:opacity 0.7s;pointer-events:none;">Location saved!</div>
+  <!-- Non-modal failure/status surface: renderer fallbacks and the global error
+       net report here instead of an alert (S1/B9). -->
+  <div id="appMessage" role="status" aria-live="polite" style="display:none;"></div>
   <canvas id="fractalCanvas"></canvas>
   <canvas id="fractalCanvasWebGL" style="display:none;"></canvas>
   <script type="module" src="app.js"></script>

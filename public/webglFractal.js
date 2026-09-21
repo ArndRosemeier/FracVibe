@@ -1,22 +1,41 @@
+// Accounting for GPU↔CPU teardown. Every constructed renderer increments and
+// every destroyed renderer decrements, so a test can assert that N toggles leave
+// zero live renderers instead of inferring it. (Inference is not evidence.)
+let liveRendererCount = 0;
+function trackLiveRenderer(delta) {
+  liveRendererCount = Math.max(0, liveRendererCount + delta);
+  if (typeof window !== 'undefined') window.__fvLiveWebglRenderers = liveRendererCount;
+}
+
 // Minimal WebGL Fractal Renderer (Mandelbrot/Julia)
 export class WebGLFractalRenderer {
   constructor(canvas) {
     this.canvas = canvas;
+    this.gl = null;
+    this.program = null;
+    this.vsh = null;
+    this.fsh = null;
+    this.posBuf = null;
+    this.destroyed = false;
     if (!canvas) {
-      console.error('[WebGL] ERROR: Canvas is null or undefined!');
       throw new Error('WebGL initialization failed: canvas is null or undefined');
     }
     if (!canvas.parentNode) {
-      console.error('[WebGL] ERROR: Canvas has no parentNode (not attached to DOM)!', canvas);
       throw new Error('WebGL initialization failed: canvas not attached to DOM');
     }
-    // Use the minimal working context creation
-    this.gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
-    if (!this.gl) {
-      console.error('[WebGL] getContext failed. Canvas:', canvas, 'Parent:', canvas.parentNode);
-      throw new Error('WebGL context creation failed');
+    trackLiveRenderer(1);
+    try {
+      this.gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+      if (!this.gl) {
+        throw new Error('WebGL context creation failed');
+      }
+      this.initFractalShader();
+    } catch (err) {
+      // A half-initialised renderer must not stay counted as live, and must not
+      // keep a context it created.
+      this.destroy();
+      throw err;
     }
-    this.initFractalShader();
   }
 
   initFractalShader() {
@@ -165,13 +184,23 @@ export class WebGLFractalRenderer {
     gl.compileShader(vsh);
     const vCompiled = gl.getShaderParameter(vsh, gl.COMPILE_STATUS);
     const vLog = gl.getShaderInfoLog(vsh);
-    if (!vCompiled) throw new Error('Vertex shader failed: ' + vLog);
     const fsh = gl.createShader(gl.FRAGMENT_SHADER);
     gl.shaderSource(fsh, fragSrc);
     gl.compileShader(fsh);
     const fCompiled = gl.getShaderParameter(fsh, gl.COMPILE_STATUS);
     const fLog = gl.getShaderInfoLog(fsh);
-    if (!fCompiled) throw new Error('Fragment shader failed: ' + fLog);
+    // Hold the handles so a partially-built renderer can still be torn down.
+    this.vsh = vsh;
+    this.fsh = fsh;
+    if (!vCompiled || !fCompiled) {
+      if (!vCompiled) console.error('[WebGL] vertex shader failed:', vLog);
+      if (!fCompiled) console.error('[WebGL] fragment shader failed:', fLog);
+      gl.deleteShader(vsh);
+      gl.deleteShader(fsh);
+      this.vsh = null;
+      this.fsh = null;
+      throw new Error(vCompiled ? 'Fragment shader failed: ' + fLog : 'Vertex shader failed: ' + vLog);
+    }
     // Create program
     this.program = gl.createProgram();
     gl.attachShader(this.program, vsh);
@@ -179,10 +208,20 @@ export class WebGLFractalRenderer {
     gl.linkProgram(this.program);
     const linked = gl.getProgramParameter(this.program, gl.LINK_STATUS);
     const linkLog = gl.getProgramInfoLog(this.program);
-    if (!linked) throw new Error('Program link failed: ' + linkLog);
+    if (!linked) {
+      console.error('[WebGL] program link failed:', linkLog);
+      gl.deleteProgram(this.program);
+      gl.deleteShader(vsh);
+      gl.deleteShader(fsh);
+      this.program = null;
+      this.vsh = null;
+      this.fsh = null;
+      throw new Error('Program link failed: ' + linkLog);
+    }
     gl.useProgram(this.program);
     // Fullscreen quad
     const posBuf = gl.createBuffer();
+    this.posBuf = posBuf;
     gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
       -1, -1, 1, -1, -1, 1,
@@ -209,9 +248,32 @@ export class WebGLFractalRenderer {
     this.colorOffset = offset;
   }
 
+  // Keep the drawing buffer at CSS size x devicePixelRatio and the viewport in
+  // step. Returns true when the backing store actually changed.
+  resize(cssWidth, cssHeight, dpr) {
+    const canvas = this.canvas;
+    if (!canvas) return false;
+    const ratio = dpr || window.devicePixelRatio || 1;
+    const cssW = cssWidth || window.innerWidth;
+    const cssH = cssHeight || window.innerHeight;
+    const w = Math.max(1, Math.round(cssW * ratio));
+    const h = Math.max(1, Math.round(cssH * ratio));
+    let changed = false;
+    if (canvas.width !== w) { canvas.width = w; changed = true; }
+    if (canvas.height !== h) { canvas.height = h; changed = true; }
+    if (changed && this.gl && !this.gl.isContextLost()) {
+      this.gl.viewport(0, 0, canvas.width, canvas.height);
+    }
+    return changed;
+  }
+
   render(view, maxIter, colorSchemeIdx = 0, fractalType = 0, juliaParams = undefined) {
     const gl = this.gl;
-    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    // Safe to call after destroy()/context loss: draw nothing rather than throw.
+    if (!gl || this.destroyed || gl.isContextLost() || !this.program) return;
+    if (gl.canvas && (gl.drawingBufferWidth !== this.canvas.width || gl.drawingBufferHeight !== this.canvas.height)) {
+      gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    }
     gl.useProgram(this.program);
     gl.uniform1f(this.u_centerX, view.centerX);
     gl.uniform1f(this.u_centerY, view.centerY);
@@ -229,13 +291,33 @@ export class WebGLFractalRenderer {
       gl.uniform1f(this.u_julia_cx, 0.0);
       gl.uniform1f(this.u_julia_cy, 0.0);
     }
-    // Debug log
-    console.log('[WebGL] render: fractalType', fractalType, 'juliaParams', juliaParams);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
   };
 
   destroy() {
-    // No longer forcibly lose the context! Just null out the reference.
+    // Idempotent: a context-loss event and an explicit teardown may both arrive,
+    // and the live-renderer accounting must only be decremented once.
+    if (this.destroyed) return;
+    this.destroyed = true;
+    const gl = this.gl;
+    // Release everything we allocated, then release the context itself. Without
+    // this, every GPU→CPU toggle leaked a program, two shaders, a buffer and a
+    // live GL context (the browser caps those, and the app degrades silently).
+    if (gl && !gl.isContextLost()) {
+      if (this.program) gl.deleteProgram(this.program);
+      if (this.vsh) gl.deleteShader(this.vsh);
+      if (this.fsh) gl.deleteShader(this.fsh);
+      if (this.posBuf) gl.deleteBuffer(this.posBuf);
+      const lose = gl.getExtension('WEBGL_lose_context');
+      if (lose) {
+        try { lose.loseContext(); } catch (_) { /* already gone */ }
+      }
+    }
+    this.program = null;
+    this.vsh = null;
+    this.fsh = null;
+    this.posBuf = null;
     this.gl = null;
+    trackLiveRenderer(-1);
   }
 }

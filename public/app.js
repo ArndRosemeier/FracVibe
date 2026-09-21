@@ -6,7 +6,8 @@ import { WebGLFractalRenderer } from './webglFractal.js';
 import { FractalMemoryRepository } from './memoryRepository.js';
 
 const canvas = document.getElementById('fractalCanvas');
-const canvasWebGL = document.getElementById('fractalCanvasWebGL');
+// `let`: a real WebGL context loss replaces this element (see swapCanvasWebGL).
+let canvasWebGL = document.getElementById('fractalCanvasWebGL');
 const infoElem = document.getElementById('info');
 const typeSelect = document.getElementById('fractalType');
 const colorSchemeSelect = document.getElementById('colorScheme');
@@ -212,33 +213,45 @@ function renderSavedLocations() {
 // Start with a very zoomed-out view (tiny Mandelbrot)
 viewer.view.scale = 300;
 
-// --- WebGL zoom cap logic ---
+// --- WebGL zoom cap logic (S1): the clamp itself lives in FractalViewer
+// (setZoomLimit/clampScale) so wheel, setView and the startup animation all
+// produce the SAME value. This module only DECIDES the cap and what to say when
+// it is reached. There is no monkey-patching of viewer methods any more.
 const WEBGL_ZOOM_CAP = 10000;
 const WEBGL_MIN_SCALE = 1 / WEBGL_ZOOM_CAP;
 let askedCpuSwitchAtZoomCap = false;
 let deniedCpuSwitchAtZoomCap = false;
 
-const originalSetView = viewer.setView.bind(viewer);
-viewer.setView = function(view) {
-  // Cap zoom in WebGL mode
-  if (webglCheckbox.checked) {
-    if (view.scale < WEBGL_MIN_SCALE) {
-      view = { ...view, scale: WEBGL_MIN_SCALE };
-      if (!askedCpuSwitchAtZoomCap && !deniedCpuSwitchAtZoomCap) {
-        askedCpuSwitchAtZoomCap = true;
-        setTimeout(() => {
-          if (window.confirm('Zoom level limit reached for GPU mode. Switch to CPU mode for deeper zoom?')) {
-            webglCheckbox.checked = false;
-            updateWebGLState();
-          } else {
-            deniedCpuSwitchAtZoomCap = true;
-          }
-        }, 10);
-      }
+function handleZoomLimitReached() {
+  showMessage('Zoom limit reached for GPU mode (~' + WEBGL_ZOOM_CAP.toLocaleString() + 'x). Offer to switch to CPU for deeper zoom.');
+  // The cap is hit on every further wheel tick, but the user is PROMPTED only
+  // once. Report both facts to the observer so "once" is observable, not
+  // asserted from behaviour.
+  const prompted = !askedCpuSwitchAtZoomCap && !deniedCpuSwitchAtZoomCap;
+  try {
+    window.dispatchEvent(new CustomEvent('fv-zoom-limit', {
+      detail: { scale: viewer.view.scale, prompted },
+    }));
+  } catch (_) { /* observation only */ }
+  if (!prompted) return;
+  askedCpuSwitchAtZoomCap = true;
+  // Deferred so the clamp (and the render it triggers) is not blocked by the
+  // modal; the cap itself is already applied by the caller.
+  setTimeout(() => {
+    let switchToCpu = false;
+    try {
+      switchToCpu = window.confirm('Zoom level limit reached for GPU mode. Switch to CPU mode for deeper zoom?');
+    } catch (_) { /* a blocked/absent dialog must not break zoom */ }
+    if (switchToCpu) {
+      webglCheckbox.checked = false;
+      updateWebGLState();
+    } else {
+      deniedCpuSwitchAtZoomCap = true;
     }
-  }
-  originalSetView(view);
-};
+  }, 10);
+}
+
+viewer.setZoomLimit(WEBGL_MIN_SCALE, handleZoomLimitReached);
 
 viewer.setView(viewer.view);
 updateInfo(viewer.view);
@@ -262,6 +275,20 @@ let colorCycleRequestId = null;
 let progressiveState = null;
 
 let webglRenderer = null;
+// Set when the startup zoom animation has finished; lets the suite (and later
+// view logic) distinguish "still animating" from "settled".
+let zoomAnimationSettled = false;
+// --- S1 renderer-selection state (declared here because updateWebGLState runs
+// during startup, before the module body below finishes) ---
+// renderingWebGL stops a render from recursing; webglFailureHandled remembers
+// that we degraded to CPU so we neither retry a dead context nor report twice;
+// webglPending marks the window in which GPU mode is selected but the renderer
+// is still being built (a missing renderer then is NOT a failure).
+let renderingWebGL = false;
+let webglFailureHandled = false;
+let webglPending = false;
+let resizeViewportTimer = null;
+let currentErrorMessage = '';
 
 // Track if user has been asked to switch to CPU mode at zoom cap
 // (DECLARED ONCE at the top for global use)
@@ -313,6 +340,39 @@ function exit3DMode() {
 function updateInfo(view) {
   infoElem.textContent = `Center: (${view.centerX.toFixed(5)}, ${view.centerY.toFixed(5)})  Zoom: ${(1/view.scale).toFixed(2)}`;
 }
+
+// --- Non-modal failure / status surface (S1/B9) ---
+// Everything that used to be an `alert` (or was swallowed entirely) reports
+// here: visible in the page, dismissible-free, and never blocking the renderer.
+const appMessageElem = document.getElementById('appMessage');
+
+function showMessage(text, level) {
+  currentErrorMessage = text == null ? '' : String(text);
+  if (!appMessageElem) return;
+  appMessageElem.textContent = currentErrorMessage;
+  appMessageElem.className = 'app-message' + (level && level !== 'info' ? ' app-message--' + level : '');
+  appMessageElem.style.display = currentErrorMessage ? 'block' : 'none';
+}
+
+function showError(text) { showMessage(text, 'error'); }
+
+function errorText(err) {
+  const raw = (err && (err.message || err.reason || err)) || 'Unknown error';
+  return String(raw).replace(/\s+/g, ' ').slice(0, 300);
+}
+
+// The last-resort net: an exception that escapes a render path must leave a
+// message, not a frozen canvas (S1).
+window.addEventListener('error', (event) => {
+  const target = event && event.target;
+  const where = target && target !== window && target.tagName
+    ? `${target.tagName} ${target.src || target.href || ''}`.trim()
+    : '';
+  showError(`Error: ${errorText(event && (event.error || event.message))}${where ? ` (${where})` : ''}`);
+});
+window.addEventListener('unhandledrejection', (event) => {
+  showError(`Unhandled promise rejection: ${errorText(event && (event.reason || event))}`);
+});
 
 typeSelect.addEventListener('change', () => {
   viewer.setFractal(typeSelect.value);
@@ -438,19 +498,22 @@ updateWebGLState();
 
 // Animate zoom from 300 to 3 (default) at startup, then show splash
 (function animateZoom() {
-  let target = 3;
-  let minStep = 0.01;
-  let delay = 16; // ms per frame (about 60fps)
+  const target = 3;
+  const minStep = 0.01;
+  const delay = 16; // ms per frame (about 60fps)
   function loop() {
     if (viewer.view.scale > target) {
-      let diff = viewer.view.scale - target;
-      let thisStep = Math.max(diff * 0.08, minStep); // Easing: smaller steps as we approach
-      viewer.view.scale = Math.max(viewer.view.scale - thisStep, target);
-      viewer.setView(viewer.view);
-      updateInfo(viewer.view);
+      const diff = viewer.view.scale - target;
+      const thisStep = Math.max(diff * 0.08, minStep); // Easing: smaller steps as we approach
+      const nextScale = Math.max(viewer.view.scale - thisStep, target);
+      // Go through setView (a fresh object, never mutating the live view) so the
+      // ONE clamp applies here exactly as it does for the wheel (S1). Passing the
+      // live object would let the animation overwrite a clamped scale next frame.
+      viewer.setView({ ...viewer.view, scale: nextScale });
       setTimeout(loop, delay);
     } else {
       // Animation done, show splash
+      zoomAnimationSettled = true;
       updateInfo(viewer.view);
       showFractVibeSplash();
       // The animation moved the view without going through the view-change
@@ -484,9 +547,90 @@ if (cycleColorsCheckbox.checked) {
 // Initial calculation
 startFractalCalculationWithTiming();
 
-window.addEventListener('resize', () => {
-  viewer.resize();
+// --- S1/B4: the ONE resize path -------------------------------------------------
+// Both canvases are sized to CSS size x devicePixelRatio here, for all three
+// renderers. FractalViewer no longer installs its own resize listener.
+// A canvas whose WebGL context has been lost can never hand out a fresh context
+// again, so teardown replaces the element with a clean one. Idempotent: the
+// current canvas is only replaced while it is the one that lost its context.
+function swapCanvasWebGL() {
+  const old = canvasWebGL;
+  if (!old || !old.parentNode) return null;
+  if (!old._fvContextLost) return old;
+  const replacement = old.cloneNode(false);
+  replacement.width = 1;
+  replacement.height = 1;
+  old.parentNode.replaceChild(replacement, old);
+  canvasWebGL = replacement;
+  attachFractalMouseEvents(replacement);
+  attachContextLossGuard(replacement);
+  return replacement;
+}
+
+function sameSizeCanvas(c, w, h) {
+  return c.width === w && c.height === h;
+}
+
+function resizeRenderers(force) {
+  if (in3DMode) return; // Fractal3DViewer owns its own size
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = window.innerWidth;
+  const cssH = window.innerHeight;
+  const w = Math.max(1, Math.round(cssW * dpr));
+  const h = Math.max(1, Math.round(cssH * dpr));
+
+  const cw = canvasWebGL;
+  const webglChanged = !!cw && (force || !sameSizeCanvas(cw, w, h));
+  if (webglChanged) {
+    cw.width = w;
+    cw.height = h;
+    if (webglRenderer && typeof webglRenderer.resize === 'function') {
+      webglRenderer.resize(cssW, cssH, dpr);
+    }
+  }
+
+  const viewerChanged = viewer.width !== w || viewer.height !== h || force;
+  if (viewerChanged) viewer.applyCanvasSize(cssW, cssH, dpr);
+  return { width: w, height: h, webglChanged, viewerChanged, dpr };
+}
+
+function onViewportResize() {
+  if (in3DMode) return;
+  const change = resizeRenderers(false);
+  if (!change) return;
+  // Refresh both renderers immediately, then recompute at the new resolution
+  // once the burst of resize events has settled.
+  if (webglCheckbox.checked) renderWebGL();
+  else viewer.render();
+  if (resizeViewportTimer) clearTimeout(resizeViewportTimer);
+  resizeViewportTimer = setTimeout(() => {
+    resizeViewportTimer = null;
+    startFractalCalculationWithTiming();
+  }, 150);
+}
+
+window.addEventListener('resize', onViewportResize);
+
+// devicePixelRatio changes (dragging a window between displays, or a browser
+// zoom) fire no 'resize' event on their own; watch the media query directly.
+let dprQuery = null;
+function watchDevicePixelRatio() {
+  if (!window.matchMedia) return;
+  if (dprQuery && dprQuery.removeEventListener) dprQuery.removeEventListener('change', dprHandler);
+  const dpr = window.devicePixelRatio || 1;
+  dprQuery = window.matchMedia('(resolution: ' + dpr + 'dppx)');
+  if (dprQuery.addEventListener) dprQuery.addEventListener('change', dprHandler);
+}
+function dprHandler() {
+  watchDevicePixelRatio();
+  resizeRenderers(true);
+  if (webglCheckbox.checked) renderWebGL();
+  else viewer.render();
   startFractalCalculationWithTiming();
+}
+watchDevicePixelRatio();
+window.addEventListener('beforeunload', () => {
+  if (dprQuery && dprQuery.removeEventListener) dprQuery.removeEventListener('change', dprHandler);
 });
 
 window.addEventListener('keydown', e => {
@@ -577,104 +721,132 @@ function getColorSchemeIdx() {
   return colorSchemeMap[viewer.colorScheme] ?? 0;
 }
 
+// --- S1: renderer selection and the WebGL failure path ------------------------
+// (state declared near the top, before startup runs updateWebGLState)
 function updateWebGLState() {
   if (webglCheckbox.checked) {
+    if (webglFailureHandled) {
+      // Already degraded: stay on the CPU canvas instead of retrying a context
+      // this page cannot get.
+      canvasWebGL.style.display = 'none';
+      canvas.style.display = '';
+      return;
+    }
     // Show WebGL canvas, hide 2D canvas BEFORE context creation
     canvas.style.display = 'none';
-    canvasWebGL.style.display = 'block'; // Explicitly set to block
-    // Attach a MutationObserver to debug style changes
-    if (!canvasWebGL._debugObserver) {
-      canvasWebGL._debugObserver = new MutationObserver((mutations) => {
-        mutations.forEach(m => {
-          if (m.attributeName === 'style') {
-            console.log('[WebGL] MutationObserver: style changed to', canvasWebGL.style.display);
-          }
-        });
-      });
-      canvasWebGL._debugObserver.observe(canvasWebGL, { attributes: true, attributeFilter: ['style'] });
-    }
+    canvasWebGL.style.display = 'block';
     // Force reflow to ensure style is applied before context creation
     void canvasWebGL.offsetWidth;
-    // Now set canvas size (must be visible)
-    canvasWebGL.width = window.innerWidth;
-    canvasWebGL.height = window.innerHeight;
-    viewer.setView = function(view) {
-  // Cap zoom in WebGL mode
-  if (webglCheckbox.checked) {
-    const maxZoom = 10000;
-    if (1 / view.scale > maxZoom) {
-      view = { ...view, scale: 1 / maxZoom };
-      // Ask user to switch to CPU mode only once
-      if (!askedCpuSwitchAtZoomCap && !deniedCpuSwitchAtZoomCap) {
-        askedCpuSwitchAtZoomCap = true;
-        setTimeout(() => {
-          if (window.confirm('Zoom level limit reached for GPU mode. Switch to CPU mode for deeper zoom?')) {
-            webglCheckbox.checked = false;
-            updateWebGLState();
-          } else {
-            deniedCpuSwitchAtZoomCap = true;
-          }
-        }, 10);
-      }
-    }
-  }
-  this.view = { ...view };
-  this.render();
-};
+    // Size the drawing buffer to CSS size x dpr, now that the canvas is visible
+    // (B4: this used to be a one-off CSS-pixel size that never changed again).
+    resizeRenderers(true);
+    webglPending = true;
     setTimeout(() => {
-      // Log style right before context creation
-      console.log('[WebGL] Before context: style.display =', canvasWebGL.style.display);
       try {
-        if (!webglRenderer) webglRenderer = new WebGLFractalRenderer(canvasWebGL);
+        if (!webglRenderer) {
+          swapCanvasWebGL(); // no-op unless the current canvas lost its context
+          webglRenderer = new WebGLFractalRenderer(canvasWebGL);
+        }
+        webglPending = false;
         renderWebGL();
-      } catch (e) {
-        alert('WebGL is not supported or could not be initialized.');
-        webglCheckbox.checked = false;
-        webglRenderer = null;
-        canvasWebGL.style.display = 'none';
-        canvas.style.display = '';
-        viewer.render();
+      } catch (err) {
+        webglPending = false;
+        handleWebGLFailure('WebGL is not supported or could not be initialized.', err);
       }
     }, 0);
-  } else {
+  } else if (!webglFailureHandled) {
     // Show 2D canvas, hide WebGL canvas
+    webglPending = false;
     canvasWebGL.style.display = 'none';
     canvas.style.display = '';
-    if (webglRenderer) { webglRenderer.destroy(); webglRenderer = null; }
-    viewer.render();
+    if (webglRenderer) {
+      webglRenderer.destroy();
+      webglRenderer = null;
+      // The destroyed context leaves its canvas permanently unusable; replace it
+      // so a later GPU toggle can actually get a context.
+      canvasWebGL._fvContextLost = true;
+      swapCanvasWebGL();
+    }
+    renderFractal();
+  } else {
+    // Degraded to CPU: make sure the 2D canvas is the visible one.
+    canvasWebGL.style.display = 'none';
+    canvas.style.display = '';
+    renderFractal();
   }
+}
+
+// One exit for every WebGL failure: context creation, shader compile, context
+// loss, or a throw from renderWebGL. It always (a) starts a REAL CPU render so
+// the canvas is never the blank #222 the old alert-path left behind, and (b)
+// says so in the page instead of an alert.
+function handleWebGLFailure(reason, err) {
+  const detail = err ? ` (${errorText(err)})` : '';
+  if (webglRenderer) {
+    try { webglRenderer.destroy(); } catch (_) { /* already unusable */ }
+    webglRenderer = null;
+    canvasWebGL._fvContextLost = true;
+    swapCanvasWebGL();
+  }
+  webglCheckbox.checked = false;
+  webglFailureHandled = true;
+  canvasWebGL.style.display = 'none';
+  canvas.style.display = '';
+  showError(reason + detail + ' Fell back to the CPU renderer.');
+  // Start a real CPU calculation (the old path only called viewer.render(), which
+  // paints the background when no image data exists yet).
+  startFractalCalculationWithTiming();
+}
+
+// A lost context (real event or an unusable renderer): report it, degrade to
+// CPU, and swap in a live WebGL canvas so a later GPU toggle can work again.
+function handleWebGLLoss(note) {
+  if (webglRenderer) {
+    try { webglRenderer.destroy(); } catch (_) { /* already unusable */ }
+    webglRenderer = null;
+  }
+  canvasWebGL._fvContextLost = true;
+  webglCheckbox.checked = false;
+  canvasWebGL.style.display = 'none';
+  canvas.style.display = '';
+  showError('WebGL context lost. ' + (note || '') + ' Fell back to the CPU renderer.');
+  startFractalCalculationWithTiming();
 }
 
 function renderWebGL() {
   lastRenderStart = performance.now();
-  if (!webglRenderer) return;
-  // --- Enforce zoom cap at render time ---
-  if (webglCheckbox.checked && viewer.view.scale < WEBGL_MIN_SCALE) {
-    viewer.view.scale = WEBGL_MIN_SCALE;
-    if (!askedCpuSwitchAtZoomCap && !deniedCpuSwitchAtZoomCap) {
-      askedCpuSwitchAtZoomCap = true;
-      setTimeout(() => {
-        if (window.confirm('Zoom level limit reached for GPU mode. Switch to CPU mode for deeper zoom?')) {
-          webglCheckbox.checked = false;
-          updateWebGLState();
-        } else {
-          deniedCpuSwitchAtZoomCap = true;
-        }
-      }, 10);
-    }
+  if (!webglRenderer) {
+    // No renderer while GPU mode is the ACTIVE choice means WebGL cannot draw:
+    // fall back rather than leaving a blank canvas (S1/B9). This used to be a
+    // bare `return`. While the renderer is still being built (webglPending) that
+    // absence is expected, and while the CPU is the active choice there is simply
+    // nothing for WebGL to do.
+    if (webglCheckbox.checked && !webglPending) handleWebGLFailure('WebGL renderer unavailable.');
+    return;
   }
-  console.log('[WebGL] renderWebGL: view', JSON.stringify(viewer.view), 'maxIter', viewer.maxIter, 'colorScheme', viewer.colorScheme);
-  // Map fractal type string to int
-  const typeMap = { mandelbrot: 0, julia: 1, burningship: 2, tricorn: 3 };
-  const fractalTypeInt = typeMap[viewer.fractalType] || 0;
-  const juliaParams = (fractalTypeInt === 1) ? viewer.juliaParams : undefined;
-  webglRenderer.render(
-    viewer.view,
-    viewer.maxIter,
-    getColorSchemeIdx(),
-    fractalTypeInt,
-    juliaParams
-  );
+  if (webglRenderer.destroyed || (webglRenderer.gl && webglRenderer.gl.isContextLost())) {
+    handleWebGLLoss('The renderer is no longer usable.');
+    return;
+  }
+  try {
+    // Map fractal type string to int
+    const typeMap = { mandelbrot: 0, julia: 1, burningship: 2, tricorn: 3 };
+    const fractalTypeInt = typeMap[viewer.fractalType] || 0;
+    const juliaParams = (fractalTypeInt === 1) ? viewer.juliaParams : undefined;
+    renderingWebGL = true;
+    webglRenderer.render(
+      viewer.view,
+      viewer.maxIter,
+      getColorSchemeIdx(),
+      fractalTypeInt,
+      juliaParams
+    );
+  } catch (err) {
+    handleWebGLFailure('WebGL rendering failed.', err);
+    return;
+  } finally {
+    renderingWebGL = false;
+  }
   lastRenderDuration = performance.now() - lastRenderStart;
   setRenderTimeDisplay(lastRenderDuration);
 }
@@ -683,28 +855,72 @@ function setRenderTimeDisplay(ms) {
   renderTimeElem.textContent = `Render: ${ms.toFixed(1)} ms`;
 }
 
-// Hook up checkbox
+// Hook up checkbox. Every switch is guarded: a failure here must surface as a
+// message and a CPU render, never as an uncaught exception.
 webglCheckbox.addEventListener('change', () => {
-  updateWebGLState();
-  if (webglCheckbox.checked) {
-    renderWebGL();
-  } else {
-    startFractalCalculationWithTiming();
+  try {
+    updateWebGLState();
+    if (webglCheckbox.checked) {
+      renderWebGL();
+    } else {
+      startFractalCalculationWithTiming();
+    }
+  } catch (err) {
+    handleWebGLFailure('Renderer switch failed.', err);
   }
 });
 
-// Update rendering on any parameter change
+// --- S1: the ONE canvas resize path -------------------------------------------
+// `viewer.render` is re-pointed exactly once, here, to dispatch to the active
+// renderer. (Previously this was a monkey-patch installed before every GPU entry.)
 const originalRender = viewer.render.bind(viewer);
-viewer.render = function() {
-  lastRenderStart = performance.now();
-  if (webglCheckbox.checked && webglRenderer) {
-    renderWebGL();
+function renderFractal() {
+  if (webglCheckbox.checked && (webglRenderer || webglPending)) {
+    if (webglRenderer) renderWebGL();
+    // webglPending: the deferred init will render as soon as it has a renderer.
   } else {
     originalRender();
     lastRenderDuration = performance.now() - lastRenderStart;
     setRenderTimeDisplay(lastRenderDuration);
   }
+}
+viewer.render = function() {
+  lastRenderStart = performance.now();
+  return renderFractal();
 };
+
+// Context loss must be heard from the moment the element exists, not only after
+// a renderer was constructed. preventDefault() keeps the canvas restorable;
+// the element is then replaced so a fresh context can be created.
+function attachContextLossGuard(target) {
+  if (!target || typeof target.addEventListener !== 'function') return;
+  target.addEventListener('webglcontextlost', (event) => {
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    target._fvContextLost = true;
+    // A teardown we initiated also emits this event, but only for the ACTIVE
+    // canvas does it mean the page just lost its renderer. A detached canvas
+    // (already replaced by swapCanvasWebGL) must not trigger a second fallback.
+    if (target !== canvasWebGL) return;
+    handleWebGLLoss(event && event.statusMessage ? event.statusMessage : '');
+  });
+}
+attachContextLossGuard(canvasWebGL);
+
+// --- S1: debug/observation hook for the suite ---------------------------------
+// A small, frozen surface so tests can observe view truth without inferring it
+// from pixels. It exposes no way to change renderer behaviour.
+window.__fv = Object.freeze({
+  getView: () => ({ ...viewer.view }),
+  setScale: (scale) => viewer.setView({ ...viewer.view, scale }),
+  runAnimationFrame: () => { viewer.setView({ ...viewer.view, scale: viewer.view.scale }); },
+  renderWebGL: () => renderWebGL(),
+  forceFallback: () => handleWebGLFailure('WebGL failure forced for observation.'),
+  simulateContextLoss: () => handleWebGLLoss('Context loss simulated.'),
+  zoomCap: WEBGL_ZOOM_CAP,
+  minScale: WEBGL_MIN_SCALE,
+  liveRenderers: () => (typeof window.__fvLiveWebglRenderers === 'number' ? window.__fvLiveWebglRenderers : 0),
+  animationSettled: () => zoomAnimationSettled,
+});
 
 // Also update on maxIter/type/params changes
 [typeSelect, colorSchemeSelect, maxIterSlider].forEach(el => {

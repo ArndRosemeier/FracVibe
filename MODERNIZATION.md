@@ -63,6 +63,10 @@ consolidation below.
 the 2D canvas, so `canvasWebGL` keeps its old buffer size and `u_aspect`/viewport go stale
 after any window resize. Both canvases also size their buffer from `innerWidth/innerHeight`
 (CSS px), so everything is blurry on HiDPI.
+*Fixed (S1):* `FractalViewer.applyCanvasSize()` and `WebGLFractalRenderer.resize()` size both
+backing stores to CSS size × `devicePixelRatio` on startup, on `resize` and on a DPR change;
+`Fractal3DViewer.onResize()` now calls `setPixelRatio`. The two old 2D resize listeners are
+one path in `app.js`. Pinned by `tests/canvas-dpr.spec.js`.
 
 **B5. Iteration cap mismatch.** The slider allows 2000 (`index.html:33`) but the fragment
 shader loops `for (int i = 0; i < 1024; i++)` (`webglFractal.js:52,63,74,85`). Above 1024,
@@ -88,6 +92,14 @@ uniform).
 `updateWebGLState()` does not start a CPU calculation → blank canvas in the fallback path.
 And `WebGLFractalRenderer.destroy()` only nulls `gl`, leaking programs, buffers and the
 context itself on every GPU/CPU toggle.
+*Fixed (S1):* every WebGL failure (context creation, shader compile, context loss, a throw
+from `renderWebGL`) now runs one `handleWebGLFailure`/`handleWebGLLoss` exit that starts a
+real CPU calculation and reports through the new non-modal `#appMessage` element instead of
+`alert`. `destroy()` is idempotent and deletes the program, both shaders and the buffer, then
+releases the context via `WEBGL_lose_context`; it also accounts for live renderers so the
+suite can assert teardown. A canvas that lost its context is replaced before a later GPU
+toggle, and `window` `error`/`unhandledrejection` listeners surface anything that still
+escapes. Pinned by `tests/webgl-fallback.spec.js`.
 
 ---
 
@@ -117,6 +129,10 @@ pre-fix), `FractalViewer.setView`/`onWheel` are monkey-patched from `app.js`, an
 in `fractalViewer.js:117-121` can never fire because `WEBGL_MIN_SCALE`/`webglCheckbox` are
 module-scoped in `app.js`, not globals. This is the classic "feature added by patching the
 patch" smell and is what produced B1. Consolidate view state + clamping into one module.
+*Fixed (S1):* `FractalViewer.setZoomLimit()`/`clampScale()` now own the cap; `setView`,
+`onWheel` and the startup animation all route through it, `renderWebGL` no longer clamps, and
+both monkey-patches plus the dead wheel guard are deleted. Pinned (all three paths must
+produce the same scale) by `tests/zoom-clamp.spec.js`.
 
 **Dead / orphan files.**
 - `recursiveFractalVibe.js`, `recursiveFractalLetter.js`, `splashMandelbrotCurve.js` — never

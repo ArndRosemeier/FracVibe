@@ -38,3 +38,28 @@ body {
   margin-left: 20px;
   font-size: 0.95em;
 }
+
+/* Non-modal status surface (S1). Sits above both canvases but never blocks
+   input: a WebGL fallback must be visible and the app must stay usable. */
+#appMessage {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  max-width: min(640px, 92vw);
+  padding: 0.6em 1.1em;
+  border-radius: 8px;
+  background: rgba(30, 30, 30, 0.94);
+  border: 1px solid #555;
+  color: #ffe066;
+  font-size: 0.95em;
+  line-height: 1.35;
+  z-index: 4000;
+  pointer-events: none;
+  box-shadow: 0 2px 16px #0008;
+}
+#appMessage.app-message--error {
+  border-color: #a33;
+  color: #ffb3b3;
+  background: rgba(48, 18, 18, 0.95);
+}
