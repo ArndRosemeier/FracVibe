@@ -173,3 +173,66 @@
   absent per Claude.
 - FractalShark's GPU numbers and bertbaron's ~1E1500 / rust-fractal's E50000 are **authors' own
   claims, not benchmarked by this probe**.
+
+## 7 · GPU extended-precision LIBRARIES AND TECHNIQUES (web search 2026-09-21, owner-directed)
+
+The prior conclusion "no library exists for the GPU" was **wrong as stated**: GLSL/WGSL
+high-precision arithmetic libraries exist, several are aimed at *exactly* our problem
+(deep-zoom fractal rendering), and one ships a production WebGL/WebGPU implementation with
+a documented precision benchmark. Sources below; treat them as external and unvetted until
+we measure them here.
+
+### What exists
+- **luma.gl `fp64` / `fp64arithmetic`** (vis.gl — production WebGL2/WebGPU library) —
+  double-single ("expansion") arithmetic in **both GLSL and WGSL**; the guide explicitly
+  demonstrates **deep-zoom Mandelbrot** with an fp32-vs-fp64 side-by-side and a precision
+  benchmark. **Up to ~48 significant bits (~14 decimal digits)**, within the f32 exponent
+  range. Also ships **integer-controlled double-single** for backends whose compiler will not
+  preserve rounding points, and `fp64u32` exact-delta helpers.
+  <https://github.com/visgl/luma.gl> · <https://luma.gl/docs/api-guide/shaders/gpu-floating-point-precision>
+- **`glsl-arbitrary-precision`** — "an arbitrary-precision arithmetic library for GLSL".
+  <https://github.com/RohanFredriksson/glsl-arbitrary-precision>
+- **`glsl-arb-prec`** — "a mini-library for performing arbitrary-precision arithmetic in
+  OpenGL ES Shader Language" (i.e. exactly our GLSL ES 1.00 target).
+  <https://github.com/alexozer/glsl-arb-prec>
+- **CAMPARY** — CUDA multiple-precision arithmetic (library + applications).
+  <https://hal.science/hal-01312858/document>
+- **deep-fractal** (munrocket/JMaio) — a WebGL deep-zoom Mandelbrot viewer built on
+  perturbation theory: a working reference implementation of the architecture we use.
+  <https://github.com/JMaio/deep-fractal>
+
+### The technique ladder (mapped onto OUR failure mode)
+Precision = **significand width**; the shipped exponent split fixed **range**. For the delta
+mantissa the established options, cheapest first:
+
+| technique | precision | notes for us |
+|---|---|---|
+| double-single (`hi + lo`) | ~48 bits | what DECISIONS 37 measured here, at 10.4–12.5× fragment cost |
+| integer-controlled double-single | ~48 bits | deterministic rounding points; robust where the compiler reassociates |
+| full software binary64 | 53 bits + binary64 range | "expensive, but a small application-specific subset can be reasonable" |
+| fixed point | chosen | the guide lists **"deep iterative calculation over a bounded interval"** as its fit — that is literally our kernel |
+| k-component expansion | ≈ k × 24 bits | the general ladder; cost ≈ k |
+
+### TWO WARNINGS THAT CHANGE OUR PLAN
+1. **WGSL's floating-point rules permit reassociation and fusion, and do not specify one
+   rounding direction — so the classic double-single transforms are NOT portable in WebGPU.**
+   An error-free transform is an algorithm over *rounding events*: the low term of `TwoSum` is
+   algebraically ZERO over the reals, so a reassociating compiler can erase the very
+   information being recovered. luma.gl therefore selects an **integer-controlled** path on
+   Apple WebGPU automatically, and states plainly that `let`/`var` assignment, parentheses,
+   identity `bitcast`, `+0.0`, `*1.0` and WGSL `fma` are all **not** portable precision
+   barriers. **Consequence for us: a WebGPU mantissa ladder must use integer-controlled
+   transforms, or be validated per-adapter — the GLSL route is safer than the WGSL route.**
+2. **Validation requires real hardware.** The guide is explicit: "a software adapter or a
+   compile-only test cannot demonstrate that residual terms survive execution", and it
+   recommends inspecting **both the high component and a required nonzero low component**,
+   because "a final value can look plausible even after the expansion silently collapses to
+   f32". **This host runs SwiftShader for BOTH WebGL and WebGPU**, so our measurements here
+   can develop and falsify the mechanism but **cannot certify that the extra precision
+   survives on real GPUs** — that certification needs hardware we do not have.
+
+### What this means for DECISIONS 64/65 (unchanged in substance, sharpened in route)
+The 1e-42 limit remains a **solver limitation, not a floor** — now with named, existing
+implementations to build from rather than a from-scratch derivation. The ladder is
+double-single (measured here) → integer-controlled double-single (robust) → k-component
+expansion → full software binary64 (arbitrary), each bounded by time, not by a wall.
