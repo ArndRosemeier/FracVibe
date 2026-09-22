@@ -967,6 +967,16 @@ function onMouseDown(e) {
   if (viewer && viewer.onMouseDown) viewer.onMouseDown(e);
 }
 function onWheel(e) {
+  // COARSE-TO-FINE latency instrument. The event's OWN `timeStamp` (same time
+  // origin as `performance.now()`) is when the browser created the wheel event; if
+  // the main thread was busy inside a GPU pass, that is how long the user waited
+  // before the app could even begin to respond. `gpuWheelToFirstFrameMs` then
+  // measures to the first REFINEMENT FRAME of the view this wheel asked for —
+  // which is the cheap step-8 level, not a full-resolution pass.
+  if (e && typeof e.timeStamp === 'number' && e.timeStamp > 0) gpuWheelEventAt = e.timeStamp;
+  else gpuWheelEventAt = gpuNow();
+  gpuAwaitingWheelFrame = true;
+  gpuWheelToFirstFrameMs = null;
   if (viewer && viewer.onWheel) viewer.onWheel(e);
 }
 function onMouseMove(e) {
@@ -1335,6 +1345,220 @@ function handleWebGLLoss(note) {
   startFractalCalculationWithTiming();
 }
 
+// --- COARSE-TO-FINE GPU REFINEMENT (owner request, 2026-09-22 verbatim) --------
+//   "Deep zooms seem to work well on webgpu. They get slow of course and thats
+//    where the coarse to fine rendering should come in. Rendering that does not
+//    block further zoom. Can do that for any depth, it just wont be noticable at
+//    lower depths."
+//
+// The CPU lane has always done this (`public/fractalWorker.js` walks ONE buffer
+// through gridStep 8 -> 4 -> 2 -> 1 and posts EVERY level as a real frame). This
+// is the same shape on the GPU path, and it follows the same level sequence.
+//
+// WHAT A LEVEL IS. Each level is a REAL render of the SAME view through the SAME
+// fragment program — `WebGLFractalRenderer.renderPass(view, ..., sampleStep)`
+// draws it into an offscreen target of ceil(W/step) x ceil(H/step) texels and
+// magnifies that onto the canvas. So a level's cost is proportional to the number
+// of FRAGMENTS it rasterises: step 8 does 1/64 of the final pass's work, step 4
+// 1/16, step 2 1/4. The math is not duplicated and not approximated — the sample
+// DENSITY is the parameter (DECISIONS row 52), and `step === 1` is byte-for-byte
+// the pre-refinement full-resolution pass. The measured per-level ms are exposed
+// at `window.__fv.lastGpuChain()`.
+//
+// WHY THE CHAIN YIELDS. A GPU pass cannot be preempted once it is submitted, so
+// the honest mechanism is BETWEEN passes: each pass is followed by a macrotask
+// yield, and the next pass checks the generation token FIRST. A wheel delivered
+// during that yield has already run `renderWebGL()` (the wheel handler calls it),
+// which bumps the token, so the superseded chain abandons immediately instead of
+// burning the GPU on a view nobody will see. The first level a wheel's own chain
+// runs is the CHEAPEST one (step 8) and it runs synchronously inside the handler,
+// so "the first visible response" to a wheel is a coarse frame rather than a full
+// -resolution pass — that is the measured latency claim (`wheelToFirstFrameMs`).
+//
+// WHERE THE LEVEL SEQUENCE LIVES. It mirrors the CPU worker's `[8, 4, 2, 1]`, as
+// ONE constant. Nothing about it depends on depth, on the machine, or on a
+// stopwatch: there is NO depth- or timing-based switch here (DECISIONS row 46),
+// and no new cap. A single level (`[1]`) reproduces the pre-change build exactly
+// and is what the pins' FAILING BASELINE arm drives.
+const DEFAULT_GPU_SCHEDULE = [8, 4, 2, 1];
+let gpuSchedule = DEFAULT_GPU_SCHEDULE.slice();
+let gpuRenderGeneration = 0;   // bumped by every render request; the supersede token
+let gpuChain = null;           // the chain in flight, or null when idle
+let gpuChainsStarted = 0;
+let gpuChainsCompleted = 0;
+let gpuChainsAbandoned = 0;
+let gpuPassesSkipped = 0;      // passes an abandoned chain did NOT run (no GPU time)
+const gpuChainLog = [];        // the last few ended chains, newest last (observation)
+let gpuSettleWaiters = [];     // resolvers for whenGpuIdle()
+let gpuPassHook = null;        // observation hook: runs after every applied pass
+let gpuWheelEventAt = null;    // the wheel event's own timestamp (same origin as now)
+let gpuAwaitingWheelFrame = false;
+let gpuWheelToFirstFrameMs = null;
+
+function gpuNow() {
+  return (typeof performance !== 'undefined' && performance.now)
+    ? performance.now() : Date.now();
+}
+
+function gpuChainSnapshot(chain) {
+  return {
+    generation: chain.generation,
+    schedule: chain.schedule.slice(),
+    levels: chain.levels.map((l) => ({ ...l })),
+    passesApplied: chain.index,
+    abandoned: !!chain.abandoned,
+    completed: !!chain.completed,
+    passesSkipped: chain.skipped || 0,
+    startedAt: chain.startedAt,
+    totalMs: (chain.completedAt == null ? gpuNow() : chain.completedAt) - chain.startedAt,
+    fullImageMs: chain.fullMs || 0,
+    view: { ...chain.view },
+  };
+}
+
+function logGpuChain(chain) {
+  gpuChainLog.push(gpuChainSnapshot(chain));
+  if (gpuChainLog.length > 8) gpuChainLog.shift();
+}
+
+function settleGpuWaitersIfIdle() {
+  if (gpuChain) return;
+  const waiters = gpuSettleWaiters;
+  gpuSettleWaiters = [];
+  for (const resolve of waiters) resolve();
+}
+
+// Resolves when no refinement chain is in flight. Observation only: it is how a
+// pin reads the FINAL frame of the production path instead of the first level.
+// A superseded chain resolves this only once the chain that replaced it is done.
+function whenGpuIdle() {
+  if (!gpuChain) return Promise.resolve();
+  return new Promise((resolve) => { gpuSettleWaiters.push(resolve); });
+}
+
+// The same, but looping: the CPU lane re-renders through the GPU path when its
+// job's final frame lands (`applyWorkerFrame` -> `viewer.setData` -> `render`), so
+// a chain can start immediately after one ends. A pin that reads PIXELS awaits
+// this, so it can never read a half-refined frame by accident.
+function whenGpuSettled() {
+  if (!gpuChain) return Promise.resolve();
+  return whenGpuIdle().then(() => (gpuChain ? whenGpuSettled() : undefined));
+}
+
+function abandonGpuChain(chain) {
+  if (chain.abandoned || chain.completed) return;
+  chain.abandoned = true;
+  chain.completedAt = gpuNow();
+  chain.skipped = Math.max(0, chain.schedule.length - chain.index);
+  gpuPassesSkipped += chain.skipped;
+  gpuChainsAbandoned++;
+  if (gpuChain === chain) gpuChain = null;
+  logGpuChain(chain);
+  settleGpuWaitersIfIdle();
+}
+
+// ONE step of a refinement chain: apply one level, then either finish or yield.
+// The generation check is FIRST, so a superseded chain never starts another pass.
+function stepGpuChain(chain) {
+  if (chain.abandoned || chain.completed) return;
+  if (!webglRenderer || webglRenderer.destroyed
+      || gpuChain !== chain || chain.generation !== gpuRenderGeneration) {
+    abandonGpuChain(chain);
+    return;
+  }
+  const step = chain.schedule[chain.index];
+  let rec = null;
+  try {
+    rec = webglRenderer.renderPass(
+      chain.view, chain.maxIter, chain.colorSchemeIdx, chain.fractalType, chain.juliaParams, 0, step,
+    );
+  } catch (err) {
+    chain.abandoned = true;
+    chain.completedAt = gpuNow();
+    chain.skipped = Math.max(0, chain.schedule.length - chain.index);
+    if (gpuChain === chain) gpuChain = null;
+    logGpuChain(chain);
+    settleGpuWaitersIfIdle();
+    handleWebGLFailure('WebGL rendering failed.', err);
+    return;
+  }
+  if (!rec) {
+    // The renderer went away mid-chain (destroy/context loss). Stop quietly: the
+    // failure path that tore it down has already reported and started a CPU render.
+    abandonGpuChain(chain);
+    return;
+  }
+  chain.levels.push(rec);
+  chain.index++;
+  if (rec.step === 1) chain.fullMs = rec.ms;
+  // The wheel-to-first-visible-response latency, measured from the wheel EVENT's
+  // own timestamp (so it includes any time the main thread was busy finishing a
+  // pass) to the first frame of the view that wheel asked for.
+  if (gpuAwaitingWheelFrame) {
+    gpuAwaitingWheelFrame = false;
+    if (gpuWheelEventAt != null) gpuWheelToFirstFrameMs = gpuNow() - gpuWheelEventAt;
+  }
+  if (typeof gpuPassHook === 'function') {
+    // The hook may itself start a new chain (that is how the supersede pin drives a
+    // view change from inside the refinement); the next step's check handles it.
+    try {
+      gpuPassHook({
+        ...gpuChainSnapshot(chain),
+        step: rec.step, ms: rec.ms, width: rec.width, height: rec.height, levelIndex: chain.index - 1,
+      });
+    } catch (_) { /* observation only */ }
+  }
+  if (chain.index >= chain.schedule.length) {
+    chain.completed = true;
+    chain.completedAt = gpuNow();
+    gpuChainsCompleted++;
+    if (gpuChain === chain) gpuChain = null;
+    logGpuChain(chain);
+    // DECISIONS row 59: the readout is the cost of a FULL image, so it reports the
+    // step-1 pass — the number the pre-refinement build reported — not the sum of
+    // the chain (which includes the cheap levels and the yields; the sum is at
+    // `lastGpuChain().totalMs`).
+    lastRenderDuration = chain.fullMs;
+    setRenderTimeDisplay(chain.fullMs);
+    settleGpuWaitersIfIdle();
+    return;
+  }
+  // A macrotask yield, not a microtask: only a macrotask lets the browser deliver
+  // INPUT that arrived while a pass was running, which is the entire point.
+  setTimeout(() => stepGpuChain(chain), 0);
+}
+
+// Start a refinement chain for the CURRENT view. The first (coarsest) level runs
+// synchronously so the caller — the wheel handler, a slider change, the real
+// render path — has a visible frame as soon as it returns; the rest yield.
+function startGpuChain() {
+  const fractalType = FractalKernel.indexForType(viewer.fractalType);
+  const chain = {
+    generation: ++gpuRenderGeneration,
+    schedule: gpuSchedule.slice(),
+    index: 0,
+    levels: [],
+    skipped: 0,
+    abandoned: false,
+    completed: false,
+    startedAt: gpuNow(),
+    completedAt: null,
+    fullMs: 0,
+    // A SNAPSHOT: `viewer.onWheel` mutates `viewer.view` in place, so without this
+    // a superseded chain would keep rendering the NEW view (doing the very work
+    // the supersede check exists to prevent).
+    view: { ...viewer.view },
+    maxIter: viewer.maxIter,
+    colorSchemeIdx: getColorSchemeIdx(),
+    fractalType,
+    juliaParams: (fractalType === FractalKernel.indexForType('julia')) ? viewer.juliaParams : undefined,
+  };
+  gpuChainsStarted++;
+  gpuChain = chain;
+  stepGpuChain(chain);
+  return chain;
+}
+
 function renderWebGL() {
   lastRenderStart = performance.now();
   if (!webglRenderer) {
@@ -1354,24 +1578,18 @@ function renderWebGL() {
     // The fractal-type index comes from the kernel's FRACTAL_TYPES table, which is
     // the same table the shader's `#define FT_*` values are templated from, so a
     // type name and its GLSL branch can never disagree (S3 pin 3).
-    const fractalTypeInt = FractalKernel.indexForType(viewer.fractalType);
-    const juliaParams = (fractalTypeInt === FractalKernel.indexForType('julia')) ? viewer.juliaParams : undefined;
     renderingWebGL = true;
-    webglRenderer.render(
-      viewer.view,
-      viewer.maxIter,
-      getColorSchemeIdx(),
-      fractalTypeInt,
-      juliaParams
-    );
+    // COARSE-TO-FINE: one full-resolution pass became a chain of progressively
+    // finer passes (see startGpuChain). The first level is applied synchronously so
+    // this call still leaves a frame on screen; `whenGpuIdle()` resolves when the
+    // FINAL (full-resolution) frame is on screen.
+    startGpuChain();
   } catch (err) {
     handleWebGLFailure('WebGL rendering failed.', err);
     return;
   } finally {
     renderingWebGL = false;
   }
-  lastRenderDuration = performance.now() - lastRenderStart;
-  setRenderTimeDisplay(lastRenderDuration);
 }
 
 function setRenderTimeDisplay(ms) {
@@ -1448,10 +1666,15 @@ window.__fv = Object.freeze({
   // S1 observation hook: ONE real wheel tick through the viewer's OWN `onWheel`
   // handler (the same function the canvas listener calls), so a pin can drive the
   // wheel path without dispatching events. It adds no production path.
-  wheelTick: (deltaY) => viewer.onWheel({
+  wheelTick: (deltaY) => onWheel({
     deltaY: typeof deltaY === 'number' ? deltaY : -2000,
     clientX: 0, clientY: 0,
     preventDefault() {},
+    // The app-level wrapper measures wheel-to-first-frame latency from the
+    // event's own timestamp. A synthetic tick has no browser timestamp, so it is
+    // stamped NOW — which is what the real input path records too.
+    timeStamp: (typeof performance !== 'undefined' && performance.now)
+      ? performance.now() : Date.now(),
   }),
   renderWebGL: () => renderWebGL(),
   forceFallback: () => handleWebGLFailure('WebGL failure forced for observation.'),
@@ -1777,6 +2000,56 @@ window.__fv = Object.freeze({
   renderTimeMs: () => lastRenderDuration,
   fullImagePasses: () => (webglRenderer ? webglRenderer.fullImagePasses : 0),
   renderTimeText: () => (renderTimeElem ? renderTimeElem.textContent : ''),
+  // --- COARSE-TO-FINE observables (counted, never inferred) -------------------
+  // `gpuPasses` is every pass the GPU applied (coarse levels and full-resolution
+  // ones); `fullImagePasses` above stays the count of FULL-RESOLUTION passes, so
+  // DECISIONS row 59's "the readout is a full image" is still a counted fact and
+  // "more than one frame was applied" is visible without redefining it.
+  gpuPasses: () => (webglRenderer ? webglRenderer.gpuPasses : 0),
+  lastPassStep: () => (webglRenderer ? webglRenderer.lastPassStep : 0),
+  lastPassMs: () => (webglRenderer ? webglRenderer.lastPassMs : 0),
+  // The level sequence this build renders, and its override (TEST-ONLY). `[1]` is
+  // the PRE-CHANGE build exactly: one full-resolution pass, nothing to abandon and
+  // no frame before the whole image is done. It is the pins' failing baseline.
+  gpuSchedule: () => gpuSchedule.slice(),
+  setGpuSchedule: (steps) => {
+    const clean = Array.isArray(steps)
+      ? steps.map((s) => Math.max(1, Math.floor(s))).filter((s) => Number.isFinite(s))
+      : [];
+    gpuSchedule = clean.length ? clean : DEFAULT_GPU_SCHEDULE.slice();
+    return gpuSchedule.slice();
+  },
+  // Is a chain in flight, and what is its own state? `gpuJobToken()` is the GPU
+  // twin of the worker lane's `jobToken()`: non-null while a render is refining,
+  // null when it is done (completed OR abandoned — a superseded chain is over).
+  gpuJobToken: () => (gpuChain ? gpuChain.generation : null),
+  gpuRefinement: () => (gpuChain ? gpuChainSnapshot(gpuChain) : null),
+  gpuChains: () => ({
+    started: gpuChainsStarted,
+    completed: gpuChainsCompleted,
+    abandoned: gpuChainsAbandoned,
+    passesSkipped: gpuPassesSkipped,
+  }),
+  // The chains that have ENDED, newest last: how many levels each applied, whether
+  // it completed or was abandoned, how many passes the abandonment SAVED, and the
+  // per-level ms. This is the cost curve AND the abandon evidence, measured.
+  gpuChainLog: () => gpuChainLog.map((c) => ({ ...c, levels: c.levels.map((l) => ({ ...l })), schedule: c.schedule.slice() })),
+  // Resolves when the FULL-RESOLUTION frame of the live view is on screen. A pin
+  // that compares pixels must await this: the first level is already up when
+  // `renderWebGL()` returns, and it is deliberately not the final one.
+  whenRenderIdle: () => whenGpuIdle(),
+  // The same, looping until the GPU lane is idle AND stays idle across a turn —
+  // what a pixel pin should await after a render (a CPU-lane final frame also
+  // re-renders through the GPU path).
+  whenRenderSettled: () => whenGpuSettled(),
+  // Observation hook, invoked after EVERY applied level (default none, so it adds
+  // no production work). The supersede pin drives a real view change from inside
+  // the refinement through it, which is exactly the "user zooms mid-render" case.
+  setGpuPassHook: (fn) => { gpuPassHook = typeof fn === 'function' ? fn : null; return true; },
+  // The wheel-to-first-visible-frame latency: from the wheel event's own
+  // timestamp to the first refinement frame of the view it asked for. Null until a
+  // wheel has been handled with the instrument armed.
+  wheelToFirstFrameMs: () => gpuWheelToFirstFrameMs,
   // GPU-ARBITRARY observation surface (the same shape as P1's `perturbConstants`
   // and P2's `bigOrbitBits`): the delta-coordinate RANGE split the deep lane
   // actually used, and the diagnostic that reproduces the pre-fix seed.

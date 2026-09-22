@@ -50,13 +50,19 @@ async function waitSettled(page) {
 // readback must follow the draw without an intervening paint, exactly as D1 pin 5
 // does. Returns per-pixel reference smooth values, the GPU pixels, the rebase count
 // and the metrics the pin asserts on.
+//
+// COARSE-TO-FINE: `renderWebGL` now starts a refinement CHAIN and applies its
+// coarsest level synchronously; `whenRenderSettled()` resolves in a microtask of
+// the FULL-RESOLUTION pass's own task, so the readback below still lands before
+// compositing (the drawing buffer is intact) while measuring the final image.
 async function deepFrame(page) {
-  return page.evaluate(() => {
+  return page.evaluate(async () => {
     const fv = window.__fv;
     const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('fractalCanvasWebGL'));
     const gl = canvas.getContext('webgl');
     if (!gl) return { error: 'no webgl context' };
     fv.renderWebGL();
+    await fv.whenRenderSettled();
     const w = canvas.width, h = canvas.height;
     const px = new Uint8Array(w * h * 4);
     gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);

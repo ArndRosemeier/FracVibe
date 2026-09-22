@@ -149,8 +149,11 @@ async function setExactDeepView(page, { centerX = CENTRE_X, centerY = CENTRE_Y, 
 
 // The BIG page-side measurement. Arms are compared against ONE independent
 // direct-iteration reference, in ONE page task, so no paint can interleave.
+// COARSE-TO-FINE: `renderWebGL` now starts a refinement chain, so each arm awaits
+// `whenRenderSettled()` — which resolves in the same task as the FULL-RESOLUTION
+// draw — before reading the canvas.
 async function measureArms(page) {
-  return page.evaluate(() => {
+  return page.evaluate(async () => {
     const fv = window.__fv;
     const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('fractalCanvasWebGL'));
     const gl = canvas.getContext('webgl');
@@ -168,6 +171,7 @@ async function measureArms(page) {
 
     // --- arm A: the shipped BigInt orbit -------------------------------------
     fv.renderWebGL();
+    await fv.whenRenderSettled();
     const colourA = readColour();
     const srcA = fv.orbitSource();
     const diagA = fv.orbitFrame().n;
@@ -177,6 +181,7 @@ async function measureArms(page) {
     fv.setOrbitMode('float64');
     fv.invalidateOrbit();
     fv.renderWebGL();
+    await fv.whenRenderSettled();
     const colourB = readColour();
     const srcB = fv.orbitSource();
     const diagB = fv.orbitFrame().n;
@@ -461,8 +466,10 @@ test('P2 pin 3: crossing the precision step changes nothing visible, where a tra
 
   // ONE fixed view, the two sides of that step, through the REAL Worker path.
   await setExactDeepView(page, { scale: STEP_SCALE, bits: 128 });
-  const low = await page.evaluate(() => {
+  const low = await page.evaluate(async () => {
     window.__fv.renderWebGL();
+    // COARSE-TO-FINE: the colour is the FULL-RESOLUTION frame of the chain.
+    await window.__fv.whenRenderSettled();
     const c = document.getElementById('fractalCanvasWebGL');
     const gl = c.getContext('webgl');
     const buf = new Uint8Array(c.width * c.height * 4);
@@ -470,8 +477,9 @@ test('P2 pin 3: crossing the precision step changes nothing visible, where a tra
     return { colour: Array.from(buf), n: Array.from(window.__fv.orbitFrame().n), info: window.__fv.bigOrbitInfo() };
   });
   await setExactDeepView(page, { scale: STEP_SCALE, bits: 192 });
-  const high = await page.evaluate(() => {
+  const high = await page.evaluate(async () => {
     window.__fv.renderWebGL();
+    await window.__fv.whenRenderSettled();
     const c = document.getElementById('fractalCanvasWebGL');
     const gl = c.getContext('webgl');
     const buf = new Uint8Array(c.width * c.height * 4);

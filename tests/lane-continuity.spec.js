@@ -72,6 +72,11 @@ async function runFrame(page, scale, slider) {
       };
       tick();
     });
+    // COARSE-TO-FINE: the CPU job's final frame re-renders through the GPU path
+    // (`setData` -> `render`), so its refinement chain must settle before the
+    // pixels are read; the readback then lands in the same task as the
+    // FULL-RESOLUTION draw.
+    await window.__fv.whenRenderSettled();
     const c = /** @type {HTMLCanvasElement} */ (document.getElementById('fractalCanvasWebGL') || document.querySelector('canvas'));
     const gl = c.getContext('webgl');
     const buf = new Uint8Array(c.width * c.height * 4);

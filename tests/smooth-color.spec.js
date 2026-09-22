@@ -510,8 +510,12 @@ test('D1 pin 5: the GPU evaluates the identical smooth expression with the same 
   await page.check('#webglRender');
   await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
   await expect.poll(() => page.evaluate(() => window.__fv.liveRenderers()), { timeout: 10_000 }).toBe(1);
-  const parity = await page.evaluate(() => {
+  const parity = await page.evaluate(async () => {
     window.__fv.renderWebGL();
+    // COARSE-TO-FINE: await the FULL-RESOLUTION level of the refinement chain and
+    // read the pixels in the same task as that final draw (the settle resolves in a
+    // microtask of it), so no preserveDrawingBuffer is needed.
+    await window.__fv.whenRenderSettled();
     const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('fractalCanvasWebGL'));
     const gl = canvas.getContext('webgl');
     if (!gl) return null;

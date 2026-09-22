@@ -94,11 +94,33 @@ export class WebGLFractalRenderer {
     // A 1x1 RGBA scratch buffer for the completion sync that makes the render-time
     // readout real (see draw). Reused, because it is touched once per image.
     this._syncPixel = new Uint8Array(4);
-    // How many full-image passes this renderer has issued. The render-time readout
-    // is asserted against this so "the time is a FULL image" is counted: `draw`
-    // always submits exactly one full-frame drawArrays, and this counter advances
-    // by one per pass (never per partial pass, because there are none).
+    // How many FULL-RESOLUTION passes this renderer has issued. The render-time
+    // readout is asserted against this so "the time is a FULL image" is counted:
+    // `draw` submits exactly one full-frame drawArrays and advances this by one;
+    // a COARSE pass (`renderPass` with sampleStep > 1) deliberately does NOT
+    // advance it, because it is not a full image. Coarse passes are counted
+    // separately by `gpuPasses`, so both facts stay available and neither is
+    // inferred (see COARSE-TO-FINE below).
     this.fullImagePasses = 0;
+    // COARSE-TO-FINE: every pass this renderer has applied, full-resolution or
+    // coarse. `fullImagePasses` is a subset of this, so a pin can assert "more
+    // than one frame was applied" without redefining the full-image count that
+    // DECISIONS row 59 gave `fullImagePasses`.
+    this.gpuPasses = 0;
+    // The sample step of the pass most recently applied (1 = full resolution).
+    this.lastPassStep = 0;
+    this.lastPassMs = 0;
+    // The offscreen target a coarse pass renders into before it is magnified onto
+    // the canvas, and the program that magnifies it. Created lazily; the size is
+    // reallocated only when the requested coarse size changes.
+    this.blitProgram = null;
+    this.blitVsh = null;
+    this.blitFsh = null;
+    this.blitU = null;
+    this._coarseTex = null;
+    this._coarseFbo = null;
+    this._coarseW = 0;
+    this._coarseH = 0;
     this.onBigOrbitReady = null;
     this.orbitSource = 'none';
     if (!canvas) {
@@ -581,6 +603,27 @@ ${mandelbrotBody}
       this.plainVsh = this.vsh;
       this.plainFsh = this.fsh;
     }
+    // --- COARSE-TO-FINE: the PRESENT pass ------------------------------------
+    // A coarse pass runs the SAME fragment program with the SAME uniforms (the
+    // iteration and colour arithmetic exists ONCE — DECISIONS row 52) into an
+    // offscreen RGBA texture of ceil(W/step) x ceil(H/step) texels, then magnifies
+    // that texture over the whole canvas with this tiny textured-quad program.
+    // The cost of a pass is therefore proportional to the number of FRAGMENTS it
+    // rasterises, so a step-8 pass does 1/64 of the final pass's work — which is
+    // the whole point: a "coarse pass" that internally rendered every pixel and
+    // merely downsampled (a mipmap of a full-res render) is not refinement and is
+    // explicitly NOT what this does.
+    const blitFragSrc = `
+      precision mediump float;
+      varying vec2 v_uv;
+      uniform sampler2D u_src;
+      void main() { gl_FragColor = texture2D(u_src, v_uv); }
+    `;
+    const blitBuilt = buildProgram(blitFragSrc);
+    this.blitProgram = blitBuilt.program;
+    this.blitVsh = blitBuilt.vsh;
+    this.blitFsh = blitBuilt.fsh;
+    this.blitU = { src: gl.getUniformLocation(this.blitProgram, 'u_src') };
 
     gl.useProgram(this.program);
     // Fullscreen quad
@@ -923,20 +966,17 @@ ${mandelbrotBody}
     return { n, w, h, cap, insideSentinel: cap + 1 };
   }
 
-  draw(view, maxIter, colorSchemeIdx, fractalType, juliaParams, diag) {
+  // --- COARSE-TO-FINE: the shared per-pass body --------------------------------
+  // Pick the lane, build/upload the reference orbit if this view needs one, bind
+  // the program and its uniforms, and issue exactly ONE full-frame drawArrays.
+  // It deliberately does NOT touch the clock, the viewport or the framebuffer, so
+  // the SAME body serves a full-resolution pass (straight to the canvas) and a
+  // coarse pass (into the offscreen target). Both run the ONE fragment program, so
+  // the iteration and colour arithmetic exists once (DECISIONS row 52) and the
+  // only thing that changes between levels is the pass's SAMPLE DENSITY — a
+  // parameter (how many fragments are rasterised), not a second implementation.
+  _drawFractal(view, maxIter, colorSchemeIdx, fractalType, juliaParams, diag) {
     const gl = this.gl;
-    // Safe to call after destroy()/context loss: draw nothing rather than throw.
-    if (!gl || this.destroyed || gl.isContextLost() || !this.program) return;
-    // ARBITRARY DEPTH: the full-image time of THIS pass. `draw` issues exactly one
-    // full-frame drawArrays for the whole image (no tiling, no partial pass), and
-    // in WebGL1 the command is ordered with the readbacks the suite performs, so
-    // the elapsed wall clock is attributable to this image. The readout reports it
-    // and the suite asserts it covers a FULL image (the frame counter below).
-    const drawStart = (typeof performance !== 'undefined' && performance.now)
-      ? performance.now() : Date.now();
-    if (gl.canvas && (gl.drawingBufferWidth !== this.canvas.width || gl.drawingBufferHeight !== this.canvas.height)) {
-      gl.viewport(0, 0, this.canvas.width, this.canvas.height);
-    }
     const cap = FractalKernel.clampMaxIter(maxIter);
     // P1: WHICH LANE. The reference orbit buys accuracy only past where the plain
     // float32 coordinate has already lost its pixels, and it costs a texture fetch
@@ -1056,24 +1096,147 @@ ${mandelbrotBody}
     gl.uniform1i(U.diag, diag);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     gl.uniform1i(U.diag, 0);
-    // One full-image pass done: count it and close the clock. The sync is what makes
-    // the number MEAN something, and it is MEASURED which sync works here: WebGL
-    // queues the draw and returns immediately, so a wall clock around drawArrays
-    // alone reads 0.0 ms at every depth, and `gl.finish()` does NOT wait on this
-    // host's ANGLE/SwiftShader (measured: 0.2 ms against a true 288 ms image). A
-    // ONE-PIXEL readback DOES wait, and its cost is the image itself: measured
-    // median frame 243.5 ms with it against 226.7 ms without on a 1280x800 animated
-    // zoom, i.e. ~7 % over an image that already takes ~227 ms. That is affordable
-    // for a per-FULL-IMAGE readout (not per animation frame), so the reported number
-    // is the real cost of the image the user is looking at.
-    if (!gl.isContextLost()) {
+    return { cap: cap, usePerturbation: this.usePerturbation, orbitSource: this.orbitSource };
+  }
+
+  // The completion sync, and the reason it exists: a wall clock around drawArrays
+  // alone reads 0.0 ms at every depth (WebGL queues the command and returns), and
+  // `gl.finish()` does NOT wait on this host's ANGLE/SwiftShader (measured 0.2 ms
+  // against a true 288 ms image). A ONE-PIXEL readback DOES wait, and costs ~7 % of
+  // an already ~227 ms image — affordable per IMAGE, and it is what makes the
+  // reported number the real cost of the image the user is looking at.
+  _syncPass() {
+    const gl = this.gl;
+    if (gl && !gl.isContextLost()) {
       gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, this._syncPixel);
     }
-    const drawEnd = (typeof performance !== 'undefined' && performance.now)
+  }
+
+  _now() {
+    return (typeof performance !== 'undefined' && performance.now)
       ? performance.now() : Date.now();
-    this.lastDrawMs = drawEnd - drawStart;
+  }
+
+  // A FULL-RESOLUTION pass, straight to the canvas. This is the pass whose pixels
+  // the shipped app has always shown, and with the same uniforms it is
+  // byte-for-byte the pre-refinement frame (the final level of a refinement chain,
+  // and the only level when the chain is `[1]`). `fullImagePasses` counts exactly
+  // these, so "the readout covers a full image" stays a counted fact.
+  draw(view, maxIter, colorSchemeIdx, fractalType, juliaParams, diag) {
+    const gl = this.gl;
+    // Safe to call after destroy()/context loss: draw nothing rather than throw.
+    if (!gl || this.destroyed || gl.isContextLost() || !this.program) return null;
+    const drawStart = this._now();
+    if (gl.canvas && (gl.drawingBufferWidth !== this.canvas.width || gl.drawingBufferHeight !== this.canvas.height)) {
+      gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    }
+    this._drawFractal(view, maxIter, colorSchemeIdx, fractalType, juliaParams, diag);
+    this._syncPass();
+    this.lastDrawMs = this._now() - drawStart;
+    this.lastPassMs = this.lastDrawMs;
+    this.lastPassStep = 1;
+    this.gpuPasses++;
     this.fullImagePasses++;
-  };
+    return { step: 1, width: this.canvas.width, height: this.canvas.height, ms: this.lastDrawMs };
+  }
+
+  // --- COARSE-TO-FINE: one refinement level ------------------------------------
+  // `sampleStep > 1` renders the view into an offscreen target of
+  // ceil(W/step) x ceil(H/step) texels and then magnifies it onto the canvas, so
+  // the fragment work — and therefore the measured ms — is 1/step^2 of the final
+  // pass. `sampleStep === 1` is exactly `draw`, i.e. the shipped full-resolution
+  // pass, so the last level of every chain is the pre-refinement image unchanged.
+  //
+  // REJECTED ALTERNATIVES, so the choice is on the record:
+  //  * a full-resolution pass with a coarser SAMPLE RASTER (a `u_sampleStep`
+  //    uniform that skips the iteration for non-grid fragments). It is genuinely
+  //    cheaper in the loop but still rasterises and writes EVERY canvas fragment,
+  //    so its cost floor is the full framebuffer bandwidth — it cannot reach
+  //    1/step^2 and it adds a branch to the shipped shader.
+  //  * a mipmap / downsample of a full-resolution result. This is the trap the
+  //    deliverable names: every pixel is rendered, so it is not refinement at all
+  //    and it is no cheaper.
+  //  * refining the ITERATION BUDGET (fewer iterations early) instead of the
+  //    sample density. That is a different image, not a coarser one, and it would
+  //    collide with D2's budget rule and the deep lane's correctness pins.
+  // The measured level costs are in `window.__fv.lastGpuChain()` and the pins.
+  renderPass(view, maxIter, colorSchemeIdx, fractalType, juliaParams, diag, sampleStep) {
+    const gl = this.gl;
+    if (!gl || this.destroyed || gl.isContextLost() || !this.program) return null;
+    const step = Math.max(1, Math.floor(sampleStep || 1));
+    if (step === 1) return this.draw(view, maxIter, colorSchemeIdx, fractalType, juliaParams, diag);
+    const started = this._now();
+    const w = Math.max(1, Math.ceil(this.canvas.width / step));
+    const h = Math.max(1, Math.ceil(this.canvas.height / step));
+    const target = this._ensureCoarseTarget(w, h);
+    // If the offscreen target cannot be built, fall back to a FULL pass rather
+    // than leaving the canvas stale — a slower frame is better than a wrong one.
+    if (!target) return this.draw(view, maxIter, colorSchemeIdx, fractalType, juliaParams, diag);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+    gl.viewport(0, 0, w, h);
+    this._drawFractal(view, maxIter, colorSchemeIdx, fractalType, juliaParams, diag);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    this._blit(target.tex);
+    this._syncPass();
+    this.lastDrawMs = this._now() - started;
+    this.lastPassMs = this.lastDrawMs;
+    this.lastPassStep = step;
+    this.gpuPasses++;
+    return { step: step, width: w, height: h, ms: this.lastDrawMs };
+  }
+
+  // The offscreen target for a coarse pass: ONE RGBA8 texture + FBO, reallocated
+  // only when the requested size changes. Lazily created, and torn down with the
+  // renderer, so a GPU→CPU toggle leaks nothing.
+  _ensureCoarseTarget(w, h) {
+    const gl = this.gl;
+    if (!gl || !this.blitProgram) return null;
+    if (!this._coarseTex) {
+      this._coarseTex = gl.createTexture();
+      this._coarseFbo = gl.createFramebuffer();
+      this._coarseW = 0;
+      this._coarseH = 0;
+    }
+    if (this._coarseW !== w || this._coarseH !== h) {
+      gl.bindTexture(gl.TEXTURE_2D, this._coarseTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this._coarseFbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this._coarseTex, 0);
+      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        this._coarseW = 0;
+        this._coarseH = 0;
+        return null;
+      }
+      this._coarseW = w;
+      this._coarseH = h;
+    }
+    return { fbo: this._coarseFbo, tex: this._coarseTex, width: w, height: h };
+  }
+
+  // Magnify the coarse texture over the whole canvas. The vertex shader is the ONE
+  // shared quad VS, so `v_uv` maps the texture 1:1 onto clip space and the
+  // orientation is identical to a direct draw. NEAREST: each coarse texel covers a
+  // step x step block of canvas pixels exactly, which is what "coarser" means here.
+  _blit(tex) {
+    const gl = this.gl;
+    if (!this.blitProgram) return;
+    gl.useProgram(this.blitProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.uniform1i(this.blitU.src, 0);
+    const posLoc = gl.getAttribLocation(this.blitProgram, 'a_position');
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.posBuf);
+    gl.enableVertexAttribArray(posLoc);
+    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
 
   destroy() {
     // Idempotent: a context-loss event and an explicit teardown may both arrive,
@@ -1094,6 +1257,13 @@ ${mandelbrotBody}
       if (this.plainProgram && this.plainProgram !== this.program) gl.deleteProgram(this.plainProgram);
       if (this.plainVsh && this.plainVsh !== this.vsh) gl.deleteShader(this.plainVsh);
       if (this.plainFsh && this.plainFsh !== this.fsh) gl.deleteShader(this.plainFsh);
+      // COARSE-TO-FINE: the present program and the offscreen target are per-
+      // renderer state; without this a GPU→CPU toggle would leak them per toggle.
+      if (this.blitProgram) gl.deleteProgram(this.blitProgram);
+      if (this.blitVsh) gl.deleteShader(this.blitVsh);
+      if (this.blitFsh) gl.deleteShader(this.blitFsh);
+      if (this._coarseFbo) gl.deleteFramebuffer(this._coarseFbo);
+      if (this._coarseTex) gl.deleteTexture(this._coarseTex);
       if (this.posBuf) gl.deleteBuffer(this.posBuf);
       // P1: the reference-orbit texture is per-renderer state; without this a
       // GPU→CPU toggle would leak one float texture per constructed renderer.
@@ -1116,6 +1286,14 @@ ${mandelbrotBody}
     this.plainProgram = null;
     this.plainVsh = null;
     this.plainFsh = null;
+    this.blitProgram = null;
+    this.blitVsh = null;
+    this.blitFsh = null;
+    this.blitU = null;
+    this._coarseTex = null;
+    this._coarseFbo = null;
+    this._coarseW = 0;
+    this._coarseH = 0;
     this.posBuf = null;
     this._orbitTex = null;
     this._orbitKey = null;

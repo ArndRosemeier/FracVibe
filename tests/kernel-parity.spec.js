@@ -152,15 +152,18 @@ test('S3 pin 1 (B5): at maxIter = the cap, GPU and CPU render the same set', asy
     window.__cpuCapture = { w: c.width, h: c.height, data: new Uint8Array(img.data) };
   });
 
-  // The GPU, same view and same cap. readPixels runs in the SAME task as a fresh
-  // synchronous render, so the drawing buffer is still intact (no
+  // The GPU, same view and same cap. COARSE-TO-FINE: `renderWebGL` applies the
+  // coarsest refinement level synchronously and refines from there, so the readback
+  // awaits `whenRenderSettled()` — which resolves in the same task as the
+  // FULL-RESOLUTION draw — and the drawing buffer is still intact (no
   // preserveDrawingBuffer needed).
   await page.check('#webglRender');
   await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
   await expect.poll(() => page.evaluate(() => window.__fv.liveRenderers()), { timeout: 10_000 }).toBe(1);
 
-  const metrics = await page.evaluate(() => {
+  const metrics = await page.evaluate(async () => {
     window.__fv.renderWebGL();
+    await window.__fv.whenRenderSettled();
     const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('fractalCanvasWebGL'));
     const gl = canvas.getContext('webgl');
     if (!gl) return { error: 'no webgl context' };
@@ -244,7 +247,7 @@ async function captureCpuSamples(page, schemes) {
 // The GPU image, sampled at the SAME points (readPixels' origin is bottom-left,
 // so the row is flipped to match the 2D canvas).
 async function captureGpuSamples(page, schemes) {
-  return page.evaluate(({ schemeNames, n }) => {
+  return page.evaluate(async ({ schemeNames, n }) => {
     const select = /** @type {HTMLSelectElement} */ (document.getElementById('colorScheme'));
     const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('fractalCanvasWebGL'));
     const gl = canvas.getContext('webgl');
@@ -255,6 +258,8 @@ async function captureGpuSamples(page, schemes) {
       select.value = scheme;
       select.dispatchEvent(new Event('change', { bubbles: true }));
       window.__fv.renderWebGL();
+      // The FULL-RESOLUTION level of the refinement chain (see the note on pin 1).
+      await window.__fv.whenRenderSettled();
       const px = new Uint8Array(w * h * 4);
       gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
       const pts = [];

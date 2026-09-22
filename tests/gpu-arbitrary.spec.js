@@ -104,6 +104,17 @@ async function waitSettled(page) {
     .not.toBe(null);
 }
 
+// COARSE-TO-FINE (the refinement slice) — PLEASE READ BEFORE CHANGING A READBACK.
+// A render is now a CHAIN of levels. The first (coarsest) level is applied
+// synchronously inside `renderWebGL()` — that is the responsiveness point — and
+// the FULL-RESOLUTION frame lands a macrotask later, so a pin that reads PIXELS or
+// the full-image counters must `await window.__fv.whenRenderSettled()` first. The
+// readback itself is still taken before compositing (the settle resolves in a
+// microtask of the final pass's own task), so no `preserveDrawingBuffer` is needed
+// — measured, see tests/gpu-refine.spec.js pin 1.
+// The pre-refinement build is `setGpuSchedule([1])`: one full-resolution pass, no
+// coarse level and nothing to abandon.
+
 // Drive the REAL deep-view path with an exact decimal centre and wait for the
 // Worker's orbit at the precision the RULE chose for this scale.
 async function setExactDeepView(page, { centerX = CENTRE_X, centerY = CENTRE_Y, scale }) {
@@ -127,7 +138,7 @@ async function setExactDeepView(page, { centerX = CENTRE_X, centerY = CENTRE_Y, 
 // Draw one frame and read back BOTH the shader's own escape index (u_diag = 2) and
 // the palette colour, then compare against the independent BigInt reference.
 async function measureAgainstReference(page, { legacy }) {
-  return page.evaluate((legacy) => {
+  return page.evaluate(async (legacy) => {
     const fv = window.__fv;
     fv.setLegacyDeltaSeed(legacy);
     const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('fractalCanvasWebGL'));
@@ -140,6 +151,8 @@ async function measureAgainstReference(page, { legacy }) {
     const seed = fv.deepSeed();
     const passesBefore = fv.fullImagePasses();
     fv.renderWebGL();
+    // The FULL-RESOLUTION level of the refinement chain, not the coarse first one.
+    await fv.whenRenderSettled();
     const passesAfter = fv.fullImagePasses();
     const colour = new Uint8Array(W * H * 4);
     gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, colour);
@@ -241,7 +254,7 @@ test('GPU-ARBITRARY pin 4 (NO-REGRESSION): the shallow lane renders byte-identic
   await page.goto('./', { waitUntil: 'domcontentloaded' });
   await waitSettled(page);
 
-  const out = await page.evaluate(() => {
+  const out = await page.evaluate(async () => {
     const fv = window.__fv;
     const fvLane = (r) => r.source;
     const canvas = /** @type {HTMLCanvasElement} */ (document.getElementById('fractalCanvasWebGL'));
@@ -252,6 +265,10 @@ test('GPU-ARBITRARY pin 4 (NO-REGRESSION): the shallow lane renders byte-identic
     for (const scale of scales) {
       fv.setDeepView({ ...centre, scale });
       fv.renderWebGL();
+      // The FINAL level of the refinement chain: at these shallow scales the
+      // refinement is expected to be invisible, so the full-resolution frame —
+      // the pre-refinement image — is what must be byte-identical.
+      await fv.whenRenderSettled();
       const buf = new Uint8Array(canvas.width * canvas.height * 4);
       gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, buf);
       let h = 0x811c9dc5;
@@ -360,21 +377,42 @@ test('GPU-ARBITRARY pin 2: the per-full-image render time is visible and observa
   // The user-visible readout exists and carries a number, at the default view.
   await expect(page.locator('#renderTime')).toHaveText(/Render: [\d.]+ ms/);
 
-  const shallow = await page.evaluate(() => {
-    const before = window.__fv.fullImagePasses();
-    window.__fv.renderWebGL();
+  const shallow = await page.evaluate(async () => {
+    const fv = window.__fv;
+    const before = fv.fullImagePasses();
+    const gpuBefore = fv.gpuPasses();
+    fv.renderWebGL();
+    // COARSE-TO-FINE: `fullImagePasses` counts FULL-RESOLUTION passes only, so it
+    // is complete only once the chain has finished. The first level of the chain is
+    // applied synchronously and does NOT advance it.
+    await fv.whenRenderSettled();
+    const log = fv.gpuChainLog().slice(-1)[0];
     return {
-      passes: window.__fv.fullImagePasses() - before,
-      reported: window.__fv.renderTimeMs(),
-      text: window.__fv.renderTimeText(),
+      passes: fv.fullImagePasses() - before,
+      gpuPasses: fv.gpuPasses() - gpuBefore,
+      levelSteps: log.levels.map((l) => l.step),
+      fullImageMs: log.fullImageMs,
+      reported: fv.renderTimeMs(),
+      text: fv.renderTimeText(),
       width: document.getElementById('fractalCanvasWebGL').width,
       height: document.getElementById('fractalCanvasWebGL').height,
     };
   });
-  // ONE pass per render, and it covers the WHOLE drawing buffer: the renderer
-  // issues exactly one full-frame drawArrays, so the number is a full image rather
-  // than a partial refinement frame.
+  // ONE full-resolution pass per render, and it covers the WHOLE drawing buffer:
+  // the renderer issues exactly one full-frame drawArrays for the step-1 level, so
+  // the number is a full image rather than a partial refinement frame.
   expect(shallow.passes, 'one render is exactly one full-image pass').toBe(1);
+  // ...and that full-image pass is the LAST level of a refinement chain: the other
+  // levels ran too (they are what "coarse to fine" means), and none of them counts
+  // as a full image.
+  expect(shallow.gpuPasses, 'the refinement chain applied more than one level')
+    .toBeGreaterThan(shallow.passes);
+  expect(shallow.levelSteps.length, 'a refinement chain has several levels')
+    .toBeGreaterThan(1);
+  expect(shallow.levelSteps[shallow.levelSteps.length - 1], 'the chain ends at full resolution').toBe(1);
+  expect(shallow.levelSteps[0], 'and starts coarse').toBeGreaterThan(1);
+  expect(shallow.reported, 'the readout is the FULL-image pass, not the whole chain')
+    .toBeCloseTo(shallow.fullImageMs, 3);
   expect(shallow.reported, 'the readout must be a real elapsed time').toBeGreaterThanOrEqual(0);
   expect(shallow.reported, 'the readout must be finite').toBeLessThan(60_000);
   expect(shallow.text).toMatch(/Render: [\d.]+ ms/);
@@ -383,15 +421,18 @@ test('GPU-ARBITRARY pin 2: the per-full-image render time is visible and observa
   );
   expect(shallow.width * shallow.height, 'the pass covers the whole canvas').toBeGreaterThan(0);
 
-  // A deep frame is the same ONE full-image pass, and its time is reported too.
+  // A deep frame is the same ONE full-image pass at the end of the chain, and its
+  // time is reported too.
   await setExactDeepView(page, { scale: SHALLOW_DEEP_SCALE });
-  const deep = await page.evaluate(() => {
-    const before = window.__fv.fullImagePasses();
-    window.__fv.renderWebGL();
+  const deep = await page.evaluate(async () => {
+    const fv = window.__fv;
+    const before = fv.fullImagePasses();
+    fv.renderWebGL();
+    await fv.whenRenderSettled();
     return {
-      passes: window.__fv.fullImagePasses() - before,
-      reported: window.__fv.renderTimeMs(),
-      text: window.__fv.renderTimeText(),
+      passes: fv.fullImagePasses() - before,
+      reported: fv.renderTimeMs(),
+      text: fv.renderTimeText(),
     };
   });
   expect(deep.passes, 'a deep frame is still ONE full-image pass').toBe(1);
@@ -413,7 +454,7 @@ test('GPU-ARBITRARY pin 3: the deep lane renders far past the old float32 range 
   // The measured wall of the OLD mechanism, through the REAL shader: 2e-38 is
   // float32's smallest normal and the raw product collapses there. The fixed lane
   // must render structure at that exact scale (which is the point of the slice).
-  const wall = await page.evaluate((CENTRE) => {
+  const wall = await page.evaluate(async (CENTRE) => {
     window.__GA_CENTRE_X = CENTRE;
     const fv = window.__fv;
     fv.setLegacyDeltaSeed(false);
@@ -422,10 +463,12 @@ test('GPU-ARBITRARY pin 3: the deep lane renders far past the old float32 range 
       centerXExact: window.__GA_CENTRE_X, centerYExact: '0',
     });
     fv.renderWebGL();
+    await fv.whenRenderSettled();
     const src = fv.orbitSource();
     const fixedDistinct = new Set(Array.from(fv.orbitFrame().n)).size;
     fv.setLegacyDeltaSeed(true);
     fv.renderWebGL();
+    await fv.whenRenderSettled();
     const legacyDistinct = new Set(Array.from(fv.orbitFrame().n)).size;
     fv.setLegacyDeltaSeed(false);
     return { fixedDistinct, legacyDistinct, src };
