@@ -143,10 +143,13 @@ function createGL(type, w, h) {
 }
 
 const VERT_SRC = 'attribute vec2 a_pos; void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }';
+// GLSL ES 3.00 (WebGL2) needs a matching vertex shader version; mixing a 1.00
+// vertex shader with a 3.00 fragment shader is not portable.
+const VERT_SRC_300 = '#version 300 es\nin vec2 a_pos;\nvoid main() { gl_Position = vec4(a_pos, 0.0, 1.0); }\n';
 
-function compileProgram(gl, fragSrc) {
+function compileProgram(gl, fragSrc, vertSrc) {
   const vs = gl.createShader(gl.VERTEX_SHADER);
-  gl.shaderSource(vs, VERT_SRC);
+  gl.shaderSource(vs, vertSrc || VERT_SRC);
   gl.compileShader(vs);
   if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
     throw new Error('vertex compile: ' + clean(gl.getShaderInfoLog(vs)));
@@ -249,6 +252,405 @@ const DS_FRAG = [
   '  gl_FragColor = vec4(r, g, b, 1.0);',
   '}',
 ].join('\n');
+
+// ---------------------------------------------------------------------------
+// INTEGER-CONTROLLED DOUBLE-SINGLE — the D3D11 answer (DECISIONS 101).
+//
+// WHY THIS EXISTS. The owner's RTX 5070 report measured the CLASSIC error-free
+// transforms being erased: with operands supplied as uniforms (so they cannot be
+// constant-folded) ANGLE/D3D11 still gave ds_low_component ZERO,
+// ds_low_changes_result NO and ds_twoprod_low ZERO. The low term of a TwoSum is
+// algebraically zero over the reals, so a compiler that reassociates or fuses can
+// delete the rounding event that recovered it. RESEARCH §7 warning 1 names the
+// robust alternative: do not derive the residual from a float rounding event at
+// all — DECODE the float32 operands into sign/exponent/significand integers and
+// compute the exact product/sum in INTEGER arithmetic, where no reassociation can
+// erase a bit. This probe measures that alternative on the SAME shader stack.
+//
+// WHAT IS BEING TESTED, at the level of the recurrence's own operations
+// (`w -> 2 Z w + S w^2 + d`, DECISIONS 66):
+//   * T0 twoprod    — the exact 24x24-bit product, the operation the float probe lost.
+//   * T1 sum        — an exact accumulation with explicit renormalisation.
+//   * T2 recurrence — one step of the recurrence form, expansion throughout.
+// For each, the report gives the RUNTIME-OPERAND arm (uniforms — the case that
+// failed on the owner's driver) AND the LITERAL-OPERAND arm (the case that folds
+// even on SwiftShader), so the two failure modes are distinguishable. The
+// acceptance criterion is RESEARCH §7's, verbatim: a REQUIRED-NONZERO low
+// component AND that it changes the result versus a naive float32 computation on
+// the same operands. A value that "looks plausible" after the expansion collapsed
+// fails that test.
+//
+// IMPLEMENTATION. A value is carried EXACTLY as a sign-magnitude 128-bit
+// fixed-point integer M with value = sign * M * 2^-96, 96 fractional bits. A
+// float32 is decoded with `floatBitsToUint` into a 24-bit significand and an
+// exponent (mant * 2^(ex-24)); a 24x24 product is taken by 12-bit schoolbook
+// integer multiplication (48 bits, no loss) and placed at its exponent; addition
+// is a plain 128-bit integer add; the result is renormalised back to a `(hi, lo)`
+// float32 pair by truncation to the top 24 bits and the next 24 bits. Nothing in
+// that path is a float rounding event, so nothing can be reassociated away. This
+// is a STANDALONE proof of the mechanism: it is not the shipped renderer and not
+// wired into the ladder.
+//
+// LIMITS, stated rather than discovered: 128 fixed-point bits give 96 fractional
+// bits and ~32 integer bits, so operands must be O(1) — ours are. No subnormal or
+// exponent-range handling beyond that, and no third component, because a 48-bit
+// significand is what double-single means. The classic float transforms stay in
+// the report above; this section does not replace them.
+// ---------------------------------------------------------------------------
+
+// The operands. All are exactly representable in float32, so the literal arm and
+// the uniform arm carry the SAME numbers and any difference is codegen, not input.
+const IC_B = Math.pow(2, -25);
+const IC_B2 = Math.pow(2, -45);
+const IC_C = 1 + Math.pow(2, -12);
+const IC_Z = -0.75;
+const IC_S = 1.0;
+const IC_D = 0.25;
+const IC_WIDTH = 16;
+// Expected |low| magnitudes, used only to scale the informational readout byte to
+// roughly mid-range. They are not thresholds: the nonzero/change flags come from
+// the shader's own exact comparisons, never from a decoded byte.
+const IC_LO_SCALE = [23, 38, 25]; // T0 ~2^-24, T1 ~2^-39, T2 ~2^-26
+const IC_LITERALS = {
+  u_b: '2.98023223876953125e-8', // 2^-25
+  u_b2: '2.842170943040401e-14', // 2^-45
+  u_c: '1.000244140625', // 1 + 2^-12
+  u_z: '-0.75',
+  u_s: '1.0',
+  u_d: '0.25',
+};
+
+function icFrag(runtime) {
+  const B = runtime ? 'u_b' : IC_LITERALS.u_b;
+  const B2 = runtime ? 'u_b2' : IC_LITERALS.u_b2;
+  const C = runtime ? 'u_c' : IC_LITERALS.u_c;
+  const Z = runtime ? 'u_z' : IC_LITERALS.u_z;
+  const S = runtime ? 'u_s' : IC_LITERALS.u_s;
+  const D = runtime ? 'u_d' : IC_LITERALS.u_d;
+  // Probe layout (viewport IC_WIDTH x 1), one pixel pair per transform:
+  //   p=2t   flags: (lowNonZero?255:0, changesResult?255:0, 255 marker)
+  //   p=2t+1 values: (scaled |lo|, scaled |hi-naive|)
+  //   p=15   sentinel (255,255,255) so a broken readback is distinguishable.
+  return `#version 300 es
+precision highp float;
+precision highp int;
+uniform float u_b;
+uniform float u_b2;
+uniform float u_c;
+uniform float u_z;
+uniform float u_s;
+uniform float u_d;
+out vec4 fragColor;
+
+struct Big { uvec4 m; int s; };
+
+uint pick4(uvec4 v, int i) {
+  if (i == 0) return v.x;
+  if (i == 1) return v.y;
+  if (i == 2) return v.z;
+  return v.w;
+}
+
+uvec4 add128(uvec4 a, uvec4 b) {
+  uint r0 = a.x + b.x;
+  uint c = (r0 < a.x) ? 1u : 0u;
+  uint t1 = a.y + b.y;
+  uint c1 = (t1 < a.y) ? 1u : 0u;
+  uint r1 = t1 + c;
+  uint c1b = (r1 < t1) ? 1u : 0u;
+  uint t2 = a.z + b.z;
+  uint c2 = (t2 < a.z) ? 1u : 0u;
+  uint r2 = t2 + c1 + c1b;
+  uint c2b = (r2 < t2) ? 1u : 0u;
+  uint t3 = a.w + b.w;
+  uint c3 = (t3 < a.w) ? 1u : 0u;
+  uint r3 = t3 + c2 + c2b;
+  return uvec4(r0, r1, r2, r3);
+}
+
+uvec4 sub128(uvec4 a, uvec4 b) {
+  uint r0 = a.x - b.x;
+  uint bw = (a.x < b.x) ? 1u : 0u;
+  uint t1 = a.y - b.y;
+  uint b1 = (a.y < b.y) ? 1u : 0u;
+  uint r1 = t1 - bw;
+  uint b1b = (t1 < bw) ? 1u : 0u;
+  uint t2 = a.z - b.z;
+  uint b2 = (a.z < b.z) ? 1u : 0u;
+  uint r2 = t2 - b1 - b1b;
+  uint b2b = (t2 < b1 + b1b) ? 1u : 0u;
+  uint t3 = a.w - b.w;
+  uint b3 = (a.w < b.w) ? 1u : 0u;
+  uint r3 = t3 - b2 - b2b;
+  return uvec4(r0, r1, r2, r3);
+}
+
+int cmp128(uvec4 a, uvec4 b) {
+  if (a.w != b.w) return (a.w > b.w) ? 1 : -1;
+  if (a.z != b.z) return (a.z > b.z) ? 1 : -1;
+  if (a.y != b.y) return (a.y > b.y) ? 1 : -1;
+  if (a.x != b.x) return (a.x > b.x) ? 1 : -1;
+  return 0;
+}
+
+uvec4 shl128(uvec4 v, int s) {
+  if (s <= 0) return v;
+  if (s >= 128) return uvec4(0u);
+  int w = s >> 5;
+  int b = s & 31;
+  int shb = (32 - b) & 31;
+  uvec4 o = uvec4(0u);
+  for (int i = 0; i < 4; i++) {
+    int j = i - w;
+    uint lo = 0u;
+    if (j >= 0 && j <= 3) lo = pick4(v, j) << b;
+    int jm = j - 1;
+    uint hi = 0u;
+    if (b != 0 && jm >= 0 && jm <= 3) hi = pick4(v, jm) >> shb;
+    uint r = lo | hi;
+    if (i == 0) o.x = r; else if (i == 1) o.y = r; else if (i == 2) o.z = r; else o.w = r;
+  }
+  return o;
+}
+
+uvec4 shr128(uvec4 v, int s) {
+  if (s <= 0) return v;
+  if (s >= 128) return uvec4(0u);
+  int w = s >> 5;
+  int b = s & 31;
+  int shb = (32 - b) & 31;
+  uvec4 o = uvec4(0u);
+  for (int i = 0; i < 4; i++) {
+    int j = i + w;
+    uint lo = 0u;
+    if (j <= 3) lo = pick4(v, j) >> b;
+    int jm = j + 1;
+    uint hi = 0u;
+    if (b != 0 && jm <= 3) hi = pick4(v, jm) << shb;
+    uint r = lo | hi;
+    if (i == 0) o.x = r; else if (i == 1) o.y = r; else if (i == 2) o.z = r; else o.w = r;
+  }
+  return o;
+}
+
+int topBit_impl(uint v) {
+  if (v == 0u) return -1;
+  int r = 0;
+  if (v > 0xFFFFu) { r += 16; v >>= 16; }
+  if (v > 0xFFu)   { r += 8;  v >>= 8; }
+  if (v > 0xFu)    { r += 4;  v >>= 4; }
+  if (v > 0x3u)    { r += 2;  v >>= 2; }
+  if (v > 0x1u)    { r += 1; }
+  return r;
+}
+
+int topBit(uvec4 v) {
+  if (v.w != 0u) return 96 + topBit_impl(v.w);
+  if (v.z != 0u) return 64 + topBit_impl(v.z);
+  if (v.y != 0u) return 32 + topBit_impl(v.y);
+  if (v.x != 0u) return topBit_impl(v.x);
+  return -1;
+}
+
+// GLSL ES 3.00 as ANGLE exposes it has NO findMSB/frexp/ldexp/umulExtended
+// (measured on this host; CLASSIC vendors may differ), so every one of those is
+// built here from bitwise operators and floatBitsToUint, which ARE core.
+float pow2i(int e) {
+  return uintBitsToFloat(uint(e + 127) << 23);
+}
+
+void unpack(float a, out uint mant, out int ex, out int sgn) {
+  uint bits = floatBitsToUint(a);
+  uint be = (bits >> 23) & 0xFFu;
+  if (be == 0u) { mant = 0u; ex = 0; sgn = 0; return; } // zero or subnormal: not used
+  sgn = ((bits >> 31) != 0u) ? -1 : 1;
+  mant = (bits & 0x7FFFFFu) | 0x800000u; // 24-bit significand, implicit leading 1
+  ex = int(be) - 126;                    // value = mant * 2^(ex - 24)
+}
+
+// Exact 32x24 -> 56-bit product via 12-bit schoolbook limbs. Every multiplicand
+// here is a 24-bit significand or a 32-bit fixed-point limb, and every partial
+// product is < 2^24, so no intermediate can lose a bit or overflow a uint.
+void mul32x24(uint a, uint b, out uint hi, out uint lo) {
+  uint a0 = a & 0xFFFu; uint a1 = (a >> 12) & 0xFFFu; uint a2 = (a >> 24) & 0xFFu;
+  uint b0 = b & 0xFFFu; uint b1 = b >> 12;
+  uint c0 = a0 * b0;
+  uint c1 = a0 * b1 + a1 * b0;
+  uint c2 = a1 * b1 + a2 * b0;
+  uint c3 = a2 * b1;
+  uint c4 = 0u;
+  c1 += c0 >> 12; c0 &= 0xFFFu;
+  c2 += c1 >> 12; c1 &= 0xFFFu;
+  c3 += c2 >> 12; c2 &= 0xFFFu;
+  c4 += c3 >> 12; c3 &= 0xFFFu;
+  lo = c0 | (c1 << 12) | ((c2 & 0xFFu) << 24);
+  hi = (c2 >> 8) | (c3 << 4) | (c4 << 16);
+}
+
+Big fromF32(float a) {
+  uint mant; int ex; int sgn;
+  unpack(a, mant, ex, sgn);
+  if (mant == 0u) return Big(uvec4(0u), 0);
+  return Big(shl128(uvec4(mant, 0u, 0u, 0u), ex + 72), sgn);
+}
+
+Big sAdd(Big a, Big b) {
+  if (a.s == 0) return b;
+  if (b.s == 0) return a;
+  if (a.s == b.s) return Big(add128(a.m, b.m), a.s);
+  int c = cmp128(a.m, b.m);
+  if (c == 0) return Big(uvec4(0u), 0);
+  if (c > 0) return Big(sub128(a.m, b.m), a.s);
+  return Big(sub128(b.m, a.m), b.s);
+}
+
+Big putProduct(Big acc, uint ma, int exa, int sa, uint mb, int exb, int sb, int extra) {
+  if (ma == 0u || mb == 0u) return acc;
+  uint l; uint h;
+  mul32x24(ma, mb, h, l);
+  uvec4 term = uvec4(l, h, 0u, 0u);
+  int sh = exa + exb + 48 + extra;
+  uvec4 placed = (sh >= 0) ? shl128(term, sh) : shr128(term, -sh);
+  return sAdd(acc, Big(placed, sa * sb));
+}
+
+Big mulBigF32(Big v, float f) {
+  if (v.s == 0) return Big(uvec4(0u), 0);
+  uint mant; int ex; int sgn;
+  unpack(f, mant, ex, sgn);
+  if (mant == 0u) return Big(uvec4(0u), 0);
+  uint l0, h0, l1, h1, l2, h2, l3, h3;
+  mul32x24(v.m.x, mant, h0, l0);
+  mul32x24(v.m.y, mant, h1, l1);
+  mul32x24(v.m.z, mant, h2, l2);
+  mul32x24(v.m.w, mant, h3, l3);
+  uint P0 = l0;
+  uint P1 = h0 + l1;
+  uint k1 = (P1 < h0) ? 1u : 0u;
+  uint P2t = h1 + l2;
+  uint k2 = (P2t < h1) ? 1u : 0u;
+  uint P2 = P2t + k1;
+  uint k2b = (P2 < P2t) ? 1u : 0u;
+  uint k2c = k2 + k2b;
+  uint P3t = h2 + l3;
+  uint k3 = (P3t < h2) ? 1u : 0u;
+  uint P3 = P3t + k2c;
+  uint k3b = (P3 < P3t) ? 1u : 0u;
+  uint P4 = h3 + k3 + k3b;
+  int s = 24 - ex;
+  uvec4 m;
+  if (s <= 0) {
+    m = shl128(uvec4(P0, P1, P2, P3), -s);
+  } else {
+    int w = s >> 5;
+    int b = s & 31;
+    int shb = (32 - b) & 31;
+    uvec4 o = uvec4(0u);
+    for (int i = 0; i < 4; i++) {
+      int j = i + w;
+      uint a = 0u;
+      if (j == 0) a = P0; else if (j == 1) a = P1; else if (j == 2) a = P2; else if (j == 3) a = P3; else if (j == 4) a = P4;
+      uint lo = a >> b;
+      int jm = j + 1;
+      uint an = 0u;
+      if (jm == 0) an = P0; else if (jm == 1) an = P1; else if (jm == 2) an = P2; else if (jm == 3) an = P3; else if (jm == 4) an = P4;
+      uint hi = 0u;
+      if (b != 0 && jm <= 4) hi = an << shb;
+      uint r = lo | hi;
+      if (i == 0) o.x = r; else if (i == 1) o.y = r; else if (i == 2) o.z = r; else o.w = r;
+    }
+    m = o;
+  }
+  return Big(m, v.s * sgn);
+}
+
+void toDS(Big v, out float hi, out float lo) {
+  if (v.s == 0) { hi = 0.0; lo = 0.0; return; }
+  int L = topBit(v.m);
+  if (L < 48) {
+    hi = float(v.m.x) * pow2i(-96) * float(v.s);
+    lo = 0.0;
+    return;
+  }
+  uint H = shr128(v.m, L - 23).x & 0xFFFFFFu;
+  uint Lo = shr128(v.m, L - 47).x & 0xFFFFFFu;
+  hi = float(H) * pow2i(L - 23 - 96) * float(v.s);
+  lo = float(Lo) * pow2i(L - 47 - 96) * float(v.s);
+}
+
+Big exactSum() {
+  Big acc = fromF32(1.0);
+  for (int i = 0; i < 64; i++) acc = sAdd(acc, fromF32(${B}));
+  for (int i = 0; i < 64; i++) acc = sAdd(acc, fromF32(${B2}));
+  return acc;
+}
+
+void main() {
+  int p = int(gl_FragCoord.x);
+  float r = 0.0, g = 0.0, b = 0.0;
+  if (p == 0 || p == 1) {
+    uint mc; int ec; int sc;
+    unpack(${C}, mc, ec, sc);
+    Big acc = putProduct(Big(uvec4(0u), 0), mc, ec, sc, mc, ec, sc, 0);
+    float hi, lo; toDS(acc, hi, lo);
+    float naive = ${C} * ${C};
+    if (p == 0) {
+      r = (lo != 0.0) ? 1.0 : 0.0;
+      g = ((hi != naive) || (lo != 0.0)) ? 1.0 : 0.0;
+      b = 1.0;
+    } else {
+      r = min(1.0, abs(lo) * 8388608.0);
+      g = min(1.0, abs(hi - naive) * 8388608.0);
+    }
+  } else if (p == 2 || p == 3) {
+    Big acc = exactSum();
+    float hi, lo; toDS(acc, hi, lo);
+    float naive = 1.0;
+    for (int i = 0; i < 64; i++) naive += ${B};
+    for (int i = 0; i < 64; i++) naive += ${B2};
+    if (p == 2) {
+      r = (lo != 0.0) ? 1.0 : 0.0;
+      g = ((hi != naive) || (lo != 0.0)) ? 1.0 : 0.0;
+      b = 1.0;
+    } else {
+      r = min(1.0, abs(lo) * 274877906944.0);
+      g = min(1.0, abs(hi - naive) * 274877906944.0);
+    }
+  } else if (p == 4 || p == 5) {
+    Big accW = exactSum();
+    float whi, wlo; toDS(accW, whi, wlo);
+    uint mwh; int ewh; int swh;
+    uint mwl; int ewl; int swl;
+    unpack(whi, mwh, ewh, swh);
+    unpack(wlo, mwl, ewl, swl);
+    float twoZ = 2.0 * ${Z};
+    Big acc = Big(uvec4(0u), 0);
+    acc = sAdd(acc, mulBigF32(fromF32(whi), twoZ));
+    acc = sAdd(acc, mulBigF32(fromF32(wlo), twoZ));
+    Big w2 = Big(uvec4(0u), 0);
+    w2 = putProduct(w2, mwh, ewh, swh, mwh, ewh, swh, 0);
+    w2 = putProduct(w2, mwh, ewh, swh, mwl, ewl, swl, 1);
+    w2 = putProduct(w2, mwl, ewl, swl, mwl, ewl, swl, 0);
+    acc = sAdd(acc, mulBigF32(w2, ${S}));
+    acc = sAdd(acc, fromF32(${D}));
+    float hi, lo; toDS(acc, hi, lo);
+    float wN = whi + wlo;
+    float naive = 2.0 * ${Z} * wN + ${S} * wN * wN + ${D};
+    if (p == 4) {
+      r = (lo != 0.0) ? 1.0 : 0.0;
+      g = ((hi != naive) || (lo != 0.0)) ? 1.0 : 0.0;
+      b = 1.0;
+    } else {
+      r = min(1.0, abs(lo) * 33554432.0);
+      g = min(1.0, abs(hi - naive) * 33554432.0);
+    }
+  } else if (p == 15) {
+    r = 1.0; g = 1.0; b = 1.0;
+  }
+  fragColor = vec4(r, g, b, 1.0);
+}
+`;
+}
 
 // ---------------------------------------------------------------------------
 // Identity and feature gates (our own context).
@@ -404,6 +806,81 @@ function doubleSingleProbe(probe) {
     prodNonZero: at(2, 0) > 5,
     prodLow: (at(2, 0) / 255) * Math.pow(2, -24),
   };
+}
+
+// ---------------------------------------------------------------------------
+// The integer-controlled probe (runs on a WebGL2 / GLSL ES 3.00 context).
+// ---------------------------------------------------------------------------
+
+function icUnpackArm(gl, program) {
+  gl.useProgram(program);
+  const loc = (name) => gl.getUniformLocation(program, name);
+  gl.uniform1f(loc('u_b'), IC_B);
+  gl.uniform1f(loc('u_b2'), IC_B2);
+  gl.uniform1f(loc('u_c'), IC_C);
+  gl.uniform1f(loc('u_z'), IC_Z);
+  gl.uniform1f(loc('u_s'), IC_S);
+  gl.uniform1f(loc('u_d'), IC_D);
+  fullscreenQuad(gl, program);
+  gl.viewport(0, 0, IC_WIDTH, 1);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  const px = new Uint8Array(IC_WIDTH * 4);
+  gl.readPixels(0, 0, IC_WIDTH, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  const readError = gl.getError();
+  const arms = [];
+  for (let t = 0; t < 3; t++) {
+    const fb = (t * 2) * 4;
+    const vb = (t * 2 + 1) * 4;
+    arms.push({
+      loNonZero: px[fb] > 127,
+      changes: px[fb + 1] > 127,
+      marker: px[fb + 2] > 127,
+      loValue: (px[vb] / 255) * Math.pow(2, -IC_LO_SCALE[t]),
+      diffValue: (px[vb + 1] / 255) * Math.pow(2, -IC_LO_SCALE[t]),
+    });
+  }
+  const sb = 15 * 4;
+  return {
+    arms: arms,
+    readError: readError,
+    sentinel: [px[sb], px[sb + 1], px[sb + 2]],
+  };
+}
+
+function integerControlledProbe(probe2) {
+  const gl = probe2.gl;
+  const highInt = gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_INT);
+  let renderer = gl.getParameter(gl.RENDERER);
+  try {
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    if (dbg) renderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+  } catch (_) { /* masked name is still a name */ }
+  // `getSupportedExtensions` reports availability WITHOUT enabling the extension
+  // (requesting WEBGL_debug_shader_precision would itself change codegen, so it is
+  // never requested here).
+  let supported = [];
+  try { supported = gl.getSupportedExtensions() || []; } catch (_) { supported = []; }
+  const variant = {
+    glVersion: gl.getParameter(gl.VERSION),
+    slVersion: gl.getParameter(gl.SHADING_LANGUAGE_VERSION),
+    renderer: renderer,
+    // Integer precision is reported by RANGE (the exponent bound), not by a bit
+    // count: `precision` is 0 for integer formats, so quoting it would read as
+    // "0 bits". rangeMax 31 means a signed 32-bit integer, which is what the
+    // fixed-point path needs.
+    intRange: highInt ? (highInt.rangeMin + '..' + highInt.rangeMax) : 'n/a',
+    // In WebGL2 the derivative functions are core in GLSL ES 3.00.
+    derivatives: 'core(ES3.00)',
+    shaderPrecisionDebug: (supported.indexOf('WEBGL_debug_shader_precision') !== -1) ? 'available(not-requested)' : 'absent',
+    // There is no WebGL API that reports a fast-math flag; say so rather than guess.
+    fastMath: 'not-queryable(no WebGL API)',
+  };
+
+  const runtime = icUnpackArm(gl, compileProgram(gl, icFrag(true), VERT_SRC_300));
+  const literal = icUnpackArm(gl, compileProgram(gl, icFrag(false), VERT_SRC_300));
+  return { variant: variant, runtime: runtime, literal: literal };
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +1114,85 @@ async function runBattery() {
       }
     }
 
+    // --- INTEGER-CONTROLLED DOUBLE-SINGLE ------------------------------------
+    // The D3D11 answer (DECISIONS 101). Runs on its own WebGL2 context; every
+    // failure mode is an explicit item, never a dropped line.
+    const IC_IDS = ['ic_variant', 'ic_readback', 'ic_twoprod_low', 'ic_sum_low', 'ic_recurrence_low', 'ic_required_nonzero', 'ic_arm_differential'];
+    const IC_SECTION = 'INTEGER-CONTROLLED DS';
+    let ic = null;
+    let icError = null;
+    let icUsable = false;
+    const icProbe = createGL('webgl2', IC_WIDTH, 1);
+    if (!icProbe.gl) {
+      icError = 'no WebGL2 context (GLSL ES 3.00 integer operations unavailable)';
+    } else {
+      try { ic = integerControlledProbe(icProbe); } catch (err) { icError = errText(err); }
+    }
+    if (icProbe.gl) {
+      try {
+        const lose = icProbe.gl.getExtension('WEBGL_lose_context');
+        if (lose) lose.loseContext();
+      } catch (_) { /* best effort; the app's context is untouched */ }
+    }
+    if (!ic) {
+      for (const id of IC_IDS) skip(IC_SECTION, id, icError || 'the integer-controlled probe did not run');
+    } else {
+      const TR_EXPECT = ['TwoProd(1+2^-12,1+2^-12)', '1+64*2^-25+64*2^-45', 'w->2Zw+S w^2+d'];
+      const fmtArm = (a) => 'lo=' + (a.loNonZero ? 'NONZERO' : 'ZERO')
+        + '(|lo|~' + fmtExp(a.loValue) + ') changesResult=' + (a.changes ? 'YES' : 'NO');
+      const active = (a) => (a.loNonZero && a.changes);
+      const armActive = (res) => res.arms.map(active);
+      const runtimeActive = armActive(ic.runtime);
+      const literalActive = armActive(ic.literal);
+
+      const v = ic.variant;
+      ok(IC_SECTION, 'ic_variant',
+        'ctx=webgl2/GLSL-ES-3.00 gl_version="' + clean(v.glVersion) + '" sl_version="' + clean(v.slVersion)
+        + '" renderer="' + clean(v.renderer) + '" highp_int_range=' + v.intRange
+        + ' derivatives=' + v.derivatives + ' shader_precision_debug=' + v.shaderPrecisionDebug
+        + ' fastmath=' + v.fastMath);
+
+      const sentinelOk = ic.runtime.sentinel[0] > 250 && ic.runtime.sentinel[1] > 250 && ic.runtime.sentinel[2] > 250;
+      icUsable = (ic.runtime.readError === 0) && sentinelOk;
+      if (ic.runtime.readError !== 0) {
+        fail(IC_SECTION, 'ic_readback', 'readPixels raised gl error 0x' + ic.runtime.readError.toString(16));
+      } else if (!sentinelOk) {
+        fail(IC_SECTION, 'ic_readback', 'probe sentinel read [' + ic.runtime.sentinel.join(',') + '] (expected ~[255,255,255]); the integer probe readback mapping is broken');
+      } else {
+        ok(IC_SECTION, 'ic_readback', 'viewport=' + IC_WIDTH + 'x1 sentinel=[' + ic.runtime.sentinel.join(',') + '] -> readback mapping OK');
+      }
+
+      for (let t = 0; t < 3; t++) {
+        const rt = ic.runtime.arms[t];
+        const lt = ic.literal.arms[t];
+        const id = ['ic_twoprod_low', 'ic_sum_low', 'ic_recurrence_low'][t];
+        const value = 'runtime[' + fmtArm(rt) + '] literal[' + fmtArm(lt) + '] expected=' + TR_EXPECT[t];
+        if (!icUsable) skip(IC_SECTION, id, 'readback mapping broken');
+        else if (rt.loNonZero && rt.changes) ok(IC_SECTION, id, value + ' -> REQUIRED-NONZERO-ACTIVE');
+        else if (rt.loNonZero) fail(IC_SECTION, id, 'the low component is nonzero but does NOT change the result: ' + value);
+        else fail(IC_SECTION, id, 'the integer-controlled low component was erased: ' + value);
+      }
+
+      const rtCount = runtimeActive.filter(Boolean).length;
+      const ltCount = literalActive.filter(Boolean).length;
+      const reqText = 'runtime ' + rtCount + '/3 (low!=0 AND changes result) literal ' + ltCount + '/3';
+      if (!icUsable) {
+        skip(IC_SECTION, 'ic_required_nonzero', 'readback mapping broken');
+        skip(IC_SECTION, 'ic_arm_differential', 'readback mapping broken');
+      } else if (rtCount === 3) {
+        ok(IC_SECTION, 'ic_required_nonzero', reqText + ' -> REQUIRED-NONZERO SATISFIED');
+      } else {
+        fail(IC_SECTION, 'ic_required_nonzero', 'the integer-controlled path did not satisfy REQUIRED-NONZERO: ' + reqText);
+      }
+
+      const tag = (arr) => '[' + arr.map((a) => (a ? 'A' : '-')).join('') + ']';
+      const armDiffText = 'runtime=' + tag(runtimeActive) + ' literal=' + tag(literalActive)
+        + ' (T0/T1/T2; A=active)';
+      if (icUsable && rtCount === 3) ok(IC_SECTION, 'ic_arm_differential', armDiffText + ' -> ' + (ltCount === 3 ? 'ARMS-AGREE' : 'LITERAL-ARM-DIFFERS'));
+      else if (icUsable && ltCount === 3) fail(IC_SECTION, 'ic_arm_differential', 'the integer path is ACTIVE only with folded LITERAL operands, i.e. it does not survive runtime data: ' + armDiffText);
+      else if (icUsable) fail(IC_SECTION, 'ic_arm_differential', 'both arms are inactive: ' + armDiffText);
+    }
+
     // --- DEEP LANE (and COST) ------------------------------------------------
     // Results are collected in a map and emitted in a FIXED order below, so every
     // expected id is present exactly once whatever happens.
@@ -865,6 +1421,19 @@ async function runBattery() {
       : (floatTex.status === 'SKIP' ? 'UNSUPPORTED' : 'BROKEN');
     const dsLowToken = (!ds || ds.status === 'FAIL') ? 'UNAVAILABLE'
       : (ds.sentinelOk ? (ds.lowNonZero ? (ds.lowChangesResult ? 'NONZERO-ACTIVE' : 'NONZERO-INERT') : 'ZERO-IGNORED') : 'UNAVAILABLE');
+    // The INTEGER-controlled residual, read from the runtime-operand arm (the case
+    // that failed on the owner's D3D11 driver). UNAVAILABLE = the WebGL2 integer
+    // probe could not run; ZERO-COLLAPSED = an integer low component was erased
+    // (would mean the fixed-point path itself did not survive this compiler).
+    let icToken = 'UNAVAILABLE';
+    if (ic && icUsable) {
+      const rt = ic.runtime.arms;
+      const rtActive = rt.filter((a) => a.loNonZero && a.changes).length;
+      const rtNonZero = rt.filter((a) => a.loNonZero).length;
+      if (rtActive === 3) icToken = 'NONZERO-ACTIVE';
+      else if (rtNonZero > 0) icToken = 'NONZERO-INERT';
+      else icToken = 'ZERO-COLLAPSED';
+    }
     const lanes = [];
     for (const s of deepSources) {
       if (s && s !== 'none' && lanes.indexOf(s) === -1) lanes.push(s);
@@ -879,6 +1448,7 @@ async function runBattery() {
       + ' kind=' + kind
       + ' floatTex=' + floatTexToken
       + ' dsLow=' + dsLowToken
+      + ' icDS=' + icToken
       + ' deepLane=' + (lanes.length ? lanes.join('+') : 'none')
       + ' cost: ' + costParts.join(' ')
       + ' | ' + counts.ok + 'OK/' + counts.skip + 'SKIP/' + counts.fail + 'FAIL';

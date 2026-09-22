@@ -9,7 +9,12 @@
 // SKIP/FAIL with a reason, a parseable SUMMARY, no uncaught error, the button
 // wired and safe to press twice — and NOT the values, which are machine-specific.
 // On this host a zero/ignored double-single low component is a plausible outcome;
-// the spec passes either way because it never asserts NONZERO.
+// the spec passes either way because it never asserts NONZERO. The same is true of
+// the INTEGER-CONTROLLED section (DECISIONS 101): on SwiftShader every integer arm
+// reads NONZERO-ACTIVE, and on the owner's D3D11 driver it may not — the spec
+// asserts only that each item is present and each value is a value or an explicit
+// SKIP/FAIL, and that the SUMMARY carries the `icDS=` token in one of its four
+// known states.
 //
 // It also asserts the two things that would make every other number a lie: that
 // the report is printed as ONE console block the owner can copy, and that the
@@ -25,6 +30,10 @@ const GROUPS = [
   { section: 'IDENTITY', ids: ['ua', 'gl_vendor', 'gl_renderer', 'gl_version', 'webgl2'] },
   { section: 'FEATURE GATES', ids: ['oes_texture_float', 'oes_texture_float_linear', 'max_texture_size', 'max_vertex_texture_units', 'float_texture_sampleable'] },
   { section: 'DOUBLE-SINGLE RESIDUAL', ids: ['ds_precision', 'ds_readback', 'ds_low_component', 'ds_low_changes_result', 'ds_twoprod_low'] },
+  // The integer-controlled battery (DECISIONS 101): the D3D11 response. It runs
+  // on a WebGL2 / GLSL ES 3.00 context, so on a machine with no WebGL2 these are
+  // explicit SKIPs — still structurally complete, never dropped.
+  { section: 'INTEGER-CONTROLLED DS', ids: ['ic_variant', 'ic_readback', 'ic_twoprod_low', 'ic_sum_low', 'ic_recurrence_low', 'ic_required_nonzero', 'ic_arm_differential'] },
   { section: 'DEEP LANE', ids: ['deep_view', 'deep_ref_float64', 'deep_ref_bigint', 'app_readback', 'cost_1e-4', 'cost_1e-6', 'cost_1e-8'] },
   { section: 'READBACK & ERRORS', ids: ['gl_error', 'readpixels_plausible'] },
 ];
@@ -94,8 +103,8 @@ function assertStructure(report, consoleTexts) {
   expect(parsed.footer, 'the footer must be present and countable')
     .toBe('===== END: ' + counted.ok + ' OK, ' + counted.skip + ' SKIP, ' + counted.fail + ' FAIL =====');
 
-  // (5) the SUMMARY answers the four questions by itself.
-  for (const token of ['renderer=', 'kind=', 'floatTex=', 'dsLow=', 'deepLane=', 'cost:']) {
+  // (5) the SUMMARY answers the five questions by itself.
+  for (const token of ['renderer=', 'kind=', 'floatTex=', 'dsLow=', 'icDS=', 'deepLane=', 'cost:']) {
     expect(parsed.summary, 'the SUMMARY must contain ' + token).toContain(token);
   }
   expect(['HARDWARE', 'SOFTWARE', 'UNKNOWN'].some((k) => parsed.summary.includes('kind=' + k)),
@@ -104,6 +113,8 @@ function assertStructure(report, consoleTexts) {
     'floatTex must be SAMPLES|UNSUPPORTED|BROKEN').toBe(true);
   expect(['NONZERO-ACTIVE', 'NONZERO-INERT', 'ZERO-IGNORED', 'UNAVAILABLE'].some((k) => parsed.summary.includes('dsLow=' + k)),
     'dsLow must be one of the four known tokens').toBe(true);
+  expect(['NONZERO-ACTIVE', 'NONZERO-INERT', 'ZERO-COLLAPSED', 'UNAVAILABLE'].some((k) => parsed.summary.includes('icDS=' + k)),
+    'icDS must be one of the four known tokens').toBe(true);
 
   // (6) the machine-readable surface agrees with the printed one.
   expect(report.id).toBe('gpuDiagnostic/1');
@@ -199,10 +210,11 @@ test.describe('GPU diagnostic (hardware-certification instrument)', () => {
   });
 
   // NON-VACUITY: a structure checker that accepts anything proves nothing. This
-  // runs no browser — it feeds assertStructure a report missing 23 of its 24 items
+  // runs no browser — it feeds assertStructure a report missing 30 of its 31 items
   // and requires it to reject.
   test('the structure checker is not vacuous: a malformed report is rejected', async () => {
-    const summary = 'renderer="x" kind=SOFTWARE floatTex=SAMPLES dsLow=UNAVAILABLE deepLane=none cost: 1e-4=n/a 1e-6=n/a 1e-8=n/a';
+    const ITEM_COUNT = EXPECTED_ITEMS.length;
+    const summary = 'renderer="x" kind=SOFTWARE floatTex=SAMPLES dsLow=UNAVAILABLE icDS=UNAVAILABLE deepLane=none cost: 1e-4=n/a 1e-6=n/a 1e-8=n/a';
     const badText = [
       HEADER,
       'SUMMARY: ' + summary,
@@ -218,7 +230,7 @@ test.describe('GPU diagnostic (hardware-certification instrument)', () => {
       errors: [],
     };
     expect(() => assertStructure(fakeReport, badText),
-      'a report missing 23 of its 24 items must be rejected').toThrow();
+      'a report missing ' + (ITEM_COUNT - 1) + ' of its ' + ITEM_COUNT + ' items must be rejected').toThrow();
 
     // And a report whose item set and sections are right but whose values contain
     // 'undefined' must ALSO be rejected, so "the right ids are present" cannot pass
@@ -228,13 +240,13 @@ test.describe('GPU diagnostic (hardware-certification instrument)', () => {
       badValueLines.push('--- ' + group.section + ' ---');
       for (const id of group.ids) badValueLines.push('  ' + id + ': undefined');
     }
-    badValueLines.push('===== END: 24 OK, 0 SKIP, 0 FAIL =====');
+    badValueLines.push('===== END: ' + ITEM_COUNT + ' OK, 0 SKIP, 0 FAIL =====');
     const items = [];
     for (const group of GROUPS) for (const id of group.ids) items.push({ section: group.section, id: id, status: 'OK', value: 'undefined' });
     const undefinedReport = {
       id: 'gpuDiagnostic/1', summary: summary,
       items: items,
-      counts: { ok: 24, skip: 0, fail: 0 }, errors: [],
+      counts: { ok: ITEM_COUNT, skip: 0, fail: 0 }, errors: [],
     };
     expect(() => assertStructure(undefinedReport, badValueLines.join('\n')),
       "an 'undefined' item value must be rejected").toThrow();
