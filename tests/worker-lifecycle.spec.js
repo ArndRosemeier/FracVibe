@@ -25,20 +25,25 @@ async function waitIdle(page) {
 }
 
 // The tests that need a job to still be IN FLIGHT when they act on it use the
-// heaviest user-reachable configuration: Burning Ship at the slider's maximum
-// iteration cap. Measured on this host it runs ~1.0 s end to end and emits its
-// first frame at ~120 ms, so there is a wide, deterministic window. The default
-// Mandelbrot job finishes in ~100 ms, which is too fast to fault or cancel
-// deterministically — with it these tests are flaky, not wrong.
+// heaviest user-reachable configuration: Burning Ship at a HEAVY, BOUNDED iteration
+// budget. ITER-CAP raised the slider's maximum to 100000, and a 100000-iteration
+// CPU frame on the default viewport runs for MINUTES — it would blow every 30 s
+// fixture timeout in this file without testing the worker lifecycle any better.
+// 8192 is the previous cap: the budget these fixtures were measured against
+// (~1.0 s end to end, first frame at ~120 ms), so there is a wide, deterministic
+// window. The pins here count worker events, not iterations, so the budget only has
+// to make the job last long enough to fault or cancel deterministically.
+const HEAVY_ITER = 8192;
+
 async function heavySetup(page) {
-  await page.evaluate(() => {
+  await page.evaluate((heavy) => {
     const type = /** @type {HTMLSelectElement} */ (document.getElementById('fractalType'));
     type.value = 'burningship';
     type.dispatchEvent(new Event('change', { bubbles: true }));
     const slider = /** @type {HTMLInputElement} */ (document.getElementById('maxIter'));
-    slider.value = slider.max;
+    slider.value = String(heavy);
     slider.dispatchEvent(new Event('input', { bubbles: true }));
-  });
+  }, HEAVY_ITER);
   await waitIdle(page);
 }
 

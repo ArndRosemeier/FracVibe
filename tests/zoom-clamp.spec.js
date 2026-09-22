@@ -15,6 +15,12 @@
 //      only depth signal left is the non-blocking measured-correct-reach notice.
 const { test, expect } = require('@playwright/test');
 
+// ITER-CAP: these pins drive deep views (1e-9, 1e-12, 1e-45) whose zoom-derived
+// budget is now up to 46080, and they assert STATE, not pixels. A small viewport
+// keeps the renders bounded; the clamp machinery and the stored scale do not depend
+// on the canvas size (test 1 already shrinks the canvas for its wheel storm).
+test.use({ viewport: { width: 160, height: 120 } });
+
 test('the ONE clamp applies the same value on every path (S1), and the shipped state has no limit', async ({ page }) => {
   test.setTimeout(180_000);
   const pageErrors = [];

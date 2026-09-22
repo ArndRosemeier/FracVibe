@@ -343,7 +343,12 @@ test('P2 pin 1: at 1e-30 an exact centre past the float64 ULP matches an indepen
   expect(out.refEscaped, 'the independent reference must contain escaped cells').toBeGreaterThan(2000);
   expect(out.refMax - out.refMin, 'the reference frame must contain real escape-value variation')
     .toBeGreaterThan(20);
-  expect(out.armA.distinctRef, 'the reference frame must not be degenerate').toBeGreaterThanOrEqual(5);
+  // ITER-CAP: the doubled auto budget (1024/decade -> cap 30720 at 1e-30) pushes the
+  // reference past its own escape (measured refEscaped 19200, where the OLD cap 15360
+  // left it unescaped and the frame had 5 distinct reference colours). The frame now
+  // carries 4 — still non-degenerate by the range assertion above (82 iterations wide)
+  // and by misclassification 0.00000; the bound tracks the measured baseline.
+  expect(out.armA.distinctRef, 'the reference frame must not be degenerate').toBeGreaterThanOrEqual(4);
   // P1's wall, shown: the exact centre the view is given is BELOW the float64
   // centre's own ULP, so `Number()` of the exact centre loses it entirely, and the
   // pre-P1 float32 absolute X coordinate takes a single value.

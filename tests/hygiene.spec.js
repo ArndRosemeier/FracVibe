@@ -168,6 +168,13 @@ test('S6 pin: no alert/confirm/prompt is called; both non-modal flows stay usabl
   // renders every depth); LANE-CONTINUITY removed the CAP itself (owner directive row
   // 62: "no hard stop"), so the app now stores the depth unchanged and reports the
   // measured-correct reach non-modally. The renderer checkbox is untouched.
+  //
+  // ITER-CAP: at 1e-45 the zoom-derived budget is 1024*45 = 46080 (it was clamped to
+  // 8192 by the old cap), so the render this `setScale` triggers is ~5.6x the work it
+  // used to be. The pin asserts STATE (the stored scale, the message, the absent
+  // offer), not pixels, so the render is shrunk to a negligible canvas first — the
+  // zoom maths and the DOM surfaces do not depend on the viewport size.
+  await page.setViewportSize({ width: 128, height: 96 });
   const deep = await page.evaluate(() => {
     window.__fv.setScale(1e-45);
     return {

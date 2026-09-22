@@ -241,10 +241,19 @@ async function measureAgainstReference(page, { legacy }) {
 // changed build reproduces all four EXACTLY. FNV-1a over the raw RGBA readback is
 // sensitive to a single-bit change in any channel of any pixel, and the sequence is
 // deterministic: two consecutive pre-fix captures produced byte-identical hashes.
+//
+// ITER-CAP: the three PLAIN-lane arms (`default`, `atLaneKnee`, `justAboveKnee`) are
+// STILL byte-identical to the pre-change build — that is the no-regression property
+// this pin exists for, and it survived the 2D orbit transport and the raised cap.
+// The `belowOldWall` arm at 1e-8 is BELOW the deep-lane boundary, so the DEEP
+// perturbation lane draws there and its golden tracks the auto budget: the rule went
+// 4096 -> 8192 at 1e-8, so that one hash was re-captured at the new cap (131 -> 78
+// colours). Its re-capture is the contract genuinely changing, not a plain-lane
+// regression; the plain-lane arms above are the regression net.
 const SHALLOW_GOLDEN = [
   { name: 'default',       scale: 3,        hash: 410787103,  colours: 82 },
   { name: 'atLaneKnee',    scale: 1e-4,     hash: 2918588311, colours: 479 },
-  { name: 'belowOldWall',  scale: 1e-8,     hash: 3933966953, colours: 131 },
+  { name: 'belowOldWall',  scale: 1e-8,     hash: 4064406946, colours: 78 },
   { name: 'justAboveKnee', scale: 1.05e-4,  hash: 180559335,  colours: 466 },
 ];
 
@@ -282,6 +291,7 @@ test('GPU-ARBITRARY pin 4 (NO-REGRESSION): the shallow lane renders byte-identic
   });
 
   expect(out.length).toBe(SHALLOW_GOLDEN.length);
+  console.log('[GA pin4] ' + out.map((o) => `${o.scale}:${o.hash}/${o.colours}(${o.source},cap${o.cap})`).join(' '));
   for (let i = 0; i < out.length; i++) {
     const got = out[i], want = SHALLOW_GOLDEN[i];
     // NON-VACUITY: each arm really rendered at the documented scale, and every one
