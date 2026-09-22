@@ -71,7 +71,12 @@ async function deepFrame(page) {
     const cap = fv.maxIter();
     const aspect = w / h;
     const ref = new Float32Array(w * h);
-    const zx = orbit.zx, zy = orbit.zy, ow = orbit.width;
+    const zx = orbit.zx, zy = orbit.zy;
+    // ITER-CAP: the transported reference length (NOT the texture row width). The
+    // reference must iterate over every value the draw could use, so this is the
+    // quantity `m` is bounded by — using `orbit.width` (the 8192-wide row) would
+    // truncate the reference at 8192 and measure the wrong thing.
+    const ow = orbit.length;
     let rebases = 0;
     for (let j = 0; j < h; j++) {
       const v = (j + 0.5) / h;
@@ -146,7 +151,7 @@ async function deepFrame(page) {
       }
     }
     return {
-      w, h, cap, scale: view.scale, orbitW: ow, rebases,
+      w, h, cap, scale: view.scale, orbitLen: ow, rebases,
       misFrac: mis / (w * h), meanAbs: sumAbs / (w * h), maxAbs,
       bigFrac: big / (w * h), largestComp: largest,
       distinctRef: refCols.size, distinctGpu: gpuCols.size, escaped,
@@ -170,7 +175,7 @@ test('P1 pin 1: at zoom 1e15 the deep lane matches a float64 perturbation refere
     centre: PROBE_CENTRE, scale: DEPTH_SCALE,
   });
   const out = await deepFrame(page);
-  console.log(`[P1 pin1] ${out.w}x${out.h} scale=${out.scale} cap=${out.cap} orbitW=${out.orbitW} ` +
+  console.log(`[P1 pin1] ${out.w}x${out.h} scale=${out.scale} cap=${out.cap} orbitLen=${out.orbitLen} ` +
     `lane=${out.usePerturbation} mis=${out.misFrac.toFixed(5)} meanAbs=${out.meanAbs.toFixed(3)} ` +
     `maxAbs=${out.maxAbs} bigFrac=${out.bigFrac.toFixed(4)} largestComp=${out.largestComp} ` +
     `cols ref/gpu=${out.distinctRef}/${out.distinctGpu} escaped=${out.escaped} rebases=${out.rebases}`);
@@ -221,10 +226,12 @@ test('P1 pin 2: the reference orbit is built once per view, counted, never per d
     return { count: window.__fv.orbitComputations(), orbit: window.__fv.orbitValues(), cap: window.__fv.maxIter() };
   }, { centre: PROBE_CENTRE, scale: DEPTH_SCALE });
 
-  // NON-VACUITY: an orbit was really built, at the job's own budget.
+  // NON-VACUITY: an orbit was really built, at the job's own budget. ITER-CAP: the
+  // transported reference is `cap + 1` values in a 2D texture (row width <=
+  // MAX_TEXTURE_SIZE), so `length` — not `width` — is the covered quantity.
   expect(first.count, 'a deep view must build an orbit').toBeGreaterThan(0);
   expect(first.orbit, 'the orbit must be observable').not.toBe(null);
-  expect(first.orbit.width, 'Z_0 .. Z_maxIter').toBe(Math.min(first.cap + 1, 8192));
+  expect(first.orbit.length, 'Z_0 .. Z_maxIter').toBe(first.cap + 1);
   // The orbit really is the app's float64 orbit of the view centre: Z_0 = 0 and
   // Z_1 = C.
   expect(first.orbit.zx[0]).toBe(0);
@@ -250,12 +257,14 @@ test('P1 pin 2: the reference orbit is built once per view, counted, never per d
   expect(moved.after - moved.before, 'a centre change must rebuild the orbit exactly once').toBe(1);
 
   // A BUDGET change is a different reference orbit (it is the same recurrence, more
-  // terms), so it also builds exactly one more.
+  // terms), so it also builds exactly one more. ITER-CAP: the value must clear the
+  // zoom-derived FLOOR at 1e-15 (15360 after the doubling) or the effective cap —
+  // and therefore the orbit key — would not change.
   const budget = await page.evaluate(({ centre, scale }) => {
     window.__fv.setDeepView({ ...centre, scale });
     const before = window.__fv.orbitComputations();
     const slider = /** @type {HTMLInputElement} */ (document.getElementById('maxIter'));
-    slider.value = '8000';
+    slider.value = '20000';
     slider.dispatchEvent(new Event('input', { bubbles: true }));
     window.__fv.renderWebGL();
     return { before, after: window.__fv.orbitComputations() };
@@ -309,7 +318,8 @@ test('P1 pin 3: the deep lane is depth-selected, and the Pauldelbrot detector is
   }, { centre: PROBE_CENTRE, scale: DEPTH_SCALE });
   await page.evaluate(() => window.__fv.renderWebGL());
   console.log(`[P1 pin3] deep lane=${deep.lane} glitchedFrac=${deep.glitch.glitchedFrac.toFixed(4)} ` +
-    `G=${deep.constants.glitchG} interval=${deep.constants.rescaleInterval} orbitW=${deep.constants.orbitWidth}`);
+    `G=${deep.constants.glitchG} interval=${deep.constants.rescaleInterval} ` +
+    `orbitW=${deep.constants.orbitWidth} orbitLen=${deep.constants.orbitLength}`);
   expect(deep.lane, 'the deep lane must be the perturbation one').toBe(true);
   expect(deep.glitch.glitched, 'the detector must fire on a real population').toBeGreaterThan(1000);
   expect(deep.glitch.glitchedFrac).toBeGreaterThan(0.5);
@@ -319,8 +329,10 @@ test('P1 pin 3: the deep lane is depth-selected, and the Pauldelbrot detector is
   // not see a shader that restated a different number.
   expect(deep.source).toContain('#define PERTURB_GLITCH_G ' + Math.fround(deep.constants.glitchG));
   expect(deep.source).toContain('#define PERTURB_RESCALE_INTERVAL ' + deep.constants.rescaleInterval);
-  // The deep lane really has an orbit to glitch against.
-  expect(deep.orbit.width).toBeGreaterThan(1000);
+  // The deep lane really has an orbit to glitch against — the FULL transported
+  // reference (Z_0 .. Z_maxIter), not the texture row width.
+  expect(deep.orbit.length, 'the transported reference must cover the budget').toBeGreaterThan(1000);
+  expect(deep.orbit.length, 'Z_0 .. Z_maxIter').toBe(deep.constants.orbitLength);
 
   expect(pageErrors).toEqual([]);
 });

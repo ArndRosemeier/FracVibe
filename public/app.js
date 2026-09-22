@@ -1988,7 +1988,26 @@ window.__fv = Object.freeze({
     rescaleInterval: FractalKernel.PERTURB_RESCALE_INTERVAL,
     hasFloatTexture: !!(webglRenderer && webglRenderer.hasFloatTexture),
     orbitWidth: webglRenderer ? webglRenderer._orbitW : 0,
+    orbitRows: webglRenderer ? webglRenderer._orbitRows : 0,
+    orbitLength: webglRenderer ? webglRenderer._orbitLen : 0,
   }),
+  // ITER-CAP: the reference-orbit TRANSPORT as it actually is, so a pin can prove
+  // the deep lane's reference cannot silently freeze. `covered` is the property that
+  // matters: the transported length is at least the budget + 1, so the shader never
+  // has to clamp the reference index. `shortfall` is non-zero only when the device's
+  // texture capacity is the binding constraint (never on this host).
+  orbitTransport: () => (webglRenderer ? {
+    textureSize: webglRenderer.maxOrbitTextureSize,
+    capacity: webglRenderer.maxOrbitLength,
+    budget: viewer.maxIter,
+    width: webglRenderer._orbitW,
+    rows: webglRenderer._orbitRows,
+    length: webglRenderer._orbitLen,
+    covered: webglRenderer._orbitLen >= viewer.maxIter + 1,
+    shortfall: webglRenderer.orbitShortfall,
+    orbitSource: webglRenderer.orbitSource,
+    usePerturbation: !!webglRenderer.usePerturbation,
+  } : null),
   // Run the REAL perturbation draw with the diagnostic output (the Pauldelbrot
   // glitch level in place of the colour) and read the GPU's own count back. This
   // adds no production path: production always draws with the diagnostic off, and

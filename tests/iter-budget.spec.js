@@ -11,11 +11,14 @@
 //
 // The rule under test (public/fractalKernel.js): the slider's value is a FLOOR and
 // `effective = max(slider, floor(zoom))`. The floor is ZERO at and above the deep
-// lane's boundary and grows 512 iterations per decade of zoom below it, but
-// LANE-CONTINUITY made the departure CONTINUOUS (it ramps in over the decade below
-// the boundary) so no depth has a budget jump:
-//   zoom 1e5 -> 2560   1e6 -> 3072   1e8 -> 4096   1e15 -> 7680
-// and the ONE cap (MAX_ITER) bounds it. There is NO app zoom cap any more.
+// lane's boundary and grows ITER_BUDGET_PER_DECADE iterations per decade of zoom
+// below it, but LANE-CONTINUITY made the departure CONTINUOUS (it ramps in over the
+// decade below the boundary) so no depth has a budget jump:
+//   zoom 1e5 -> 5120   1e6 -> 6144   1e8 -> 8192   1e15 -> 15360
+// (ITER-CAP doubled the slope 512 -> 1024 and raised the cap 8192 -> 100000; the
+// anchors below are the doubled ones and the ramp is unchanged, so the continuity
+// property is preserved.)
+// and the ONE cap (MAX_ITER = 100000) bounds it. There is NO app zoom cap any more.
 //
 // Everything is observed through the frozen `window.__fv` surface and driven through
 // the real UI / real worker. `setDeepView` is the ONE observation hook: with the cap
@@ -25,7 +28,7 @@
 // from pixels or inference.
 const { test, expect } = require('@playwright/test');
 
-// A small viewport keeps a real 4096-iteration CPU frame cheap; the pins are about
+// A small viewport keeps a real 8192-iteration CPU frame cheap; the pins are about
 // the budget, not the resolution.
 test.use({ viewport: { width: 200, height: 150 } });
 
@@ -33,7 +36,7 @@ test.use({ viewport: { width: 200, height: 150 } });
 const PROBE_CENTRE = { centerX: -0.743643887037151, centerY: 0.13182590420533 };
 const DEEP_SCALE = 1e-8; // zoom 1e8
 const FIXED_BUDGET = 512; // the shipped default; the probe measured it 100% inside here
-const SCALED_BUDGET = 4096; // the rule's floor at 1e8 == the budget the probe used
+const SCALED_BUDGET = 8192; // ITER-CAP: the doubled rule's floor at 1e8 (was 4096)
 
 async function waitIdle(page) {
   await expect
@@ -221,6 +224,10 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
         at1e8: fv.iterBudgetForScale(1e-8),
         at1e15: fv.iterBudgetForScale(1e-15),
         atDeep: fv.iterBudgetForScale(1e-20),
+        // Deep enough for the RULE to exceed the 100000 cap, so the clamp is
+        // exercised (with 1024/decade that is past zoom ~1e98; the deep reachable
+        // range is bounded by the rule, not by the cap, which is the point).
+        atClamp: fv.iterBudgetForScale(1e-120),
         shallow: fv.iterBudgetForScale(3),
       },
       rows,
@@ -249,13 +256,16 @@ test('D2 pin 2: the budget is monotone in zoom, bounded by the one cap, and the 
   // The stated anchors of the rule, including the probe's own budget at 1e8.
   expect(measured.anchors.shallow, 'no floor at a shallow view').toBe(1);
   expect(measured.anchors.atCap, 'no floor AT the shipped GPU zoom cap').toBe(1);
-  expect(measured.anchors.at1e5).toBe(2560);
-  expect(measured.anchors.at1e6).toBe(3072);
-  expect(measured.anchors.at1e7).toBe(3584);
-  expect(measured.anchors.at1e8, "the budget the probe needed at 1e8").toBe(4096);
-  expect(measured.anchors.at1e15).toBe(7680);
-  // Past the float64 orbit's reach the ONE cap, not the rule, decides.
-  expect(measured.anchors.atDeep, 'the rule can never exceed the ONE cap').toBe(measured.cap);
+  expect(measured.anchors.at1e5).toBe(5120);
+  expect(measured.anchors.at1e6).toBe(6144);
+  expect(measured.anchors.at1e7).toBe(7168);
+  expect(measured.anchors.at1e8, 'ITER-CAP: the probe budget doubled').toBe(8192);
+  expect(measured.anchors.at1e15).toBe(15360);
+  // The rule at 1e-20 is 1024*20 = 20480: with the raised cap the RULE, not the cap,
+  // decides over the whole reachable range (the cap first binds past zoom ~1e98).
+  expect(measured.anchors.atDeep, 'the rule decides far past any reachable depth').toBe(20480);
+  expect(measured.anchors.atClamp, 'the ONE cap still bounds the rule deep enough')
+    .toBe(measured.cap);
 
   // LANE-CONTINUITY removed the app's zoom cap (owner directive, DECISIONS 62), so
   // the rule's knee is no longer equal to a cap and the old equality is GONE.
@@ -377,8 +387,8 @@ test('D2 pin 3: the colour table is sized by the job cap and cached, not rebuilt
   });
   expect(rebuilt.after, 'a palette change must rebuild the table').toBe(rebuilt.before + 1);
 
-  // ...and the table FOLLOWS A DEEP JOB'S cap (4096), still far below the max-cap
-  // table — the allocation is a function of the job, at every depth.
+  // ...and the table FOLLOWS A DEEP JOB'S cap (8192 now), still far below the
+  // max-cap table — the allocation is a function of the job, at every depth.
   await page.evaluate(({ centre, scale }) => window.__fv.setDeepView({ ...centre, scale }), {
     centre: PROBE_CENTRE, scale: DEEP_SCALE,
   });
@@ -397,7 +407,7 @@ test('D2 pin 3: the colour table is sized by the job cap and cached, not rebuilt
 
   // The cost report the slice's docs quote, in bytes of Uint32Array.
   console.log(`[D2 pin3] measured bytes: cap512=${(512 * stride + 3) * 4} ` +
-    `cap4096=${(4096 * stride + 3) * 4} maxCap=${(deep.capMax * stride + 3) * 4}`);
+    `cap8192=${(8192 * stride + 3) * 4} maxCap=${(deep.capMax * stride + 3) * 4}`);
 
   expect(pageErrors).toEqual([]);
 });

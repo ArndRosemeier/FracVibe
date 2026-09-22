@@ -33,13 +33,26 @@
   //
   // D2 raised it 2000 -> 8192. The zoom-scaled budget below (§D2) needs more than
   // 2000 to resolve a deep view — the probe's view centre escapes only at iteration
-  // 3086 — and it asks for 4096 at zoom 1e8 and 7680 at zoom 1e15 (the practical
-  // reach of a float64 reference orbit, P6). 8192 is the smallest power of two that
-  // lets the RULE, not the cap, decide over that whole reachable range, so nothing
-  // reachable is truncated by the cap. Raising the cap alone does NOT raise any
-  // frame's cost: a job still runs at its own (scaled) budget, and the colour table
-  // is sized by that job's cap, never by this maximum (see colorTableSize below).
-  const MAX_ITER = 8192;
+  // 3086 — and it asked for 4096 at zoom 1e8 and 7680 at zoom 1e15 (the practical
+  // reach of a float64 reference orbit, P6). 8192 was the smallest power of two that
+  // let the RULE, not the cap, decide over that reachable range.
+  //
+  // ITER-CAP (owner request, 2026-09-22): "Iterations max needs to be much bigger,
+  // lets say 100000, for deep zooms." It is raised 8192 -> 100000, together with a
+  // DOUBLING of the auto-budget slope (512 -> 1024 iterations per decade, §D2). This
+  // is a CEILING and a SLOPE, not a step: the continuous ramp and the no-hard-stop
+  // property (DECISIONS 62) are untouched, and the extra headroom is what the slider
+  // and the deep lane can now reach. With 1024/decade the rule reaches 100000 only at
+  // zoom ~1e98, so over every reachable depth the RULE still decides and the cap is a
+  // UI ceiling rather than the truncating bound.
+  //
+  // Raising the cap alone does NOT raise any frame's cost: a job still runs at its
+  // own (scaled) budget, and the colour table is sized by that job's cap, never by
+  // this maximum (see colorTableSize below). It DOES lengthen the reference orbit a
+  // deep job needs, which is why `webglFractal.js` transports the orbit as a 2D
+  // float texture: one row is bounded by MAX_TEXTURE_SIZE, but the full orbit needs
+  // maxIter + 1 values, and a 1D texture silently FROZE the reference past its width.
+  const MAX_ITER = 100000;
   const MIN_ITER = 1;
   const BAILOUT = 4;
   // The escape radius squared at which the iteration test fires. ONE constant,
@@ -152,32 +165,34 @@
   // no saturation there (1e4/512 = 0.7% inside) and D1's pins deliberately hold a
   // cap of 50 at zooms up to 1e4 to make one iteration a visible colour band, so a
   // floor there would silently override an explicit user budget and destroy the
-  // band those pins measure. Below that scale it grows 512 iterations per DECADE of
-  // zoom. Why that shape: the escape count of an exterior point goes as log2(1/d)
-  // for the quadratic map, so the budget must be linear in the LOGARITHM of the
-  // zoom, not in the zoom; one decade of zoom is 3.32 doublings of the boundary
-  // distance, and 512 per decade is 154 per doubling, which covers the probe's
-  // measured 3086 with the budget it actually needed:
-  //     zoom 1e5 -> 2560     zoom 1e6 -> 3072     zoom 1e8 -> 4096
-  //     zoom 1e9 -> 4608     zoom 1e12 -> 6144    zoom 1e15 -> 7680
-  // 4096 at 1e8 is EXACTLY the budget the probe used to turn that 100%-black frame
-  // into a real one, and 3086 < 4096, so the centre escapes.
+  // band those pins measure. Below that scale it grows ITER_BUDGET_PER_DECADE
+  // iterations per DECADE of zoom. Why that shape: the escape count of an exterior
+  // point goes as log2(1/d) for the quadratic map, so the budget must be linear in
+  // the LOGARITHM of the zoom, not in the zoom; one decade of zoom is 3.32 doublings
+  // of the boundary distance, which covers the probe's measured 3086 with the budget
+  // it actually needed. ITER-CAP doubled the slope 512 -> 1024 per decade (owner
+  // request: "double the auto-iterations"), so the anchors are now:
+  //     zoom 1e5 -> 5120     zoom 1e6 -> 6144     zoom 1e8 -> 8192
+  //     zoom 1e9 -> 9216     zoom 1e12 -> 12288   zoom 1e15 -> 15360
+  // 8192 at 1e8 is EXACTLY the doubled budget of the 4096 the probe used to turn
+  // that 100%-black frame into a real one, and 3086 < 8192, so the centre escapes
+  // with the same margin as before the doubling.
   //
   // LANE-CONTINUITY (2026-09-22). This rule used to be `off` at and above
-  // `ITER_BUDGET_MIN_SCALE` and to JUMP straight to `512*log10(1/scale)` below it,
-  // so the effective budget stepped 512 -> 2058 in ONE wheel step at scale 1e-4.
-  // That step is the measured cause of the 31.6-unit mean-red colour jump across
-  // the deep lane's boundary (docs/STATE.md QUEUE row DEEP-LANE-SWITCH): with the
-  // budget held FIXED the same lane switch moves the frame by 0.005-0.036 units,
-  // i.e. the discontinuity was the BUDGET FLOOR TURNING ON, not the lane.
+  // `ITER_BUDGET_MIN_SCALE` and to JUMP straight to `PER_DECADE*log10(1/scale)`
+  // below it, so the effective budget stepped 512 -> 2058 in ONE wheel step at
+  // scale 1e-4. That step is the measured cause of the 31.6-unit mean-red colour
+  // jump across the deep lane's boundary (docs/STATE.md QUEUE row DEEP-LANE-SWITCH):
+  // with the budget held FIXED the same lane switch moves the frame by 0.005-0.036
+  // units, i.e. the discontinuity was the BUDGET FLOOR TURNING ON, not the lane.
   //
-  // The floor is now introduced CONTINUOUSLY. It departs from zero AT the knee
-  // (`ramp` 0 there) and reaches the long-standing 512-per-decade rule one decade
-  // below it (`ramp` 1 at 1e-5), so no depth has a budget discontinuity. The deep
-  // anchors are deliberately UNCHANGED — 1e-5 -> 2560, 1e-6 -> 3072, 1e-8 -> 4096,
-  // 1e-15 -> 7680 — which is why D2's own pins still hold and why only the
-  // (1e-4, 1e-5) decade is affected.
-  const ITER_BUDGET_PER_DECADE = 512;
+  // The floor is introduced CONTINUOUSLY. It departs from zero AT the knee
+  // (`ramp` 0 there) and reaches the saturated per-decade rule one decade below it
+  // (`ramp` 1 at 1e-5), so no depth has a budget discontinuity. The ramp is
+  // scale-invariant in the slope, so DOUBLING the slope doubles the deep anchors
+  // without introducing a step (LANE-CONTINUITY's rule-level pin holds the largest
+  // adjacent jump well under a fixed bound).
+  const ITER_BUDGET_PER_DECADE = 1024;
   // --- P1: the perturbation core's two named constants ------------------------
   // Pauldelbrot's glitch test is |Z+z|^2 < G |Z|^2. The sources put G anywhere in
   // 1e-2..1e-8 and publish no principled value at all (Kalles Fraktaler exposes it
@@ -230,8 +245,8 @@
   // The FLOOR the zoom asks for, clamped to [MIN_ITER, MAX_ITER]. `MIN_ITER` means
   // "no floor": the user's slider value is the whole budget. Monotone non-decreasing
   // as the scale falls (the zoom rises), and CONTINUOUS in the view scale: at the
-  // knee the floor is 0 and it reaches the 512-per-decade rule one decade below it,
-  // so a wheel step across the knee changes the effective budget by at most a few
+  // knee the floor is 0 and it reaches the saturated per-decade rule one decade below
+  // it, so a wheel step across the knee changes the effective budget by at most a few
   // iterations instead of a factor of four.
   function iterBudgetForScale(scale) {
     if (typeof scale !== 'number' || !isFinite(scale) || scale <= 0) return MIN_ITER;
@@ -342,11 +357,17 @@
   // D1 exported `COLORS_LUT_SIZE = MAX_ITER * STRIDE + 1`, the size of a table for
   // the module MAXIMUM. Nothing allocated it, but it named the wrong quantity: at
   // MAX_ITER 8192 it would be 2 097 153 entries (~8 MB) for EVERY frame, whatever
-  // cap that frame actually ran at. The table a frame needs is a function of ITS
-  // cap (D1's pin 6: a finished frame is indexed at its own job's cap), so the size
-  // is a function, not a constant, and the renderer allocates only that (plus one
-  // placeholder entry) and reuses it while the key (scheme, offset, cap) holds.
-  // +1 is the inside-the-set entry at exactly maxIter.
+  // cap that frame actually ran at — and at the ITER-CAP maximum of 100000 it would
+  // be 25 600 001 entries (~97.7 MiB) per frame. The table a frame needs is a
+  // function of ITS cap (D1's pin 6: a finished frame is indexed at its own job's
+  // cap), so the size is a function, not a constant, and the renderer allocates only
+  // that (plus one placeholder entry) and reuses it while the key (scheme, offset,
+  // cap) holds. +1 is the inside-the-set entry at exactly maxIter.
+  //
+  // CONTRACT (verified by tests/iter-budget.spec.js pin 3): NO path sizes a table by
+  // this module maximum. A 512-cap frame allocates 512*256+3 = 131 075 entries; an
+  // 8192-cap deep frame 2 097 155 (~8 MB); only a frame actually run at the 100000
+  // ceiling would allocate the ~97.7 MiB table — and that is the frame's own choice.
   function colorTableSize(maxIter) {
     return clampMaxIter(maxIter) * COLORS_LUT_STRIDE + 1;
   }

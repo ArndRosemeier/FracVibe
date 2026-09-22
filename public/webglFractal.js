@@ -52,11 +52,30 @@ export class WebGLFractalRenderer {
     this.orbitComputations = 0;
     this._orbitKey = null;
     this._orbitTex = null;
+    // ORBIT TRANSPORT (ITER-CAP). The orbit is one float32 word per component, one
+    // texel per reference iteration, but the texture is 2D: `_orbitW` is the ROW
+    // width (<= MAX_TEXTURE_SIZE) and `_orbitRows` the row count, so the transport
+    // carries `_orbitW * _orbitRows` samples. `_orbitLen` is how many of them are
+    // actually filled = the number of reference values the shader may use
+    // (maxIter + 1). It used to be a 1D texture whose width was
+    // `min(MAX_TEXTURE_SIZE, MAX_ITER)`, which SILENTLY FROZE the reference past
+    // 8192 while the loop kept iterating — the failure this 2D layout removes.
     this._orbitW = 0;
+    this._orbitRows = 0;
+    this._orbitLen = 0;
     this._orbitZx = null;
     this._orbitZy = null;
     this.hasFloatTexture = false;
-    this.maxOrbitWidth = 0;
+    // The device's per-dimension texture limit and the orbit capacity it implies
+    // (MAX_TEXTURE_SIZE^2 samples). Zero until the context exists.
+    this.maxOrbitTextureSize = 0;
+    this.maxOrbitLength = 0;
+    // Counted, never inferred: how many reference values the last deep draw could
+    // NOT transport because the budget exceeded the device's orbit capacity. Zero in
+    // production here (capacity is 67 108 864 on this host, 100 001 needed); a
+    // non-zero value means the deep lane's budget was reduced to what the transport
+    // could carry, and it is observable rather than hidden behind a frozen texel.
+    this.orbitShortfall = 0;
     // P2: the arbitrary-precision (BigInt) reference orbit. `orbitMode` selects
     // the ORBIT SOURCE for a deep view whose exact centre is available:
     //   'bigint'  (production default) -- the Worker orbit at the working precision
@@ -148,12 +167,20 @@ export class WebGLFractalRenderer {
     const gl = this.gl;
     // P1: the reference orbit travels to the GPU as a FLOAT texture, one texel per
     // iteration. The committed probe measured this transport EXACT here (NEAREST
-    // round-trips 53 significant bits; MAX_TEXTURE_SIZE = 8192 = the shipped cap;
-    // NPOT fine), so the only question is the arithmetic, not the transport. A
-    // context without OES_texture_float keeps the plain float32 Mandelbrot loop —
-    // there is no way to upload a float64 orbit without it.
+    // round-trips 53 significant bits; NPOT fine). ITER-CAP decoupled the orbit from
+    // `MAX_ITER`: the texture's ROW width is the device's MAX_TEXTURE_SIZE and it may
+    // have up to MAX_TEXTURE_SIZE rows, so the transport carries
+    // MAX_TEXTURE_SIZE^2 samples (8192 * 8192 = 67 108 864 here) — far more than the
+    // 100 001 a 100000-iteration budget needs. A context without OES_texture_float
+    // keeps the plain float32 Mandelbrot loop — there is no way to upload a float64
+    // orbit without it.
     this.hasFloatTexture = !!(gl.getExtension('OES_texture_float'));
-    this.maxOrbitWidth = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE) || 0, FractalKernel.MAX_ITER);
+    this.maxOrbitTextureSize = Math.max(0, gl.getParameter(gl.MAX_TEXTURE_SIZE) || 0);
+    // The orbit CAPACITY the device can carry. NOT tied to MAX_ITER: the cap is a
+    // UI/iteration ceiling, the texture limit is a transport one, and conflating the
+    // two is what froze the reference. `maxIter + 1` values are needed, so a budget is
+    // transportable exactly when it is below this.
+    this.maxOrbitLength = this.maxOrbitTextureSize * this.maxOrbitTextureSize;
     // Vertex shader (same as before)
     const vertSrc = `
       attribute vec2 a_position;
@@ -280,12 +307,11 @@ export class WebGLFractalRenderer {
           y = 0.0;
           for (int i = 0; i < MAX_ITER; i++) {
             if (iter >= u_maxIter) break;
-            // Z_m. m can only exceed the orbit when iter has reached u_maxIter,
-            // which the break above has already caught; the clamp is a guard for
-            // the single iteration where the orbit texture is one texel short of
-            // maxIter + 1 (MAX_TEXTURE_SIZE == MAX_ITER == 8192).
-            float om = min(float(m), u_orbitW - 1.0);
-            vec4 o = texture2D(u_orbit, vec2((om + 0.5) / u_orbitW, 0.5));
+            // Z_m. m can only exceed the transported length when the transport
+            // cannot cover the budget, which the caller prevents by reducing the
+            // budget to the covered length (and recording orbitShortfall); inside
+            // the budget this clamp never binds, so the reference never freezes.
+            vec4 o = sampleOrbit(float(m));
             Zx = o.r;
             Zy = o.g;
             Z2 = Zx * Zx + Zy * Zy;
@@ -294,8 +320,7 @@ export class WebGLFractalRenderer {
             dzx = nwx;
             dzy = nwy;
             m++;
-            float om2 = min(float(m), u_orbitW - 1.0);
-            vec4 o2 = texture2D(u_orbit, vec2((om2 + 0.5) / u_orbitW, 0.5));
+            vec4 o2 = sampleOrbit(float(m));
             Zx = o2.r;
             Zy = o2.g;
             x = Zx + S * dzx;
@@ -365,9 +390,26 @@ export class WebGLFractalRenderer {
       // P1: the reference orbit as a float texture (one texel per reference
       // iteration, .r = Re Z_m, .g = Im Z_m) and the diagnostic selector. u_diag is
       // 0 for every production draw; the glitch pin is the only caller that sets 1.
+      // ITER-CAP: the texture is 2D. u_orbitW is the ROW width (<=
+      // MAX_TEXTURE_SIZE) and u_orbitRows the row count, so the transport carries
+      // u_orbitW * u_orbitRows samples; u_orbitLen is how many of them are filled
+      // (maxIter + 1). A 1D texture capped at MAX_TEXTURE_SIZE silently froze the
+      // reference past 8192 — the failure this layout removes.
       uniform sampler2D u_orbit;
       uniform float u_orbitW;
+      uniform float u_orbitRows;
+      uniform float u_orbitLen;
       uniform int u_diag;
+      // The reference value Z_m: index m, clamped only as a defence (the transport
+      // covers maxIter + 1 values, so m is always inside it). The row is
+      // floor(m / W) and the column m - row*W; both are exact in float32 for the
+      // integer indices here (m < 2^24).
+      vec4 sampleOrbit(float m) {
+        float om = min(m, u_orbitLen - 1.0);
+        float orow = floor(om / u_orbitW);
+        float ocol = om - orow * u_orbitW;
+        return texture2D(u_orbit, vec2((ocol + 0.5) / u_orbitW, (orow + 0.5) / u_orbitRows));
+      }
       void main() {
         float x0 = u_centerX + (v_uv.x - 0.5) * u_scale * u_aspect;
         float y0 = u_centerY + ((1.0 - v_uv.y) - 0.5) * u_scale;
@@ -661,6 +703,8 @@ ${mandelbrotBody}
       // P1: the reference-orbit sampler and the diagnostic selector.
       orbit: gl.getUniformLocation(program, 'u_orbit'),
       orbitW: gl.getUniformLocation(program, 'u_orbitW'),
+      orbitRows: gl.getUniformLocation(program, 'u_orbitRows'),
+      orbitLen: gl.getUniformLocation(program, 'u_orbitLen'),
       diag: gl.getUniformLocation(program, 'u_diag'),
     });
     this.uPerturb = uniformSet(this.program);
@@ -761,22 +805,25 @@ ${mandelbrotBody}
   //
   // The result is uploaded as an RGBA FLOAT texture, one texel per reference
   // iteration, .r = Re Z_k and .g = Im Z_k. The committed probe measured this
-  // transport EXACT (NEAREST round-trips 53 significant bits; MAX_TEXTURE_SIZE ==
-  // the shipped cap) and measured a hi/lo split of the orbit to be INERT under a
-  // float32 delta, so one float32 word per component is what is stored.
+  // transport EXACT (NEAREST round-trips 53 significant bits) and measured a hi/lo
+  // split of the orbit to be INERT under a float32 delta, so one float32 word per
+  // component is what is stored. ITER-CAP stores it in a 2D texture (row width
+  // <= MAX_TEXTURE_SIZE, up to MAX_TEXTURE_SIZE rows) so the transport can carry
+  // maxIter + 1 values for any budget below MAX_TEXTURE_SIZE^2.
   ensureReferenceOrbit(centerX, centerY, maxIter) {
     const gl = this.gl;
     if (!gl || this.destroyed || gl.isContextLost() || !this.hasFloatTexture) return;
     const key = centerX + '|' + centerY + '|' + maxIter;
     if (this._orbitKey === key && this._orbitTex) return;
-    // maxIter + 1 values are needed (Z_0 .. Z_maxIter); at the shipped cap that is
-    // one more than MAX_TEXTURE_SIZE, so the last value is clamped in the shader.
-    const width = Math.max(1, Math.min(maxIter + 1, this.maxOrbitWidth));
-    const data = new Float32Array(width * 4);
-    const zx = new Float64Array(width);
-    const zy = new Float64Array(width);
+    // maxIter + 1 values are needed (Z_0 .. Z_maxIter). The layout is 2D, so all of
+    // them fit for any budget the device's texture limit can carry.
+    const length = this.orbitTransportLength(maxIter);
+    const layout = this.orbitTextureLayout(length);
+    const data = new Float32Array(layout.width * layout.rows * 4);
+    const zx = new Float64Array(length);
+    const zy = new Float64Array(length);
     let x = 0, y = 0;
-    for (let k = 0; k < width; k++) {
+    for (let k = 0; k < length; k++) {
       zx[k] = x;
       zy[k] = y;
       const xt = x * x - y * y + centerX;
@@ -788,16 +835,43 @@ ${mandelbrotBody}
     if (!this._orbitTex) this._orbitTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this._orbitTex);
     // NPOT is fine with CLAMP_TO_EDGE + NEAREST (measured on this host).
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, 1, 0, gl.RGBA, gl.FLOAT, data);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, layout.width, layout.rows, 0, gl.RGBA, gl.FLOAT, data);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     this._orbitKey = key;
-    this._orbitW = width;
+    this._orbitW = layout.width;
+    this._orbitRows = layout.rows;
+    this._orbitLen = length;
     this._orbitZx = zx;
     this._orbitZy = zy;
     this.orbitComputations++;
+  }
+
+  // --- ITER-CAP: the 2D orbit transport geometry -------------------------------
+  // How many reference values the transport can carry. The budget needs maxIter + 1;
+  // the device carries MAX_TEXTURE_SIZE^2. NOT a function of MAX_ITER.
+  orbitCapacity() {
+    return this.maxOrbitLength;
+  }
+
+  // The number of reference values actually transported for a budget: everything the
+  // budget needs, capped only by the device's capacity. `orbitShortfall` records the
+  // difference when the capacity binds (never on this host), so a reduced budget is
+  // announced rather than hidden behind a frozen reference.
+  orbitTransportLength(maxIter) {
+    return Math.max(1, Math.min(maxIter + 1, this.maxOrbitLength || (maxIter + 1)));
+  }
+
+  // The 2D layout for `length` values: as wide as the device allows, then rows.
+  // A length that fits in one row is exactly the old 1D texture (rows = 1), so the
+  // shallow lane's transport is unchanged.
+  orbitTextureLayout(length) {
+    const s = this.maxOrbitTextureSize || 1;
+    const width = Math.max(1, Math.min(length, s));
+    const rows = Math.max(1, Math.ceil(length / width));
+    return { width: width, rows: rows };
   }
 
   // The cached orbit, as plain arrays, for the suite's float64 perturbation
@@ -807,7 +881,12 @@ ${mandelbrotBody}
     return {
       zx: Array.from(this._orbitZx),
       zy: Array.from(this._orbitZy),
+      // `width` is the TEXTURE ROW width; `length` is how many reference values were
+      // transported (the quantity a reference must iterate over), and `rows` the row
+      // count. `width * rows >= length`, and only the first `length` are filled.
       width: this._orbitW,
+      rows: this._orbitRows,
+      length: this._orbitLen,
       key: this._orbitKey,
     };
   }
@@ -858,7 +937,10 @@ ${mandelbrotBody}
       centerY: centerYStr,
       maxIter: maxIter,
       bits: bits,
-      width: this.maxOrbitWidth,
+      // ITER-CAP: the number of reference VALUES the draw needs (maxIter + 1),
+      // capped only by the device's texture capacity — NOT by MAX_TEXTURE_SIZE, so
+      // the Worker really computes the long orbit a 100000 budget needs.
+      width: this.orbitTransportLength(maxIter),
       // TEST-ONLY transition-corruption injection (default 0), carried to the
       // Worker because the control is read where the orbit is actually computed.
       control: this._lastRequestControl,
@@ -876,26 +958,31 @@ ${mandelbrotBody}
     if (msg.type !== 'orbit' || msg.key !== this._bigOrbitPending) return;
     this._bigOrbitPending = null;
     // Upload exactly as the float64 lane does: one float texel per iteration,
-    // .r = Re Z_k, .g = Im Z_k. The BigInt module has already produced the
-    // float32 words (the measured-sufficient transport).
+    // .r = Re Z_k, .g = Im Z_k, in the SAME 2D layout. The BigInt module has already
+    // produced the float32 words (the measured-sufficient transport) for the number
+    // of values the draw asked for.
     const gl = this.gl;
-    const width = Math.max(1, Math.min(msg.width, this.maxOrbitWidth));
+    const capacity = this.maxOrbitLength || msg.width;
+    const length = Math.max(1, Math.min(msg.width, capacity));
+    const layout = this.orbitTextureLayout(length);
     if (!gl || this.destroyed || gl.isContextLost()) return;
     if (!this._orbitTex) this._orbitTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, this._orbitTex);
-    const data = new Float32Array(width * 4);
-    for (let k = 0; k < width; k++) {
+    const data = new Float32Array(layout.width * layout.rows * 4);
+    for (let k = 0; k < length; k++) {
       data[k * 4] = msg.zx[k];
       data[k * 4 + 1] = msg.zy[k];
     }
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, 1, 0, gl.RGBA, gl.FLOAT, data);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, layout.width, layout.rows, 0, gl.RGBA, gl.FLOAT, data);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    this._bigOrbit = { key: msg.key, width: width, bits: msg.bits, escapedAt: msg.escapedAt };
+    this._bigOrbit = { key: msg.key, width: layout.width, rows: layout.rows, length: length, bits: msg.bits, escapedAt: msg.escapedAt };
     this._orbitKey = msg.key;
-    this._orbitW = width;
+    this._orbitW = layout.width;
+    this._orbitRows = layout.rows;
+    this._orbitLen = length;
     this._orbitZx = msg.zx;
     this._orbitZy = msg.zy;
     this.orbitComputations++;
@@ -912,6 +999,8 @@ ${mandelbrotBody}
     return {
       key: this._bigOrbit.key,
       width: this._bigOrbit.width,
+      rows: this._bigOrbit.rows,
+      length: this._bigOrbit.length,
       bits: this._bigOrbit.bits,
       escapedAt: this._bigOrbit.escapedAt,
       mode: this.orbitMode,
@@ -1031,6 +1120,19 @@ ${mandelbrotBody}
       this.usePerturbation = !!(this._orbitTex && this._orbitW > 0);
       if (this.usePerturbation) this.orbitSource = 'float64';
     }
+    // ITER-CAP: the deep lane's budget must FIT the transported reference. The
+    // transport carries `_orbitLen` values and the shader indexes them 0..cap, so
+    // `cap <= _orbitLen - 1` is the honest condition (there is no index the shader
+    // ever has to clamp). On this host the capacity is 67 108 864 against 100 001
+    // needed, so it always holds. If a device's texture limit ever binds, the budget
+    // is REDUCED to what is carried and the difference is recorded in
+    // `orbitShortfall` and reported: a declared ceiling, not a frozen texel.
+    let laneCap = cap;
+    this.orbitShortfall = 0;
+    if (this.usePerturbation && this._orbitLen > 0 && cap > this._orbitLen - 1) {
+      laneCap = this._orbitLen - 1;
+      this.orbitShortfall = cap - laneCap;
+    }
     const program = this.usePerturbation ? this.program : this.plainProgram;
     gl.useProgram(program);
     // Uniform locations belong to the program that was just bound.
@@ -1062,8 +1164,10 @@ ${mandelbrotBody}
     gl.uniform1f(U.aspect, this.canvas.width / this.canvas.height);
     // The shader's loop bound is the constant MAX_ITER; clamping the uniform to the
     // same ONE constant is what makes `iter == u_maxIter` (the "inside" test) mean
-    // the same thing on the GPU as it does in the kernel (S3/B5).
-    gl.uniform1i(U.maxIter, cap);
+    // the same thing on the GPU as it does in the kernel (S3/B5). The deep lane
+    // passes `laneCap`, which equals `cap` unless the orbit transport is the binding
+    // constraint (see above); the plain lane has no orbit and always uses `cap`.
+    gl.uniform1i(U.maxIter, this.usePerturbation ? laneCap : cap);
     gl.uniform1i(U.colorScheme, colorSchemeIdx);
     gl.uniform1f(U.colorOffset, this.colorOffset || 0);
     // Fractal type index comes from the kernel's FRACTAL_TYPES table (app.js
@@ -1083,8 +1187,12 @@ ${mandelbrotBody}
       gl.bindTexture(gl.TEXTURE_2D, this._orbitTex);
       gl.uniform1i(U.orbit, 0);
       gl.uniform1f(U.orbitW, this._orbitW);
+      gl.uniform1f(U.orbitRows, this._orbitRows || 1);
+      gl.uniform1f(U.orbitLen, this._orbitLen || 1);
     } else {
       gl.uniform1f(U.orbitW, 0.0);
+      gl.uniform1f(U.orbitRows, 1.0);
+      gl.uniform1f(U.orbitLen, 0.0);
     }
     // The attribute index is looked up per program: the two lanes share the vertex
     // shader, but nothing guarantees the linker gives `a_position` the same index in
@@ -1298,6 +1406,8 @@ ${mandelbrotBody}
     this._orbitTex = null;
     this._orbitKey = null;
     this._orbitW = 0;
+    this._orbitRows = 0;
+    this._orbitLen = 0;
     this._bigOrbit = null;
     this._bigOrbitPending = null;
     this.gl = null;

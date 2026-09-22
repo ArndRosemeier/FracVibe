@@ -397,7 +397,9 @@ test('P2 pin 2: the arbitrary-precision orbit is built once per (exact centre, b
   expect(first.spawns, 'exactly ONE long-lived Worker, not one per view').toBe(1);
   expect(first.info, 'the orbit must be observable').not.toBe(null);
   expect(first.info.bits).toBe(await page.evaluate((s) => window.__fv.bigOrbitBitsForScale(s), DEPTH_SCALE));
-  expect(first.info.width).toBe(Math.min(first.cap + 1, 8192));
+  // ITER-CAP: the Worker now returns the FULL reference the budget needs (cap + 1
+  // values) in a 2D texture, not the 8192 clamped by MAX_TEXTURE_SIZE.
+  expect(first.info.length, 'the transported BigInt reference covers the budget').toBe(first.cap + 1);
 
   // Five re-draws of the SAME view build NOTHING — counted, not inferred.
   const repeated = await page.evaluate(() => {

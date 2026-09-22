@@ -109,8 +109,17 @@ test('S3 pin 2: slider max, kernel cap and shader loop bound are ONE constant', 
 });
 
 // --- pin 1 ---------------------------------------------------------------------
+//
+// ITER-CAP: this pin renders a CPU AND a GPU frame at `maxIter = the cap`, and the
+// cap is now 100000 (was 8192) — ~12x the work per pixel, on a view that is
+// deliberately interior-heavy so most pixels run the FULL budget. A small viewport
+// keeps the same comparison (every pixel, CPU vs GPU, at the cap) affordable; the
+// pin's contract is the bound at the cap, not the resolution.
 
-test('S3 pin 1 (B5): at maxIter = the cap, GPU and CPU render the same set', async ({ page }) => {
+test.describe('S3 pin 1 at the raised cap', () => {
+  test.use({ viewport: { width: 96, height: 72 } });
+
+  test('S3 pin 1 (B5): at maxIter = the cap, GPU and CPU render the same set', async ({ page }) => {
   const pageErrors = [];
   page.on('pageerror', (err) => pageErrors.push(String(err)));
   await page.goto('./', { waitUntil: 'domcontentloaded' });
@@ -213,6 +222,7 @@ test('S3 pin 1 (B5): at maxIter = the cap, GPU and CPU render the same set', asy
   expect(metrics.meanAbs, 'mean per-channel |CPU - GPU| (0-255)').toBeLessThan(6);
   expect(metrics.bigFrac, 'fraction of pixels off by more than 48').toBeLessThan(0.06);
   expect(pageErrors).toEqual([]);
+  });
 });
 
 // --- pin 3 ---------------------------------------------------------------------
