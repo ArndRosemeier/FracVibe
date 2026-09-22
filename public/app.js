@@ -1577,8 +1577,9 @@ function startGpuChain() {
 // coarsest level is drawn synchronously, the level boundary yields, and the next
 // animation frame arrives before the chain can converge, so nothing is ever
 // finished and the image BOUNCES. MEASURED on the pre-fix build over one full
-// startup animation (64x48, SwiftShader): 263 GPU passes across 110 view
-// generations, 109 abandoned — i.e. one chain per frame, almost all superseded.
+// startup animation: 110 view generations with 108-109 of them ABANDONED and
+// 263-297 GPU passes — the dispatcher's live run and this writer's own RED
+// control (SwiftShader, software numbers; NOT hardware numbers).
 //
 // The fix uses the state the app already keeps: while the animation is DRIVING
 // the view (`zoomAnimationSettled === false`) a view change costs exactly ONE
