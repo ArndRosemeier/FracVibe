@@ -35,6 +35,10 @@
 //                  driver that silently fails readback makes every other number a
 //                  lie.
 //   * COST       — renderTimeMs() at three depths, the first real-hardware timings.
+//                  The reading is taken AFTER the app's own completion signal
+//                  (`__fv.whenRenderIdle()`), i.e. after the full-resolution pass
+//                  of the refinement chain; a step whose full-image render does not
+//                  complete is an explicit SKIP, never a number (see the cost loop).
 //
 // DESIGN CONSTRAINTS.
 //   * It integrates with the app ONLY through the frozen `window.__fv` observables
@@ -72,6 +76,11 @@ const COST_STEPS = [
   { id: 'cost_1e-6', scale: 1e-6 },
   { id: 'cost_1e-8', scale: 1e-8 },
 ];
+
+// How long ONE cost step may spend waiting for its full-resolution pass. A deep
+// full-image pass on a software rasteriser can run to tens of seconds; past this
+// budget the step is reported as an explicit SKIP rather than as a stale number.
+const COST_SETTLE_TIMEOUT_MS = 60000;
 
 // The known double-single values. 1 + 2^-25 rounds to 1.0 in f32, so its exact
 // TwoSum residual is 2^-25 (representable). 1 + 2^-12 squared is a Dekker classic:
@@ -1352,21 +1361,64 @@ async function runBattery() {
             deepFail('app_readback', 'threw: ' + errText(err));
           }
 
-          // (4) cost at three depths, through the real render path.
+          // (4) cost at three depths, through the real render path, read AFTER the
+          // full-image pass completes.
+          //
+          // THE DEFECT THIS REPLACES (DECISIONS 105; measured on the owner's D3D11
+          // box AND on this SwiftShader host): the old loop called
+          // `fv.renderWebGL()` and read `fv.renderTimeMs()` in the SAME synchronous
+          // turn. `renderWebGL()` starts a coarse-to-fine refinement CHAIN: it
+          // applies the coarsest (step-8) level synchronously and yields the rest as
+          // macrotasks, and `lastRenderDuration` — the scalar behind
+          // `renderTimeMs()` — is assigned only when the chain COMPLETES, in its
+          // step-1 branch. Nothing yields inside the loop, so no chain ever
+          // completed, and all three steps read the SAME stale scalar left by the
+          // last render that finished before the loop: identical to the decimal on
+          // two unrelated drivers, with `passes=0` because the full-resolution pass
+          // had not run. A wrong number that looks right is worse than a missing
+          // one — the owner diffed those two runs and believed them.
+          //
+          // MEASURED on this host before the change (1000x700, SwiftShader): right
+          // after `renderWebGL()` the readout was 41.7 ms with passesDelta=0 and a
+          // live `gpuJobToken()`; after the completion signal the same step measured
+          // 69.8 ms with passesDelta=1.
+          //
+          // So each step DRIVES the real path (`setDeepView` + `renderWebGL`) and
+          // then WAITS on the app's own completion signal (`__fv.whenRenderIdle()`,
+          // the resolver the chain itself settles) — never a fixed sleep. A step
+          // that does not complete inside the budget, or whose completion applied no
+          // full-image pass, is an explicit SKIP with its reason: a full-image GPU
+          // render was not measurable from here, and saying so beats inventing a
+          // number.
           for (const step of COST_STEPS) {
             const id = step.id;
             try {
               fv.setDeepView({ centerX: FLOAT_DEEP_X, centerY: FLOAT_DEEP_Y, scale: step.scale });
               const passesBefore = fv.fullImagePasses ? fv.fullImagePasses() : null;
               fv.renderWebGL();
+              // The signal is obtained AFTER the render request, so it cannot resolve
+              // against a chain that was already idle.
+              const settle = (typeof fv.whenRenderIdle === 'function') ? fv.whenRenderIdle() : null;
+              const settled = settle
+                ? await Promise.race([settle.then(() => true), sleep(COST_SETTLE_TIMEOUT_MS).then(() => false)])
+                : false;
               const ms = fv.renderTimeMs();
               const passesAfter = fv.fullImagePasses ? fv.fullImagePasses() : null;
               const src = fv.orbitSource();
               deepSources.push(src);
               const passes = (passesBefore !== null && passesAfter !== null) ? (passesAfter - passesBefore) : '?';
-              const value = ms.toFixed(1) + ' ms (scale=' + step.scale + ' capIter=' + fv.maxIter() + ' lane=' + src + ' passes=' + passes + ')';
-              if (typeof ms === 'number' && isFinite(ms) && ms >= 0) deepOk(id, value);
-              else deepFail(id, 'renderTimeMs() is not a finite number: ' + value);
+              const ctx = 'scale=' + step.scale + ' capIter=' + fv.maxIter() + ' lane=' + src + ' passes=' + passes;
+              if (!settle) {
+                deepSkip(id, 'this build exposes no completion signal (__fv.whenRenderIdle), so a full-image render cannot be timed from here: ' + ctx);
+              } else if (!settled) {
+                deepSkip(id, 'the full-image render did not complete within ' + (COST_SETTLE_TIMEOUT_MS / 1000) + 's, so renderTimeMs() would report a stale value: ' + ctx);
+              } else if (typeof passes !== 'number' || passes < 1) {
+                deepSkip(id, 'the render completed without applying a full-image pass, so the reading would not be a full image: ' + ctx);
+              } else if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) {
+                deepFail(id, 'renderTimeMs() is not a finite number: ' + ms + ' ms (' + ctx + ')');
+              } else {
+                deepOk(id, ms.toFixed(1) + ' ms (' + ctx + ')');
+              }
             } catch (err) {
               deepFail(id, 'threw: ' + errText(err));
             }

@@ -39,6 +39,65 @@ const GROUPS = [
 ];
 const EXPECTED_ITEMS = GROUPS.flatMap((g) => g.ids);
 
+// The three cost items, and the reason this spec checks them by hand rather than
+// only structurally. The owner diffed two runs and believed the `cost:` triple
+// (DECISIONS 105): on his RTX 5070/D3D11 and on this host's SwiftShader it read one
+// identical number for 1e-4, 1e-6 and 1e-8 — to the decimal, on two unrelated
+// drivers, with `passes=0`. The cause was that the loop read `renderTimeMs()`
+// (a scalar written when a refinement chain COMPLETES) in the same synchronous turn
+// it called `renderWebGL()`, which only applies the coarsest level; so all three
+// steps read the same stale value. The instrument could not measure the frame it
+// claimed. The assertion below is STRUCTURE/VARIANCE-based — it never asserts a
+// vendor value — so it holds on hardware and on software alike.
+const COST_IDS = ['cost_1e-4', 'cost_1e-6', 'cost_1e-8'];
+
+// A measured cost item must be `"<ms> ms (scale=… capIter=… lane=… passes=…)"`.
+const COST_MEASURED_RE = /^([0-9]+(?:\.[0-9]+)?) ms \(scale=([^ ]+) capIter=([0-9]+) lane=([^ ]+) passes=([^ )]+)\)$/;
+const COST_SKIP_RE = /^(SKIP|FAIL) \((.+)\)$/;
+
+// Parse and CHECK the three cost items. Throws on a dishonest readout.
+function assertCostHonesty(items) {
+  const parsed = COST_IDS.map((id) => {
+    const it = items.find((x) => x.id === id);
+    expect(it, id + ' must be present in the report').toBeTruthy();
+    const skip = COST_SKIP_RE.exec(it.value);
+    if (skip) {
+      // The honest alternative to a bad number is a stated reason, never a blank.
+      expect(skip[2].trim().length, id + ': a SKIP/FAIL cost item must state a non-empty reason, got: ' + it.value)
+        .toBeGreaterThan(0);
+      return { id: id, measured: false, reason: skip[2] };
+    }
+    const m = COST_MEASURED_RE.exec(it.value);
+    expect(m, id + ': a measured cost item must read "<ms> ms (scale=… capIter=… lane=… passes=…)", got: ' + it.value)
+      .toBeTruthy();
+    // A measured item is only a FULL-IMAGE reading if a full-image pass actually
+    // ran. The observed defect reported `passes=0`, i.e. it timed nothing.
+    expect(Number(m[5]), id + ': a measured cost item must report at least one full-image pass, got passes=' + m[5])
+      .toBeGreaterThanOrEqual(1);
+    return { id: id, measured: true, ms: parseFloat(m[1]), capIter: m[3], lane: m[4] };
+  });
+
+  const measured = parsed.filter((p) => p.measured);
+  // THE PIN. Three renders of the same view at DIFFERENT iteration budgets/lanes
+  // cannot cost the same number of milliseconds to the decimal. When every step was
+  // measured and the setups differ, the timings must vary; an identical triple is
+  // the stale-scalar bug, not a measurement. When a step could not be measured it
+  // is a SKIP whose reason the branch above already required to be non-empty, so
+  // the pin holds on a machine too slow to render the deep steps in budget.
+  if (measured.length === parsed.length) {
+    const setups = new Set(measured.map((p) => p.capIter + '/' + p.lane));
+    expect(setups.size, 'the three cost steps must not all share one setup (capIter/lane); the instrument must vary the depth')
+      .toBeGreaterThan(1);
+    const distinct = new Set(measured.map((p) => p.ms));
+    expect(distinct.size, 'the three cost items must NOT all report the same ms value: three independent renders at '
+      + 'different capIter/lane cannot be equal to the decimal, so an identical triple means the readout timed a stale '
+      + 'scalar instead of the frame. Read: '
+      + measured.map((p) => p.id + '=' + p.ms + 'ms@capIter=' + p.capIter + '/lane=' + p.lane).join(' '))
+      .toBeGreaterThan(1);
+  }
+  return parsed;
+}
+
 // Values that must never appear in a report the owner reads.
 const FORBIDDEN_SUBSTRINGS = ['undefined', 'NaN', '[object Object]'];
 
@@ -121,12 +180,23 @@ function assertStructure(report, consoleTexts) {
   expect(report.items.map((it) => it.id)).toEqual(EXPECTED_ITEMS);
   expect(report.counts).toEqual(counted);
   expect(report.errors, 'the battery must report no internal errors').toEqual([]);
+
+  // (7) THE COST PIN (DECISIONS 105): the three cost items must be MEASURED
+  // full-image renders that actually differ, or explicit SKIPs with a reason —
+  // never three identical plausible numbers.
+  const cost = assertCostHonesty(report.items);
+  console.log('\nCOST-READOUT ' + cost.map((c) => c.measured
+    ? c.id + '=' + c.ms + 'ms@capIter=' + c.capIter + '/lane=' + c.lane
+    : c.id + '=' + c.reason).join(' | ') + '\n');
   return parsed;
 }
 
 test.describe('GPU diagnostic (hardware-certification instrument)', () => {
   test('the Test button prints one structurally complete report and raises no error', async ({ page }) => {
-    test.setTimeout(180_000);
+    // The battery now WAITS for each cost step's full-resolution pass (the honest
+    // measurement, DECISIONS 105): ~25 s of extra work on this software rasteriser,
+    // more under load, so the timeout is sized for that and not for the old loop.
+    test.setTimeout(300_000);
     const consoleTexts = [];
     const consoleErrors = [];
     const pageErrors = [];
@@ -149,7 +219,7 @@ test.describe('GPU diagnostic (hardware-certification instrument)', () => {
     // running state is observable before it finishes.
     await expect(status, 'the status reports that it is running').toHaveAttribute('data-state', 'running');
 
-    await expect(status, 'the status ends done').toHaveAttribute('data-state', 'done', { timeout: 150_000 });
+    await expect(status, 'the status ends done').toHaveAttribute('data-state', 'done', { timeout: 240_000 });
     await expect(status).toContainText('done — see console');
 
     const report = await page.evaluate(() => window.__gpuDiagnostic.lastReport());
@@ -167,7 +237,8 @@ test.describe('GPU diagnostic (hardware-certification instrument)', () => {
   });
 
   test('a second press is safe (re-entry is refused, a later press reruns)', async ({ page }) => {
-    test.setTimeout(180_000);
+    // TWO full batteries, each with the awaited cost passes (see test 1).
+    test.setTimeout(420_000);
     const consoleTexts = [];
     const pageErrors = [];
     page.on('console', (msg) => {
@@ -187,7 +258,7 @@ test.describe('GPU diagnostic (hardware-certification instrument)', () => {
       window.__gpuDiagnostic.onTestClick();
       window.__gpuDiagnostic.onTestClick();
     });
-    await expect(status).toHaveAttribute('data-state', 'done', { timeout: 150_000 });
+    await expect(status).toHaveAttribute('data-state', 'done', { timeout: 240_000 });
     // Wait for the ONE block the first invocation prints; a refused re-entry must
     // never print a second, so this also fails if the guard did not hold.
     await expect.poll(() => consoleTexts.length, { timeout: 10_000 }).toBe(1);
@@ -199,7 +270,7 @@ test.describe('GPU diagnostic (hardware-certification instrument)', () => {
     // A later press reruns the whole battery and prints a fresh, complete block.
     await page.locator('#gpuDiagBtn').click();
     await expect
-      .poll(() => consoleTexts.length, { timeout: 150_000 })
+      .poll(() => consoleTexts.length, { timeout: 240_000 })
       .toBe(2);
     await expect(status).toHaveAttribute('data-state', 'done');
     const second = await page.evaluate(() => window.__gpuDiagnostic.lastReport());
@@ -250,5 +321,55 @@ test.describe('GPU diagnostic (hardware-certification instrument)', () => {
     };
     expect(() => assertStructure(undefinedReport, badValueLines.join('\n')),
       "an 'undefined' item value must be rejected").toThrow();
+  });
+
+  // NON-VACUITY OF THE COST PIN: feed assertCostHonesty the exact readout the owner
+  // reported, and the intermediate shapes, and require each to be rejected. This
+  // runs no browser: it proves the cost assertion itself is sensitive, independently
+  // of what this host's GPU happens to produce.
+  test('the cost-honesty pin is not vacuous: a flat/stale readout is rejected', async () => {
+    const mk = (ms, passes, capIter, lane) => ({
+      id: '',
+      value: ms + ' ms (scale=1e-6 capIter=' + capIter + ' lane=' + lane + ' passes=' + passes + ')',
+    });
+    const withIds = (vals) => vals.map((v, i) => ({ ...v, id: COST_IDS[i] }));
+
+    // ARM A — the required sensitive case: three DIFFERENT setups, three IDENTICAL
+    // ms values, each claiming a full-image pass. Only the variance clause can
+    // reject this, so a green here would mean the pin is vacuous.
+    const identical = withIds([
+      mk(72.5, 1, 512, 'none'),
+      mk(72.5, 1, 6144, 'float64'),
+      mk(72.5, 1, 8192, 'float64'),
+    ]);
+    expect(() => assertCostHonesty(identical),
+      'three equal timings across three different capIter/lane setups must be rejected').toThrow(/must NOT all report the same/);
+
+    // ARM B — the OWNER-OBSERVED report verbatim in shape: identical ms AND
+    // passes=0. Rejected independently of the variance clause.
+    const ownerObserved = withIds([
+      mk(72.5, 0, 512, 'none'),
+      mk(72.5, 0, 6144, 'float64'),
+      mk(72.5, 0, 8192, 'float64'),
+    ]);
+    expect(() => assertCostHonesty(ownerObserved),
+      "the owner's exact flat readout (identical ms, passes=0) must be rejected").toThrow();
+
+    // ARM C — the honest alternative must not be fakeable: a SKIP with an EMPTY
+    // reason is rejected, while a SKIP with a real reason is accepted.
+    const emptyReason = withIds([
+      { id: COST_IDS[0], value: 'SKIP ()' },
+      mk(10.0, 1, 6144, 'float64'),
+      mk(20.0, 1, 8192, 'float64'),
+    ]);
+    expect(() => assertCostHonesty(emptyReason),
+      'a SKIP with an empty reason must be rejected').toThrow();
+    const realReason = withIds([
+      { id: COST_IDS[0], value: 'SKIP (the full-image render did not complete within 60s, so renderTimeMs() would report a stale value: scale=1e-4 capIter=512 lane=none passes=0)' },
+      mk(10.0, 1, 6144, 'float64'),
+      mk(20.0, 1, 8192, 'float64'),
+    ]);
+    expect(() => assertCostHonesty(realReason),
+      'a SKIP with a stated reason is the honest outcome and must be accepted').not.toThrow();
   });
 });
