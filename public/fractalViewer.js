@@ -49,6 +49,27 @@ function FractalViewer(canvas, infoCallback) {
   this.colorOffset = 0;
   this.dragging = false;
   this.lastMouse = null;
+  // PAN-FROZEN (DECISIONS 109). While a PAN gesture owns the view — a mouse drag
+  // or a one-finger touch drag — the last COMPLETED frame is moved by a compositor
+  // transform on the canvas element and NO render work starts, because at depth a
+  // render per mousemove is hundreds of ms and queues render upon render (the
+  // owner's report). The translate is in CSS pixels, so it tracks the pointer
+  // exactly at any devicePixelRatio; it is reset only when a COMPLETED frame is
+  // drawn (`commitFrozenPan`), never on release, so the panned image stays where
+  // the user left it while the CPU lane computes the next frame. ZOOM paths — the
+  // wheel, a two-finger pinch and the startup animation — are NOT in this set.
+  this._panCanvas = null;               // element whose layer carries the frozen frame
+  this._panGestureCanvas = null;        // element that received the current gesture
+  this._panTranslate = { x: 0, y: 0 };  // CSS px currently applied
+  this._panStart = null;                // client (CSS) px at the gesture's start
+  this._panBase = { x: 0, y: 0 };       // translate the gesture starts from
+  this.panFrozenMoves = 0;              // counted: moves that translated the frame
+  this.panCommits = 0;                  // counted: frozen frames ended by a draw
+  // TEST-ONLY escape hatch (`window.__fv.setPanFreeze`): false restores the
+  // PRE-CHANGE behaviour — a render per mousemove, no frozen frame — through the
+  // SAME handlers, so the pin can measure its failing baseline in-pin. Production
+  // never sets it.
+  this.panFreezeEnabled = true;
   // TOUCH-INPUT: one finger pans, two fingers pinch-zoom about their midpoint.
   // Exactly one of the two gestures owns the view at a time, and adding or
   // lifting a finger RE-SEEDS the state from the fingers that remain, so a pinch
@@ -123,6 +144,11 @@ FractalViewer.prototype.setView = function(view) {
 FractalViewer.prototype.setData = function(iterArray, maxIter) {
   this.imageData = iterArray;
   this.maxIter = maxIter;
+  // A COMPLETED frame has arrived: it is the frame that covers the whole canvas,
+  // so the frozen pan layer is released HERE rather than at gesture end — that is
+  // what keeps the panned image where the user left it until a real frame can
+  // replace it (see `commitFrozenPan`).
+  this.commitFrozenPan();
   this.render();
 };
 
@@ -165,6 +191,94 @@ FractalViewer.prototype.setColorOffset = function(offset) {
 
 FractalViewer.prototype.setOnViewChange = function(cb) {
   this.onViewChange = cb;
+};
+
+// --- PAN-FROZEN (DECISIONS 109) -------------------------------------------------
+// The owner's instruction: "do NOT render while panning. Just move the image thats
+// there and start rendering when the mouse gets off." A PAN gesture is a mouse drag
+// (`dragging`) or a one-finger touch drag (`_touchMode === 'pan'`). A ZOOM gesture —
+// the wheel, a two-finger pinch, the startup animation — is deliberately NOT in this
+// set: the refinement chain's coarse-to-fine behaviour must keep serving zoom
+// (DECISIONS 84-86), which is why the owner's instruction is scoped to pan only.
+//
+// THE MECHANISM: the frame that is on screen is the last COMPLETED one, and it is
+// moved by a CSS `translate` on the canvas that RECEIVED the gesture (the WebGL one
+// by default, the 2D one in CPU mode). A compositor transform costs no raster work
+// and tracks the pointer by construction, so a drag of any length is O(1) work.
+//
+// THE REVEALED STRIP: a translated frame exposes a strip at its leading edge that
+// has no pixels. That is deliberate and is what DECISIONS 109 accepts DURING the
+// drag: filling it would require re-drawing (a readback or a per-move blit, i.e.
+// exactly the render work the instruction forbids) or fabricating edge-extended
+// pixels. The frame is marked NOT SETTLED while it is frozen (`data-fv-pan-frozen`,
+// and the readout/render-time are not updated by a move), and the single render on
+// release covers the whole canvas, so the strip never survives the gesture.
+FractalViewer.prototype.isPanActive = function() {
+  return !!(this.dragging || this._touchMode === 'pan');
+};
+// True while the app must NOT start render work: a pan gesture owns the view AND
+// the freeze is enabled (the test-only baseline disables it).
+FractalViewer.prototype.shouldFreezePan = function() {
+  return !!(this.panFreezeEnabled && this.isPanActive());
+};
+// True from the first pan MOVE until a completed frame is drawn: the last completed
+// frame is currently a translated layer, not a settled frame.
+FractalViewer.prototype.isPanFrozen = function() {
+  return this._panCanvas != null;
+};
+FractalViewer.prototype.getPanTranslate = function() {
+  return { x: this._panTranslate.x, y: this._panTranslate.y };
+};
+// Apply (or clear) the compositor translate on the frozen canvas. `data-fv-pan-frozen`
+// is the observable (and the styling hook) that marks the frame as NOT settled.
+FractalViewer.prototype._applyPanTranslate = function(x, y) {
+  const canvasEl = this._panCanvas;
+  if (!canvasEl || !canvasEl.style) return;
+  this._panTranslate = { x, y };
+  canvasEl.style.transform = (x || y) ? `translate(${x}px, ${y}px)` : '';
+  if (canvasEl.dataset) {
+    if (x || y) canvasEl.dataset.fvPanFrozen = '1';
+    else delete canvasEl.dataset.fvPanFrozen;
+  }
+};
+// Start (or re-start) a pan on `canvasEl`, the element that RECEIVED the gesture.
+// Any frozen frame already on screen becomes the BASE the new gesture moves, so a
+// drag that begins while the CPU lane is still answering continues from where the
+// image is rather than snapping back.
+FractalViewer.prototype.beginPan = function(canvasEl, clientX, clientY) {
+  this._panGestureCanvas = (canvasEl && canvasEl.style)
+    ? canvasEl
+    : (this._panCanvas || this.canvas);
+  this._panBase = { x: this._panTranslate.x, y: this._panTranslate.y };
+  this._panStart = { x: clientX, y: clientY };
+};
+// One pan move: translate the frozen frame by the TOTAL pointer displacement since
+// the gesture began (base + delta) — exact and drift-free however many moves.
+FractalViewer.prototype.movePan = function(clientX, clientY) {
+  if (!this._panStart) return;
+  if (!this._panCanvas) this._panCanvas = this._panGestureCanvas || this.canvas;
+  this._applyPanTranslate(
+    this._panBase.x + (clientX - this._panStart.x),
+    this._panBase.y + (clientY - this._panStart.y),
+  );
+  this.panFrozenMoves++;
+};
+// A completed frame is about to be drawn: the frozen layer has served its purpose,
+// so it is reset. Called from the drawing paths (`setData` here and `renderWebGL` in
+// app.js) and NEVER from a gesture end — that is what keeps the panned image in
+// place until the next frame actually covers the whole canvas. It refuses while a
+// pan is active: a frame that lands mid-drag must not yank the image out from under
+// the drag.
+FractalViewer.prototype.commitFrozenPan = function() {
+  if (this.isPanActive()) return false;
+  const had = this._panCanvas != null;
+  if (had) this._applyPanTranslate(0, 0);
+  this._panCanvas = null;
+  this._panGestureCanvas = null;
+  this._panStart = null;
+  this._panBase = { x: 0, y: 0 };
+  if (had) this.panCommits++;
+  return had;
 };
 
 // --- SHARED VIEW STATE & GENERIC PAN/ZOOM ---
@@ -218,6 +332,7 @@ FractalViewer.prototype.setupEvents = function() {
 FractalViewer.prototype.onMouseDown = function(e) {
   this.dragging = true;
   this.lastMouse = { x: e.clientX, y: e.clientY };
+  if (this.panFreezeEnabled) this.beginPan(e && e.currentTarget, e.clientX, e.clientY);
 };
 
 FractalViewer.prototype.onMouseMove = function(e) {
@@ -228,14 +343,33 @@ FractalViewer.prototype.onMouseMove = function(e) {
   // Pan in CSS pixels (mouse deltas), not device pixels: the drag must move the
   // view by the same amount the pointer moved, at any devicePixelRatio.
   panView(this.view, dx, dy, this.cssWidth, this.cssHeight);
+  if (this.panFreezeEnabled) {
+    // PAN-FROZEN: MOVE the image and start NO render work. The view already holds
+    // this event's final value; the readout follows (it is DOM text, not a render)
+    // and the single render happens on release.
+    this.movePan(e.clientX, e.clientY);
+    if (this.infoCallback) this.infoCallback(this.view);
+    return;
+  }
+  // TEST-ONLY baseline (freeze disabled): the PRE-CHANGE behaviour, one render and
+  // one view-change per mousemove — the failing baseline the pin measures in-pin.
   this.render();
   if (this.infoCallback) this.infoCallback(this.view);
   if (this.onViewChange) this.onViewChange(this.view);
 };
 
 FractalViewer.prototype.onMouseUp = function(e) {
+  const wasDragging = this.dragging;
   this.dragging = false;
   this.canvas.style.cursor = 'grab';
+  // THE ONE RENDER OF A PAN. The view is settled, so it goes through the normal
+  // view-change path and the refinement chain runs HERE (DECISIONS 84-86), which is
+  // also why the frozen frame is not reset here: it stays until that frame is
+  // drawn. `wasDragging` makes it exactly one: the event reaches both the canvas
+  // listener and the viewer's own window listener, and the second call is a no-op.
+  if (!wasDragging || !this.panFreezeEnabled) return;
+  if (this.infoCallback) this.infoCallback(this.view);
+  if (this.onViewChange) this.onViewChange(this.view);
 };
 
 FractalViewer.prototype.onWheel = function(e) {
@@ -289,13 +423,20 @@ FractalViewer.prototype.applyTouchViewChange = function(clamped) {
   if (this.onViewChange) this.onViewChange(this.view);
 };
 
-FractalViewer.prototype._seedPan = function(touch) {
+FractalViewer.prototype._seedPan = function(touch, canvasEl) {
   this._touchMode = 'pan';
   this._touchLast = { x: touch.clientX, y: touch.clientY };
   this._pinchLast = null;
+  if (this.panFreezeEnabled) this.beginPan(canvasEl, touch.clientX, touch.clientY);
 };
 
 FractalViewer.prototype._seedPinch = function(touches) {
+  // PAN -> PINCH: the pan gesture is over and a ZOOM gesture begins. A frozen,
+  // translated layer would make the anchored pinch measure the wrong canvas box, so
+  // the frozen pan is committed here and the view it produced is rendered through
+  // the normal wheel/pinch path. That render belongs to the ZOOM gesture, which the
+  // owner's instruction leaves untouched.
+  const leavesPan = this._touchMode === 'pan' && this.isPanFrozen();
   const a = touches[0];
   const b = touches[1];
   this._touchMode = 'pinch';
@@ -305,11 +446,15 @@ FractalViewer.prototype._seedPinch = function(touches) {
     midX: (a.clientX + b.clientX) / 2,
     midY: (a.clientY + b.clientY) / 2,
   };
+  if (leavesPan) {
+    this.commitFrozenPan();
+    this.applyTouchViewChange(false);
+  }
 };
 
 FractalViewer.prototype.onTouchStart = function(e) {
   if (e.touches.length >= 2) this._seedPinch(e.touches);
-  else if (e.touches.length === 1) this._seedPan(e.touches[0]);
+  else if (e.touches.length === 1) this._seedPan(e.touches[0], e.currentTarget);
   else { this._touchMode = null; this._touchLast = null; this._pinchLast = null; }
   if (e.cancelable) e.preventDefault();
 };
@@ -356,7 +501,7 @@ FractalViewer.prototype.onTouchMove = function(e) {
   }
   if (e.touches.length === 1) {
     if (this._touchMode !== 'pan' || !this._touchLast) {
-      this._seedPan(e.touches[0]);
+      this._seedPan(e.touches[0], e.currentTarget);
       if (e.cancelable) e.preventDefault();
       return;
     }
@@ -368,6 +513,13 @@ FractalViewer.prototype.onTouchMove = function(e) {
     // CSS pixels, exactly like the mouse drag: the view must follow the finger by
     // the distance the finger moved, at any devicePixelRatio.
     panView(this.view, dx, dy, this.cssWidth, this.cssHeight);
+    if (this.panFreezeEnabled) {
+      // PAN-FROZEN: one finger MOVES the image and starts no render work; the one
+      // render is owed on `touchend` (the finger's mouse-up).
+      this.movePan(t.clientX, t.clientY);
+      if (this.infoCallback) this.infoCallback(this.view);
+      return;
+    }
     this.applyTouchViewChange(false);
   }
 };
@@ -377,9 +529,22 @@ FractalViewer.prototype.onTouchMove = function(e) {
 // and the scale is NOT changed by the transition — the common "pinch then drag"
 // gesture would otherwise snap.
 FractalViewer.prototype.onTouchEnd = function(e) {
+  const wasPan = this._touchMode === 'pan';
   if (e.touches.length >= 2) this._seedPinch(e.touches);
-  else if (e.touches.length === 1) this._seedPan(e.touches[0]);
-  else { this._touchMode = null; this._touchLast = null; this._pinchLast = null; }
+  else if (e.touches.length === 1) this._seedPan(e.touches[0], e.currentTarget);
+  else {
+    this._touchMode = null;
+    this._touchLast = null;
+    this._pinchLast = null;
+    // THE ONE RENDER OF A ONE-FINGER PAN, exactly like the mouse-up path. A
+    // `touchcancel` lands here too: the view has already moved, so it owes the same
+    // single render. The frozen frame is NOT reset here — the render that starts is
+    // what replaces it.
+    if (wasPan && this.panFreezeEnabled) {
+      if (this.infoCallback) this.infoCallback(this.view);
+      if (this.onViewChange) this.onViewChange(this.view);
+    }
+  }
   if (e.cancelable) e.preventDefault();
 };
 

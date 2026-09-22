@@ -553,6 +553,12 @@ let lastRenderDuration = 0;
 // --- Accurate Render Timing ---
 let renderStartTime = 0;
 function startFractalCalculationWithTiming() {
+  // PAN-FROZEN (DECISIONS 109): no CPU job starts while a PAN gesture owns the
+  // view. At depth a job per mousemove is precisely the reported symptom, and a job
+  // already running would deliver frames that repaint the frozen canvas. Zoom paths
+  // are unaffected: `shouldFreezePan()` is false for a wheel, a pinch and the
+  // startup animation.
+  if (viewer && typeof viewer.shouldFreezePan === 'function' && viewer.shouldFreezePan()) return;
   // A user-initiated calculation starts with a fresh retry budget; the internal
   // self-heal retry calls `startFractalCalculation` directly so it does not.
   workerFailureRetries = 0;
@@ -764,6 +770,21 @@ function handleWorkerFailure(w, event) {
     return;
   }
   showError(`Render worker failed: ${msg} The last completed image is still shown; change the view to retry.`);
+  // PAN-FROZEN: if a frozen pan is on screen, no frame will ever replace it now.
+  // Release it and repaint the last completed frame, so the revealed strip can
+  // never become a permanent artifact.
+  releaseStrandedFrozenPan();
+}
+
+// PAN-FROZEN (DECISIONS 109): a terminal render failure must never leave the
+// translated frozen layer on screen — the strip at its leading edge has no pixels
+// and would be a PERMANENT artifact if no frame ever covered it. Releasing it
+// repaints the last completed frame at its un-translated position (which is the
+// best available image for a view whose render failed). A no-op unless a frozen
+// layer is actually held, and it refuses while a pan is still active.
+function releaseStrandedFrozenPan() {
+  if (!viewer || typeof viewer.commitFrozenPan !== 'function') return;
+  if (viewer.commitFrozenPan()) viewer.render();
 }
 
 // Kill the live worker. A worker blocked in its synchronous kernel can never read a
@@ -900,6 +921,9 @@ function handleWorkerFrame(msg) {
     // to freeze the render with no message at all.
     progressiveState = null;
     showError('Render worker returned a result that could not be applied (' + errorText(err) + '). The last completed image is still shown.');
+    // PAN-FROZEN: this job is over and no frame will be applied, so a frozen pan
+    // must not be left translated (a permanent blank strip otherwise).
+    releaseStrandedFrozenPan();
   }
 }
 
@@ -965,6 +989,9 @@ function cancelJob() {
 // tests/hygiene.spec.js "no app console output during a scripted interaction").
 function onMouseDown(e) {
   if (viewer && viewer.onMouseDown) viewer.onMouseDown(e);
+  // PAN-FROZEN: a pan has begun, so the work already in flight is stopped before
+  // its next level/frame can be applied (see `suspendRenderForPan`).
+  if (viewer && viewer.shouldFreezePan && viewer.shouldFreezePan()) suspendRenderForPan();
 }
 function onWheel(e) {
   // COARSE-TO-FINE latency instrument. The event's OWN `timeStamp` (same time
@@ -981,6 +1008,9 @@ function onWheel(e) {
 }
 function onMouseMove(e) {
   if (viewer && viewer.onMouseMove) viewer.onMouseMove(e);
+  // Belt-and-braces for the same guarantee as onMouseDown: nothing already running
+  // may apply another pass/frame while the drag owns the view.
+  if (viewer && viewer.shouldFreezePan && viewer.shouldFreezePan()) suspendRenderForPan();
 }
 function onMouseUp(e) {
   if (viewer && viewer.onMouseUp) viewer.onMouseUp(e);
@@ -993,12 +1023,21 @@ function onMouseUp(e) {
 // which is exactly what onTouchEnd does with zero touches.
 function onTouchStart(e) {
   if (viewer && viewer.onTouchStart) viewer.onTouchStart(e);
+  // PAN-FROZEN: a one-finger touch drag is a PAN, with the same no-render contract
+  // as the mouse drag (the owner asked for touch panning too). A two-finger pinch
+  // leaves `shouldFreezePan()` false and is untouched.
+  if (viewer && viewer.shouldFreezePan && viewer.shouldFreezePan()) suspendRenderForPan();
 }
 function onTouchMove(e) {
   if (viewer && viewer.onTouchMove) viewer.onTouchMove(e);
+  if (viewer && viewer.shouldFreezePan && viewer.shouldFreezePan()) suspendRenderForPan();
 }
 function onTouchEnd(e) {
   if (viewer && viewer.onTouchEnd) viewer.onTouchEnd(e);
+  // A pinch that becomes a one-finger pan is a PAN now, so the pinch's in-flight
+  // chain/job is stopped the same way. (When the LAST finger lifts, the viewer has
+  // already fired the single render and is no longer in a pan.)
+  if (viewer && viewer.shouldFreezePan && viewer.shouldFreezePan()) suspendRenderForPan();
 }
 
 function triggerFractalRender() {
@@ -1030,6 +1069,17 @@ attachFractalMouseEvents(canvas);
 attachFractalMouseEvents(canvasWebGL);
 
 // --- Ensure view changes always trigger calculation ---
+// PAN-FROZEN (DECISIONS 109): stop the work that is ALREADY in flight when a pan
+// begins. A GPU refinement chain would keep applying levels through its yields, and
+// a CPU job would keep delivering frames, so both are stopped the moment a drag
+// owns the view. This is a CANCELLATION, not a render — the frozen frame on screen
+// is untouched — and the single render on release restarts the work from the final
+// view.
+function suspendRenderForPan() {
+  if (gpuChain) abandonGpuChain(gpuChain);
+  if (progressiveState) cancelJob();
+}
+
 function onViewChangeHandler() {
   // Abort current calculation for real: terminate the worker that is inside the
   // kernel and respawn it (S2). The old `postMessage({type:'abort'})` was a no-op
@@ -1651,6 +1701,12 @@ function renderAnimationSinglePass() {
 }
 
 function renderWebGL() {
+  // PAN-FROZEN (DECISIONS 109): while a PAN gesture owns the view NO render work
+  // starts — not a chain, not a single pass. The frame on screen is the last
+  // COMPLETED one, moved by the viewer's compositor transform. Zoom paths (wheel,
+  // pinch, the startup animation) are unaffected because `shouldFreezePan()` is
+  // false for them.
+  if (viewer && typeof viewer.shouldFreezePan === 'function' && viewer.shouldFreezePan()) return;
   lastRenderStart = performance.now();
   if (!webglRenderer) {
     // No renderer while GPU mode is the ACTIVE choice means WebGL cannot draw:
@@ -1670,6 +1726,10 @@ function renderWebGL() {
     // the same table the shader's `#define FT_*` values are templated from, so a
     // type name and its GLSL branch can never disagree (S3 pin 3).
     renderingWebGL = true;
+    // A real draw is about to happen and it covers the WHOLE canvas, so any frozen
+    // pan layer is released here — the one place that can replace it. `setData`
+    // does the same for the CPU lane.
+    viewer.commitFrozenPan();
     // COARSE-TO-FINE: one full-resolution pass became a chain of progressively
     // finer passes (see startGpuChain). The first level is applied synchronously so
     // this call still leaves a frame on screen; `whenGpuIdle()` resolves when the
@@ -2160,6 +2220,21 @@ window.__fv = Object.freeze({
   // it completed or was abandoned, how many passes the abandonment SAVED, and the
   // per-level ms. This is the cost curve AND the abandon evidence, measured.
   gpuChainLog: () => gpuChainLog.map((c) => ({ ...c, levels: c.levels.map((l) => ({ ...l })), schedule: c.schedule.slice() })),
+  // --- PAN-FROZEN observables (DECISIONS 109) ----------------------------------
+  // `panning` is true exactly while a PAN gesture owns the view (mouse drag or a
+  // one-finger touch drag) — the state in which NO render work may start.
+  // `panFrozen` is true from the first pan move until a completed frame is drawn:
+  // the last completed frame is a translated layer, NOT a settled frame.
+  panning: () => viewer.isPanActive(),
+  panFrozen: () => viewer.isPanFrozen(),
+  panTranslate: () => viewer.getPanTranslate(),
+  panFrozenMoves: () => viewer.panFrozenMoves,
+  panCommits: () => viewer.panCommits,
+  // TEST-ONLY failing baseline: false restores the PRE-CHANGE behaviour (one
+  // render per mousemove, no frozen frame) through the SAME handlers, so a pin can
+  // measure its baseline in-pin. Production never calls it; the shipped default is
+  // `true`.
+  setPanFreeze: (on) => { viewer.panFreezeEnabled = on !== false; return viewer.panFreezeEnabled; },
   // Resolves when the FULL-RESOLUTION frame of the live view is on screen. A pin
   // that compares pixels must await this: the first level is already up when
   // `renderWebGL()` returns, and it is deliberately not the final one.
