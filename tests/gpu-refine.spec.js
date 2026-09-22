@@ -532,19 +532,19 @@ test('REFINE pin 4: the cost curve — ms to the first useful frame and ms to th
     const lastLevel = r.levels[r.levels.length - 1];
     expect(firstLevel.step, `${r.scale}: the first level must be the coarsest`).toBe(8);
     expect(lastLevel.step, `${r.scale}: the chain must end on the full-resolution image`).toBe(1);
-    // Both ends are MEASURED render-target sizes, not restatements of the step label:
-    // the coarse level really renders a 1/step^2 target and the last level really
-    // renders the whole canvas.
-    expect(firstLevel.w, `${r.scale}: the first level's target must be the canvas width / 8`).toBe(Math.ceil(canvasW / 8));
-    expect(firstLevel.h, `${r.scale}: the first level's target must be the canvas height / 8`).toBe(Math.ceil(canvasH / 8));
-    expect(lastLevel.w, `${r.scale}: the last level must be the whole canvas`).toBe(canvasW);
-    expect(lastLevel.h, `${r.scale}: the last level must be the whole canvas`).toBe(canvasH);
     // THE COST ORDERING, stated structurally and asserted at EVERY depth: the first
     // visible frame is cheaper because it rasterises strictly fewer fragments — 1/8^2
     // of the full image. This is exact and clock-free, so it survives the sub-
     // millisecond regime where the wall clock cannot order the two passes at all.
     expect(firstLevel.w * firstLevel.h, `${r.scale}: the first level must be the cheaper one — fewer fragments than the full image`)
       .toBeLessThan(lastLevel.w * lastLevel.h);
+    // The two ends of that ordering are MEASURED render-target sizes, not restatements
+    // of the step label: the coarse level really renders a 1/step^2 target and the
+    // last level really renders the whole canvas.
+    expect(firstLevel.w, `${r.scale}: the first level's target must be the canvas width / 8`).toBe(Math.ceil(canvasW / 8));
+    expect(firstLevel.h, `${r.scale}: the first level's target must be the canvas height / 8`).toBe(Math.ceil(canvasH / 8));
+    expect(lastLevel.w, `${r.scale}: the last level must be the whole canvas`).toBe(canvasW);
+    expect(lastLevel.h, `${r.scale}: the last level must be the whole canvas`).toBe(canvasH);
 
     if (r.scale <= 1e-8) {
       // WHERE A FULL PASS IS ACTUALLY EXPENSIVE the wall clock CAN resolve the trade,
