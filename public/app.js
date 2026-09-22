@@ -985,6 +985,21 @@ function onMouseMove(e) {
 function onMouseUp(e) {
   if (viewer && viewer.onMouseUp) viewer.onMouseUp(e);
 }
+// TOUCH wrappers. Same shape as the mouse ones — the viewer owns the gesture,
+// app.js only routes the event. There are FOUR because a touch gesture is a
+// sequence, not a single event: start (which finger(s)), move (pan or pinch),
+// end/cancel (re-seed from the fingers that remain). `touchcancel` is the OS
+// taking the gesture away (a call, a notification) and must leave no state behind,
+// which is exactly what onTouchEnd does with zero touches.
+function onTouchStart(e) {
+  if (viewer && viewer.onTouchStart) viewer.onTouchStart(e);
+}
+function onTouchMove(e) {
+  if (viewer && viewer.onTouchMove) viewer.onTouchMove(e);
+}
+function onTouchEnd(e) {
+  if (viewer && viewer.onTouchEnd) viewer.onTouchEnd(e);
+}
 
 function triggerFractalRender() {
   if (webglCheckbox.checked) {
@@ -1000,6 +1015,16 @@ function attachFractalMouseEvents(targetCanvas) {
   targetCanvas.addEventListener('mousemove', onMouseMove);
   targetCanvas.addEventListener('mouseup', onMouseUp);
   targetCanvas.addEventListener('mouseleave', onMouseUp);
+  // TOUCH. `{ passive: false }` is REQUIRED, not stylistic: the handler calls
+  // `preventDefault` to stop the browser scrolling/zooming the PAGE instead of the
+  // fractal, and a passive listener's preventDefault is ignored. The CSS half of
+  // the same contract is `touch-action: none` on both canvases (public/styles.css):
+  // the property is what tells the browser, before any event fires, that these
+  // gestures belong to the canvas.
+  targetCanvas.addEventListener('touchstart', onTouchStart, { passive: false });
+  targetCanvas.addEventListener('touchmove', onTouchMove, { passive: false });
+  targetCanvas.addEventListener('touchend', onTouchEnd, { passive: false });
+  targetCanvas.addEventListener('touchcancel', onTouchEnd, { passive: false });
 }
 attachFractalMouseEvents(canvas);
 attachFractalMouseEvents(canvasWebGL);

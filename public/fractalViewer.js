@@ -49,6 +49,13 @@ function FractalViewer(canvas, infoCallback) {
   this.colorOffset = 0;
   this.dragging = false;
   this.lastMouse = null;
+  // TOUCH-INPUT: one finger pans, two fingers pinch-zoom about their midpoint.
+  // Exactly one of the two gestures owns the view at a time, and adding or
+  // lifting a finger RE-SEEDS the state from the fingers that remain, so a pinch
+  // that becomes a pan (or an interrupted gesture) continues without a jump.
+  this._touchMode = null;   // null | 'pan' | 'pinch'
+  this._touchLast = null;   // { x, y } client CSS px — the one-finger anchor
+  this._pinchLast = null;   // { dist, midX, midY } client CSS px — the two-finger anchor
   this.setupEvents();
   // NOTE: there is deliberately NO window 'resize' listener here. app.js owns the
   // single resize path and calls resize() exactly once (S1/B4).
@@ -172,6 +179,25 @@ export function zoomView(view, zoomFactor) {
   view.scale *= zoomFactor;
 }
 
+// Zoom by `factor` while keeping the world point under the SCREEN offset (sx, sy)
+// fixed, where `factor` is the multiplier applied to `view.scale` (a pinch-in has
+// factor < 1 because zooming in means a smaller scale). `sx`/`sy` are CSS pixels
+// from the canvas CENTRE (positive = right/down).
+// A pinch must move the plane under the user's fingers, not about the canvas
+// centre: with the ONE projection the kernel and the shader share
+// (`FractalKernel.pixelToCoord`), the world point under an offset `o` is
+// `center + o·scale`, so holding it fixed while `scale -> factor·scale` shifts the
+// centre by `o·scale·(1 - factor)`. That is this function — and it is why a pinch
+// whose fingers sit off-centre also PANS. A centre-only zoom here would leave the
+// point under the fingers sliding away, which is the visible defect.
+export function zoomViewAt(view, factor, sx, sy, width, height) {
+  const scale = view.scale;
+  const aspect = width / height;
+  view.centerX += sx * scale / width * aspect * (1 - factor);
+  view.centerY += sy * scale / height * (1 - factor);
+  view.scale = scale * factor;
+}
+
 FractalViewer.prototype.setupEvents = function() {
   this.canvas.addEventListener('mousedown', e => {
     this.onMouseDown(e);
@@ -223,6 +249,138 @@ FractalViewer.prototype.onWheel = function(e) {
   if (this.infoCallback) this.infoCallback(this.view);
   if (clamped && this.onZoomLimit) this.onZoomLimit(this.view);
   if (this.onViewChange) this.onViewChange(this.view);
+};
+
+// --- TOUCH INPUT -----------------------------------------------------------------
+// A phone or tablet has no wheel, so without these handlers the app can PAN (the
+// browser synthesises mouse events from a drag) but cannot ZOOM at all — the one
+// gesture that matters on those devices. The gesture semantics are the two the
+// platform defines, and they mirror the mouse exactly:
+//   ONE finger  -> pan, through the SAME `panView` the mouse drag uses;
+//   TWO fingers -> pinch, a scale factor from the ratio of the finger separation,
+//                  ANCHORED at the midpoint (`zoomViewAt`) and panned by the
+//                  midpoint's own movement, so the plane follows the fingers.
+// The listener registration (and its `{ passive: false }`) lives in app.js's
+// `attachFractalMouseEvents`, which owns the canvas binding for BOTH canvases;
+// `preventDefault` here is what stops the page from scrolling or zooming itself,
+// which is also why the handler cannot be passive.
+
+// The canvas that owns the gesture is the event's CURRENT TARGET, never
+// `this.canvas`: the WebGL lane is the default and app.js binds these handlers to
+// the WebGL canvas too, while the viewer's own 2D canvas is display:none there —
+// a hidden element has a zero-sized box, so measuring it would put the anchor at
+// the wrong place.
+FractalViewer.prototype._touchCanvasRect = function(e) {
+  const el = (e && e.currentTarget) || this.canvas;
+  return el.getBoundingClientRect();
+};
+
+// The shared tail of every touch gesture that MOVED the view: the zoom-derived
+// budget is re-derived (D2 — a pinch changes the scale), the canvas is repainted
+// immediately, and the app is told so a real CPU job / GPU pass starts for the new
+// view. This is the wheel's own sequence, so a pinch and a wheel reach the
+// renderer through the same route. `clamped` is the ONE zoom clamp's answer, so
+// the one-shot limit notice fires on a pinch exactly as it does on a wheel.
+FractalViewer.prototype.applyTouchViewChange = function(clamped) {
+  this.refreshBudget();
+  this.render();
+  if (this.infoCallback) this.infoCallback(this.view);
+  if (clamped && this.onZoomLimit) this.onZoomLimit(this.view);
+  if (this.onViewChange) this.onViewChange(this.view);
+};
+
+FractalViewer.prototype._seedPan = function(touch) {
+  this._touchMode = 'pan';
+  this._touchLast = { x: touch.clientX, y: touch.clientY };
+  this._pinchLast = null;
+};
+
+FractalViewer.prototype._seedPinch = function(touches) {
+  const a = touches[0];
+  const b = touches[1];
+  this._touchMode = 'pinch';
+  this._touchLast = null;
+  this._pinchLast = {
+    dist: Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY),
+    midX: (a.clientX + b.clientX) / 2,
+    midY: (a.clientY + b.clientY) / 2,
+  };
+};
+
+FractalViewer.prototype.onTouchStart = function(e) {
+  if (e.touches.length >= 2) this._seedPinch(e.touches);
+  else if (e.touches.length === 1) this._seedPan(e.touches[0]);
+  else { this._touchMode = null; this._touchLast = null; this._pinchLast = null; }
+  if (e.cancelable) e.preventDefault();
+};
+
+FractalViewer.prototype.onTouchMove = function(e) {
+  if (e.touches.length >= 2) {
+    // A second finger arrived without a fresh touchstart being seen (or the
+    // gesture is resuming): seed from the current spread instead of dividing by a
+    // stale distance, which would jump the scale.
+    if (this._touchMode !== 'pinch' || !this._pinchLast) {
+      this._seedPinch(e.touches);
+      if (e.cancelable) e.preventDefault();
+      return;
+    }
+    const a = e.touches[0];
+    const b = e.touches[1];
+    const dist = Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    const midX = (a.clientX + b.clientX) / 2;
+    const midY = (a.clientY + b.clientY) / 2;
+    const last = this._pinchLast;
+    // 1. The plane follows the midpoint, through the SAME mapping a one-finger
+    //    drag uses — this is what makes a two-finger move feel attached.
+    panView(this.view, midX - last.midX, midY - last.midY, this.cssWidth, this.cssHeight);
+    // 2. The scale follows the separation ratio, anchored at the NEW midpoint. The
+    //    pan above and this anchored zoom compose EXACTLY into "the world point
+    //    under each finger's midpoint stays under it" — see `zoomViewAt`.
+    //    Fingers APART (a larger separation) means zoom IN, and zoom in means a
+    //    SMALLER `scale` — `scale` is the world width the viewport spans — so the
+    //    multiplier is the OLD separation over the NEW one, not the reverse. The
+    //    cap is the ONE `clampScale`, applied below like the wheel's.
+    const zoom = dist > 0 ? last.dist / dist : 1;
+    if (zoom > 0 && isFinite(zoom)) {
+      const rect = this._touchCanvasRect(e);
+      const sx = midX - rect.left - rect.width / 2;
+      const sy = midY - rect.top - rect.height / 2;
+      zoomViewAt(this.view, zoom, sx, sy, this.cssWidth, this.cssHeight);
+    }
+    const { scale, clamped } = this.clampScale(this.view.scale);
+    this.view.scale = scale;
+    this._pinchLast = { dist, midX, midY };
+    if (e.cancelable) e.preventDefault();
+    this.applyTouchViewChange(clamped);
+    return;
+  }
+  if (e.touches.length === 1) {
+    if (this._touchMode !== 'pan' || !this._touchLast) {
+      this._seedPan(e.touches[0]);
+      if (e.cancelable) e.preventDefault();
+      return;
+    }
+    const t = e.touches[0];
+    const dx = t.clientX - this._touchLast.x;
+    const dy = t.clientY - this._touchLast.y;
+    this._touchLast = { x: t.clientX, y: t.clientY };
+    if (e.cancelable) e.preventDefault();
+    // CSS pixels, exactly like the mouse drag: the view must follow the finger by
+    // the distance the finger moved, at any devicePixelRatio.
+    panView(this.view, dx, dy, this.cssWidth, this.cssHeight);
+    this.applyTouchViewChange(false);
+  }
+};
+
+// A finger lifted (or the gesture was cancelled). Re-seed from what REMAINS:
+// lifting one finger of a pinch continues as a pan from that finger's position,
+// and the scale is NOT changed by the transition — the common "pinch then drag"
+// gesture would otherwise snap.
+FractalViewer.prototype.onTouchEnd = function(e) {
+  if (e.touches.length >= 2) this._seedPinch(e.touches);
+  else if (e.touches.length === 1) this._seedPan(e.touches[0]);
+  else { this._touchMode = null; this._touchLast = null; this._pinchLast = null; }
+  if (e.cancelable) e.preventDefault();
 };
 
 // Build the render's colour table. The table is over the SMOOTH value, at the

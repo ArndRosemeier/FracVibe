@@ -22,6 +22,11 @@ body {
   height: 100vh;
   background: #222;
   cursor: grab;
+  /* TOUCH: the canvas consumes pan and pinch ITSELF (public/app.js binds the
+     touch handlers, public/fractalViewer.js implements them). Without this the
+     browser claims the gesture first — the page scrolls or the viewport
+     pinch-zooms — and the app never sees a touchmove it can use. */
+  touch-action: none;
 }
 /* Same full-screen layer as #fractalCanvas: as a normal in-flow block this
    canvas pushed the three.js canvas (3D mode) below the viewport. */
@@ -33,6 +38,10 @@ body {
   height: 100vh;
   background: #222;
   cursor: grab;
+  /* TOUCH: both canvases, so a WebGL fallback to the CPU canvas keeps the same
+     gesture contract (the WebGL canvas is the default and is REPLACED on context
+     loss, so the rule must match by id, not by a one-off inline style). */
+  touch-action: none;
 }
 #info {
   margin-left: 20px;
