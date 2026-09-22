@@ -272,9 +272,16 @@ keyboard path to the canvas, and no touch/pointer events at all (mouse-only: `mo
 undocumented in the UI.
 *Partly fixed (S6):* the "save location" flow no longer uses `window.prompt` (it is the
 non-modal `#saveLocationPanel`), and the zoom-cap decision no longer uses `window.confirm`
-(`#zoomCapOffer`); the import path already reported through `#appMessage`. **Still open and
-deliberately out of this campaign** (Phase 3, `docs/PLAN.md` §3): `<dialog>`/ARIA/focus
-management, a keyboard path to the canvas, and pointer/touch input.
+(`#zoomCapOffer`); the import path already reported through `#appMessage`.
+*Partly fixed (TOUCH-INPUT, 2026-09-22, `docs/DECISIONS.md` row 101):* **the canvas now
+takes TOUCH — one finger pans and two fingers pinch-zoom, on both the WebGL and the 2D
+canvas** (`public/fractalViewer.js` `onTouchStart`/`onTouchMove`/`onTouchEnd`, bound by
+`attachFractalMouseEvents`, with `touch-action: none` on both canvases). What is still
+missing is not a capability but a unification: POINTER events would merge the mouse and
+touch paths into one, which is a refactor of a pinned seam, not a new gesture.
+**Still open and deliberately out of this campaign** (Phase 3, `docs/PLAN.md` §3):
+`<dialog>`/ARIA/focus management, a keyboard path to the canvas, and POINTER-event input
+(mouse + touch through one path).
 
 **Persistence.** `FractalMemoryRepository` is session-only by design, so Saved Locations die
 on reload while Export/Import implies durability. `localStorage`/IndexedDB is the obvious
@@ -315,8 +322,9 @@ upgrade, and the repo abstraction is already the right seam for it.
 3. **Phase 2 — foundation (2–4 days).** Vite build, `three` from npm, Node 24, ESM dev
    server, lint/format/CI, single fractal kernel (+ its palette table) shared by
    worker/main/shader, worker pool.
-4. **Phase 3 — product.** `<dialog>` + accessible controls, pointer/touch input, persisted
-   locations (IndexedDB), then optional TypeScript migration and feature work.
+4. **Phase 3 — product.** `<dialog>` + accessible controls, pointer-event input (mouse and
+   touch through ONE path — TOUCH-INPUT landed the touch GESTURES themselves, see row 101),
+   persisted locations (IndexedDB), then optional TypeScript migration and feature work.
 
 Explicitly deferred: WebGPU / `three/webgpu` rewrite, WASM/SIMD kernels, OffscreenCanvas.
 All are reasonable later; none are needed to fix the current defects.
