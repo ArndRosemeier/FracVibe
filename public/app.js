@@ -1045,7 +1045,18 @@ updateWebGLState();
       // The animation moved the view without going through the view-change
       // path, so the CPU renderer is still showing the pre-animation image.
       // (GPU mode re-renders every frame from the uniforms, so it needs nothing.)
-      if (!webglCheckbox.checked) startFractalCalculationWithTiming();
+      if (!webglCheckbox.checked) {
+        startFractalCalculationWithTiming();
+      } else if (webglRenderer) {
+        // ANIMATION CHAIN STORM (owner: "bouncing, rendering the same spot again
+        // from scratch"). While the animation drove the view, every frame cost
+        // exactly ONE pass (`renderAnimationSinglePass`) and started NO chain —
+        // a chain per frame was guaranteed to be superseded before it converged.
+        // Now that the view has SETTLED, run the FULL coarse-to-fine chain once,
+        // so the user ends on the fully refined frame. This is the single chain
+        // the whole animation owes; measured, see tests/anim-refine.spec.js.
+        renderWebGL();
+      }
     }
   }
   loop();
@@ -1559,6 +1570,60 @@ function startGpuChain() {
   return chain;
 }
 
+// --- THE ANIMATION'S SINGLE PASS (the chain-storm fix) -------------------------
+// The startup animation drives `viewer.setView` once per ~16 ms frame; that path
+// reaches the GPU through the re-pointed `viewer.render` -> `renderFractal` ->
+// `renderWebGL`. Starting a CHAIN per frame is a storm by construction: the
+// coarsest level is drawn synchronously, the level boundary yields, and the next
+// animation frame arrives before the chain can converge, so nothing is ever
+// finished and the image BOUNCES. MEASURED on the pre-fix build over one full
+// startup animation (64x48, SwiftShader): 263 GPU passes across 110 view
+// generations, 109 abandoned — i.e. one chain per frame, almost all superseded.
+//
+// The fix uses the state the app already keeps: while the animation is DRIVING
+// the view (`zoomAnimationSettled === false`) a view change costs exactly ONE
+// full-resolution pass — the pre-refinement single-pass behaviour, which is
+// smooth at the animation's shallow scales — and starts no chain. The chain runs
+// ONCE, in the animation's own completion branch, on the settled view.
+//
+// WHY A FULL-RESOLUTION PASS AND NOT A COARSE ONE. The animation renders scales
+// ~183 -> 3, where a full pass is cheap, and `step === 1` is byte-for-byte the
+// pre-refinement frame this path drew before the refinement slice existed — so
+// the animated frames are the ones the owner already accepted as smooth. A
+// coarse (step-8) frame per animation frame would be cheaper still, but it would
+// show 8x8 blocks for the whole ~3.5 s animation and then snap; that is a visible
+// regression the owner did not ask for, so it is REJECTED here.
+//
+// This touches the ANIMATION only. The wheel path is untouched: after the
+// animation has settled `zoomAnimationSettled` is true forever, so a wheel
+// starts a chain exactly as the REFINE slice measured it (3.8 ms to the first
+// coarse frame).
+function renderAnimationSinglePass() {
+  if (!webglRenderer || webglRenderer.destroyed
+      || (webglRenderer.gl && webglRenderer.gl.isContextLost())) return;
+  // Invariant, not a branch that should ever fire: single-pass mode never starts
+  // a chain, so entering an animation frame with one in flight would mean a chain
+  // is still rendering a view the animation has already left. Abandon it rather
+  // than let it draw over the animation's own frame.
+  if (gpuChain) abandonGpuChain(gpuChain);
+  gpuRenderGeneration++; // supersede anything that thinks it is still current
+  const fractalType = FractalKernel.indexForType(viewer.fractalType);
+  const rec = webglRenderer.renderPass(
+    { ...viewer.view }, viewer.maxIter, getColorSchemeIdx(), fractalType,
+    (fractalType === FractalKernel.indexForType('julia')) ? viewer.juliaParams : undefined,
+    0, 1,
+  );
+  if (!rec) return;
+  if (gpuAwaitingWheelFrame) {
+    // Same latency instrument as a chain's first level, for the case where a real
+    // wheel is delivered while the animation is still driving the view.
+    gpuAwaitingWheelFrame = false;
+    if (gpuWheelEventAt != null) gpuWheelToFirstFrameMs = gpuNow() - gpuWheelEventAt;
+  }
+  lastRenderDuration = rec.ms;
+  setRenderTimeDisplay(rec.ms);
+}
+
 function renderWebGL() {
   lastRenderStart = performance.now();
   if (!webglRenderer) {
@@ -1583,7 +1648,15 @@ function renderWebGL() {
     // finer passes (see startGpuChain). The first level is applied synchronously so
     // this call still leaves a frame on screen; `whenGpuIdle()` resolves when the
     // FINAL (full-resolution) frame is on screen.
-    startGpuChain();
+    //
+    // THE ANIMATION EXCEPTION (owner: "bouncing, rendering the same spot again from
+    // scratch"): while the startup animation is DRIVING the view at ~60 fps, a
+    // chain per frame is a storm — each one is superseded before it converges. That
+    // state is `zoomAnimationSettled === false`, and there a view change costs ONE
+    // pass and no chain; the chain runs once when the view settles. See
+    // `renderAnimationSinglePass`.
+    if (zoomAnimationSettled) startGpuChain();
+    else renderAnimationSinglePass();
   } catch (err) {
     handleWebGLFailure('WebGL rendering failed.', err);
     return;
@@ -1701,6 +1774,14 @@ window.__fv = Object.freeze({
   zoomCapPrompted: () => askedCpuSwitchAtZoomCap,
   liveRenderers: () => (typeof window.__fvLiveWebglRenderers === 'number' ? window.__fvLiveWebglRenderers : 0),
   animationSettled: () => zoomAnimationSettled,
+  // TEST-ONLY: put the app into the state the startup animation holds while it is
+  // DRIVING the view (`false`), so a pin can script an animation-like sequence of
+  // view changes through the REAL render path (`setView` -> `renderWebGL`) instead
+  // of asserting the mechanism from outside. `true` restores the settled state and
+  // therefore the shipped sparse-input behaviour: every view change starts a chain.
+  // No production code calls it; the animation's own completion branch is the one
+  // writer of `zoomAnimationSettled` in the app.
+  setAnimationSettled: (v) => { zoomAnimationSettled = !!v; return zoomAnimationSettled; },
   // --- S5 3D-truth observables (B8 + the awaited 3D failure path) ---
   // How many times the 3D viewer has EVALUATED the fractal heightmap. A colour
   // change (offset or scheme) must leave this number untouched: counted, not
